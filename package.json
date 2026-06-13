@@ -1,0 +1,13 @@
+{
+  "name": "memory-gateway",
+  "private": true,
+  "cloudflare": {
+    "label": "Memory Gateway",
+    "products": ["Workers", "D1"],
+    "bindings": {
+      "BEARER_TOKEN": {
+        "description": "A secret password for your memory store. Generate a random one with `openssl rand -hex 32`, or use any long random string. Save it — you will paste it into your claude.ai connector."
+      }
+    }
+  }
+}

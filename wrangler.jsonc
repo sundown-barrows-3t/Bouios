@@ -1,0 +1,19 @@
+{
+  // Customer template for the Deploy to Cloudflare button.
+  // The button clones this to the customer's own GitHub, provisions the D1
+  // database below on THEIR account and binds it, prompts for the BEARER_TOKEN
+  // secret, then deploys. database_id is a placeholder the deploy flow fills in.
+  "name": "memory-gateway",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "memory-vault",
+      "database_id": "PLACEHOLDER_PROVISIONED_ON_DEPLOY"
+    }
+  ],
+  "vars": {
+    "AUTH_MODE": "bearer"
+  }
+}
