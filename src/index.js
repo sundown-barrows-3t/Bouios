@@ -539,10 +539,127 @@ async function handleMcp(request, env, licence) {
   return new Response(JSON.stringify(Array.isArray(body) ? responses : responses[0]), { status: 200, headers });
 }
 
+function htmlResponse(html) {
+  return new Response(html, {
+    status: 200,
+    headers: { "content-type": "text/html; charset=utf-8" },
+  });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
+    if (path === "/" && request.method === "GET") {
+      const html = `<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bouios - AI Memory Backend - Syndakat</title>
+    <meta name="description" content="Bouios is a memory backend for AI assistants. Keep context, decisions, and learned patterns across conversations and devices. Persistent memory for AI across sessions.">
+    <meta name="keywords" content="AI memory, context, persistent memory backend, AI assistant memory, conversation continuity">
+    <meta property="og:title" content="Bouios - AI Memory Backend">
+    <meta property="og:description" content="Persistent memory backend for AI assistants. Keep context across conversations and devices.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://bouios.syndakat.com/">
+    <meta property="og:image" content="https://syndakat.com/favicon.svg">
+    <meta property="og:site_name" content="Syndakat">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Bouios - AI Memory Backend">
+    <meta name="twitter:description" content="Persistent memory backend for AI assistants. Keep context across conversations and devices.">
+    <meta name="twitter:image" content="https://syndakat.com/favicon.svg">
+    <meta name="theme-color" content="#C8102E">
+    <link rel="canonical" href="https://bouios.syndakat.com/">
+    <link rel="icon" type="image/svg+xml" href="https://syndakat.com/favicon.svg">
+    <link rel="stylesheet" href="https://syndakat.com/syndakat.css">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.6; margin: 0; padding: 0; background: #f9f9f9; }
+        header { background: white; padding: 2rem; border-bottom: 1px solid #eee; }
+        header a { text-decoration: none; font-size: 1.2rem; font-weight: 600; color: #333; }
+        header span { color: #C8102E; }
+        .by-syndakat { font-size: 0.85rem; color: #666; margin-left: 0.5rem; }
+        main { max-width: 960px; margin: 0 auto; padding: 2rem; }
+        h1 { font-size: 2rem; margin-bottom: 1rem; }
+        h2 { font-size: 1.5rem; margin-top: 2rem; margin-bottom: 1rem; }
+        p { max-width: 700px; margin: 1rem 0; }
+        ul { margin: 1rem 0; padding-left: 2rem; }
+        li { margin: 0.5rem 0; }
+        .features { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; margin: 2rem 0; }
+        .feature { padding: 1.5rem; background: white; border: 1px solid #eee; border-radius: 4px; }
+        .feature h3 { margin-top: 0; }
+        .cta { background: #C8102E; color: white; padding: 0.75rem 1.5rem; text-decoration: none; border-radius: 4px; display: inline-block; margin: 1rem 0; }
+        footer { text-align: center; padding: 2rem; color: #666; font-size: 0.9rem; margin-top: 3rem; border-top: 1px solid #eee; }
+        @media (max-width: 768px) {
+            .features { grid-template-columns: 1fr; }
+            h1 { font-size: 1.5rem; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <a href="https://syndakat.com">BOUIOS<span>.</span></a>
+        <span class="by-syndakat">by Syndakat</span>
+    </header>
+    <main>
+        <h1>Persistent AI Memory Backend</h1>
+        <p>Keep your AI assistant's context, decisions, and learned patterns across conversations and devices. No more context window resets.</p>
+
+        <div class="features">
+            <div class="feature">
+                <h3>Session Memory</h3>
+                <p>Your assistant loads your full context at the start of each conversation. Resume where you left off.</p>
+            </div>
+            <div class="feature">
+                <h3>Cross-Device Sync</h3>
+                <p>Continue on your phone where you left off on desktop. Full context synchronised across all devices.</p>
+            </div>
+            <div class="feature">
+                <h3>Learned Patterns</h3>
+                <p>Your assistant remembers decisions and approaches from past conversations. Improves over time.</p>
+            </div>
+            <div class="feature">
+                <h3>Rules & Context</h3>
+                <p>Set standing instructions once. Your assistant applies them consistently in every conversation.</p>
+            </div>
+        </div>
+
+        <h2>How it Works</h2>
+        <ol>
+            <li>Register the Bouios MCP in your AI assistant at https://bouios.syndakat.com/mcp</li>
+            <li>Start a conversation with "load memory: PROJECTNAME"</li>
+            <li>Your assistant loads your full context and working state</li>
+            <li>Work on your task. The assistant handles complex reasoning with your memory context</li>
+            <li>When done, the assistant automatically writes your session back to memory</li>
+            <li>Next conversation: full context is available immediately</li>
+        </ol>
+
+        <h2>Use Cases</h2>
+        <ul>
+            <li><strong>Research projects:</strong> Keep notes, highlights, and working outlines intact across sessions</li>
+            <li><strong>Business planning:</strong> Maintain strategic context and decision history across multiple conversations</li>
+            <li><strong>Creative work:</strong> Preserve your style, ideas, and project state between sessions</li>
+            <li><strong>Learning:</strong> Build cumulative knowledge that compounds across study sessions</li>
+            <li><strong>Sark planning:</strong> Combine with Travel MCP and Sark MCP to build a living knowledge base about island life</li>
+        </ul>
+
+        <h2>Getting Started</h2>
+        <p>Bouios is designed for users of AI assistants. To use it:</p>
+        <ul>
+            <li>You need an AI assistant that supports MCPs (Claude, etc.)</li>
+            <li>Register the Bouios MCP with your assistant</li>
+            <li>Create a memory project (projects are created on first write)</li>
+            <li>Start using it immediately with "load memory: PROJECTNAME"</li>
+        </ul>
+        <a href="https://ai.syndakat.com/" class="cta">View All AI Tools</a>
+    </main>
+    <footer>
+        <p>Bouios is part of Syndakat - Islander tools, built by islanders, made useful.</p>
+    </footer>
+</body>
+</html>`;
+      return htmlResponse(html);
+    }
     if (path === "/health") return json({ ok: true, service: "memory-gateway" });
     // No-op unless REQUIRE_LICENCE === "true" (default deployments unchanged).
     const licence = await requestLicence(request, url, env);
