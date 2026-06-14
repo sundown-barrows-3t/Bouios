@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bouios - AI Memory Backend - Syndakat</title>
+    <meta name="description" content="Bouios: persistent memory backend for AI assistants. Keep your assistant's context across sessions and devices with a stateful memory vault.">
+    <meta name="keywords" content="AI memory, assistant memory, context persistence, AI backend, Cloudflare Workers">
+    <meta property="og:title" content="Bouios - AI Memory Backend">
+    <meta property="og:description" content="Persistent memory backend for AI assistants. Built by Syndakat.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://bouios.syndakat.com/">
+    <meta property="og:site_name" content="Syndakat">
+    <meta name="theme-color" content="#C8102E">
+    <link rel="canonical" href="https://bouios.syndakat.com/">
+    <link rel="icon" type="image/svg+xml" href="https://syndakat.com/favicon.svg">
+    <link rel="stylesheet" href="https://syndakat.com/syndakat.css">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; }
+        header { background: #fff; border-bottom: 1px solid #eee; padding: 1.5rem 2rem; display: flex; align-items: center; gap: 1rem; }
+        .logo-group { display: flex; align-items: center; gap: 0.5rem; }
+        .logo { font-size: 1.4rem; font-weight: 700; color: #000; text-decoration: none; }
+        .red-dot { display: inline-block; width: 12px; height: 12px; background: #C8102E; border-radius: 50%; margin: 0 0.25rem; }
+        .by-syndakat { font-size: 0.9rem; color: #999; font-weight: 500; }
+        .content { max-width: 960px; margin: 0 auto; padding: 3rem 2rem; }
+        h1 { font-size: 2.2rem; margin: 0 0 1rem; color: #000; }
+        p { line-height: 1.6; color: #666; font-size: 1.05rem; }
+        .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 2rem; margin: 2rem 0; }
+        .feature-card { padding: 1.5rem; border: 1px solid #eee; border-radius: 8px; background: #fafafa; }
+        .feature-card h3 { margin: 0 0 0.5rem; font-size: 1.1rem; color: #000; }
+        .feature-card p { font-size: 0.95rem; margin: 0; color: #666; }
+        .tech-specs { background: #f5f5f5; padding: 2rem; border-radius: 8px; margin: 2rem 0; }
+        .tech-specs h2 { margin: 0 0 1rem; font-size: 1.3rem; }
+        .tech-specs ul { margin: 0; padding-left: 1.5rem; }
+        .tech-specs li { margin-bottom: 0.5rem; color: #666; }
+        footer { text-align: center; padding: 2rem; color: #999; font-size: 0.9rem; border-top: 1px solid #eee; }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="logo-group">
+        <span class="logo">Bouios<span class="red-dot"></span></span>
+        <span class="by-syndakat">by Syndakat</span>
+    </div>
+</header>
+
+<div class="content">
+    <h1>Persistent Memory for AI Assistants</h1>
+    <p>Bouios is a stateful memory backend that keeps your AI assistant's context, decisions, and learned patterns across conversations, sessions, and devices. No more context window resets. No more forgotten conversations.</p>
+
+    <div class="feature-grid">
+        <div class="feature-card">
+            <h3>Session Memory</h3>
+            <p>Your assistant loads your full context at the start of each conversation. Rules, decisions, and working state are always available.</p>
+        </div>
+        <div class="feature-card">
+            <h3>Cross-Device Sync</h3>
+            <p>Continue on your phone where you left off on your desktop. Memory state syncs automatically across every surface.</p>
+        </div>
+        <div class="feature-card">
+            <h3>Learned Patterns</h3>
+            <p>Your assistant remembers decisions, approaches, and patterns from past conversations. Gets smarter the more you work together.</p>
+        </div>
+        <div class="feature-card">
+            <h3>Rules & Context</h3>
+            <p>Set standing rules once. Your assistant applies them consistently across all future conversations.</p>
+        </div>
+    </div>
+
+    <div class="tech-specs">
+        <h2>What Bouios Stores</h2>
+        <ul>
+            <li><strong>Hot state:</strong> Current working context, active tasks, and conversation state</li>
+            <li><strong>Memory entries:</strong> Patterns, mistakes, decisions, and pending items your assistant has learned</li>
+            <li><strong>Rules:</strong> Standing instructions and constraints that apply across conversations</li>
+            <li><strong>Context:</strong> Project-specific information, metadata, and cross-session variables</li>
+            <li><strong>Logs:</strong> Audit trail of what happened in each session</li>
+        </ul>
+    </div>
+
+    <h2>How It Works</h2>
+    <p>Bouios exposes a simple JSON-RPC 2.0 MCP server that your AI assistant calls at the start and end of conversations. Your assistant loads your memory, works on your task, then writes back what was learned. On the next conversation, it has the full context from before.</p>
+
+    <h2>Built for Channel Islands</h2>
+    <p>Bouios is part of the Syndakat platform, built for life and work in the Channel Islands. If you need your AI assistant to remember things across conversations, context windows, and devices — integrate Bouios.</p>
+
+</div>
+
+<footer>
+    <p>&copy; 2026 Syndakat &middot; Built by islanders, for the Channel Islands</p>
+</footer>
+
+</body>
+</html>
