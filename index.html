@@ -90,11 +90,31 @@
 
 <div class="floating-buttons">
   <button id="back-to-top" title="Back to top">↑</button>
+  <button id="dark-sky-toggle" title="Toggle dark mode">◐</button>
   <button id="sark-bot-float" title="Chat with Sark Bot">🦞</button>
+</div>
+
+<div id="sark-bot-overlay"></div>
+<div class="sark-bot-popup" id="sark-bot-popup" style="display:none;">
+  <header>
+    Sark Bot
+    <button class="close-btn" onclick="closeSarkBotPopup()">×</button>
+  </header>
+  <div class="chat-body" id="popup-chat-body"></div>
+  <div class="chat-input">
+    <input id="popup-chat-input" type="text" placeholder="Ask about sailings, events, or news...">
+    <button onclick="sendPopupMessage()">Ask</button>
+  </div>
 </div>
 
 <script>
 const backToTop = document.getElementById("back-to-top");
+const botFloatBtn = document.getElementById("sark-bot-float");
+const botOverlay = document.getElementById("sark-bot-overlay");
+const botPopup = document.getElementById("sark-bot-popup");
+const popupChatBody = document.getElementById("popup-chat-body");
+const popupChatInput = document.getElementById("popup-chat-input");
+
 window.addEventListener("scroll", () => {
   if (window.scrollY > 300) {
     backToTop.style.opacity = "1";
@@ -107,24 +127,69 @@ window.addEventListener("scroll", () => {
 backToTop.addEventListener("click", () => {
   window.scrollTo({ top: 0, behavior: "smooth" });
 });
-document.getElementById("sark-bot-float").addEventListener("mouseenter", function() {
-  this.style.transform = "scale(1.1)";
+
+botFloatBtn.addEventListener("click", () => {
+  botOverlay.style.display = "block";
+  botPopup.style.display = "flex";
+  popupChatInput.focus();
 });
-document.getElementById("sark-bot-float").addEventListener("mouseleave", function() {
-  this.style.transform = "scale(1)";
+
+function closeSarkBotPopup() {
+  botOverlay.style.display = "none";
+  botPopup.style.display = "none";
+}
+
+botOverlay.addEventListener("click", closeSarkBotPopup);
+
+function sendPopupMessage() {
+  const q = popupChatInput.value.trim();
+  if (!q) return;
+  popupChatInput.value = '';
+  const userMsg = document.createElement("div");
+  userMsg.style.cssText = "text-align:right;padding:0.5rem;background:#f0f0f0;border-radius:6px;font-size:0.9rem";
+  userMsg.textContent = q;
+  popupChatBody.appendChild(userMsg);
+  popupChatBody.scrollTop = popupChatBody.scrollHeight;
+
+  fetch('/api/archive/query?q=' + encodeURIComponent(q), { headers: { 'Accept': 'application/json' } })
+    .then(r => r.json())
+    .then(d => {
+      const botMsg = document.createElement("div");
+      botMsg.style.cssText = "text-align:left;padding:0.5rem;background:#e8f5e9;border-radius:6px;font-size:0.9rem";
+      botMsg.textContent = d.answer || "Could not fetch response.";
+      popupChatBody.appendChild(botMsg);
+      popupChatBody.scrollTop = popupChatBody.scrollHeight;
+    })
+    .catch(() => {
+      const errMsg = document.createElement("div");
+      errMsg.style.cssText = "text-align:left;padding:0.5rem;background:#ffebee;border-radius:6px;font-size:0.9rem;color:var(--red,#C8102E)";
+      errMsg.textContent = "Error connecting to Sark Bot. Please try again.";
+      popupChatBody.appendChild(errMsg);
+    });
+}
+
+popupChatInput.addEventListener("keypress", (e) => {
+  if (e.key === "Enter") sendPopupMessage();
+});
+
+function toggleDarkMode() {
+  const html = document.documentElement;
+  const current = html.getAttribute("data-theme");
+  const next = current === "dark" ? "light" : "dark";
+  html.setAttribute("data-theme", next);
+  localStorage.setItem("theme", next);
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  const darkSkyToggle = document.getElementById("dark-sky-toggle");
+  if (darkSkyToggle) {
+    darkSkyToggle.addEventListener("click", toggleDarkMode);
+  }
+  const savedTheme = localStorage.getItem("theme");
+  if (savedTheme === "dark") {
+    document.documentElement.setAttribute("data-theme", "dark");
+  }
 });
 </script>
-
-<div id="sark-bot-overlay"></div>
-<div class="sark-bot-popup" id="sark-bot-popup" style="display:none;">
-  <header>
-    Sark Bot
-    <button class="close-btn" onclick="closeSarkBotPopup()">×</button>
-  </header>
-  <div class="chat-body" style="padding:1.5rem;justify-content:center;">
-    <p style="text-align:center;margin:0 0 1rem;color:#666;">Ask about Sark — sailings, events, island news, and Chief Pleas decisions.</p>
-    <a href="https://sark.syndakat.com#sark-bot" style="display:inline-block;padding:0.75rem 1.5rem;background:var(--red,#C8102E);color:white;text-decoration:none;border-radius:0.5rem;font-weight:600;margin:0 auto;">Go to Sark Bot</a>
-  </div>
-</div>
 </body>
 </html>
