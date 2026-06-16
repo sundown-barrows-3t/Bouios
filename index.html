@@ -16,51 +16,37 @@
     <link rel="icon" type="image/svg+xml" href="https://syndakat.com/favicon.svg">
     <link rel="stylesheet" href="https://syndakat.com/syndakat.css">
     <style>
-        :root {
-            --text: #0f0f0f;
-            --text-muted: #545454;
-            --accent: #C8102E;
-            --bg: #ffffff;
-            --border: #eeeeee;
-            --bg-secondary: #fafafa;
-            --bg-tertiary: #f5f5f5;
-        }
-        @media (prefers-color-scheme: dark) {
-            :root {
-                --text: #ffffff;
-                --text-muted: #c7c7c7;
-                --accent: #c8001a;
-                --bg: #0f0f0f;
-                --border: #2a2a2a;
-                --bg-secondary: #1a1a1a;
-                --bg-tertiary: #242424;
-            }
-        }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; background: var(--bg); color: var(--text); }
-        header { background: var(--bg); border-bottom: 1px solid var(--border); padding: 1.5rem 2rem; display: flex; align-items: center; gap: 2rem; }
-        .logo { font-size: 1.5rem; font-weight: 700; color: var(--text); text-decoration: none; }
-        .logo span { color: var(--accent); }
-        .by-syndakat { font-size: 0.9rem; color: var(--text-muted); font-weight: 500; }
+        .by-syndakat { font-size: 0.9rem; color: var(--mid); font-weight: 500; }
+        .by-syndakat a { color: inherit; text-decoration: none; }
+        .by-syndakat a:hover { color: var(--text); }
         .content { max-width: 960px; margin: 0 auto; padding: 3rem 2rem; }
-        h1 { font-size: 2.2rem; margin: 0 0 1rem; color: var(--text); }
-        p { line-height: 1.6; color: var(--text-muted); font-size: 1.05rem; }
+        .content h1 { font-size: 2.2rem; margin: 0 0 1rem; color: var(--text); }
+        .content p { line-height: 1.6; color: var(--mid); font-size: 1.05rem; }
         .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 2rem; margin: 2rem 0; }
-        .feature-card { padding: 1.5rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-secondary); }
+        .feature-card { padding: 1.5rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-alt); }
         .feature-card h3 { margin: 0 0 0.5rem; font-size: 1.1rem; color: var(--text); }
-        .feature-card p { font-size: 0.95rem; margin: 0; color: var(--text-muted); }
-        .tech-specs { background: var(--bg-tertiary); padding: 2rem; border-radius: 8px; margin: 2rem 0; }
+        .feature-card p { font-size: 0.95rem; margin: 0; color: var(--mid); }
+        .tech-specs { background: var(--bg-alt); padding: 2rem; border-radius: 8px; margin: 2rem 0; }
         .tech-specs h2 { margin: 0 0 1rem; font-size: 1.3rem; color: var(--text); }
         .tech-specs ul { margin: 0; padding-left: 1.5rem; }
-        .tech-specs li { margin-bottom: 0.5rem; color: var(--text-muted); }
-        footer { text-align: center; padding: 2rem; color: var(--text-muted); font-size: 0.9rem; border-top: 1px solid var(--border); }
+        .tech-specs li { margin-bottom: 0.5rem; color: var(--mid); }
     </style>
 </head>
 <body>
 
+<!-- NAV:START -->
 <header>
-    <a href="https://syndakat.com" class="logo">Bouios<span>.</span></a>
-    <span class="by-syndakat">by Syndakat</span>
+    <a href="https://bouios.syndakat.com" class="logo">BOUIOS<span>.</span></a>
+    <span class="by-syndakat">by <a href="https://syndakat.com">Syndakat</a></span>
+    <nav>
+        <a href="https://sark.syndakat.com">Sark</a>
+        <a href="https://shop.syndakat.com">Shop</a>
+        <a href="https://tools.syndakat.com">Tools</a>
+        <a href="https://booking.syndakat.com">Booking</a>
+        <a href="https://travel.syndakat.com">Travel</a>
+    </nav>
 </header>
+<!-- NAV:END -->
 
 <div class="content">
     <h1>Persistent Memory for AI Assistants</h1>
@@ -80,7 +66,7 @@
             <p>Your assistant remembers decisions, approaches, and patterns from past conversations. Gets smarter the more you work together.</p>
         </div>
         <div class="feature-card">
-            <h3>Rules & Context</h3>
+            <h3>Rules &amp; Context</h3>
             <p>Set standing rules once. Your assistant applies them consistently across all future conversations.</p>
         </div>
     </div>
@@ -100,16 +86,17 @@
     <p>Bouios exposes a simple JSON-RPC 2.0 MCP server that your AI assistant calls at the start and end of conversations. Your assistant loads your memory, works on your task, then writes back what was learned. On the next conversation, it has the full context from before.</p>
 
     <h2>Built for Channel Islands</h2>
-    <p>Bouios is part of the Syndakat platform, built for life and work in the Channel Islands. If you need your AI assistant to remember things across conversations, context windows, and devices — integrate Bouios.</p>
+    <p>Bouios is part of the Syndakat platform, built for life and work in the Channel Islands. If you need your AI assistant to remember things across conversations, context windows, and devices - integrate Bouios.</p>
 
 </div>
 
+<!-- FOOTER:START -->
 <footer>
-    <p style="margin-top:2rem;padding-top:2rem;border-top:1px solid var(--border);font-size:0.85rem;color:var(--text-muted);">&copy; 2026 <strong>Bouios by <a href="https://syndakat.com" style="color:inherit;">Syndakat</a></strong> &middot; <a href="https://syndakat.com/privacy.html" style="color:inherit;">Privacy</a> &middot; <a href="https://syndakat.com/terms.html" style="color:inherit;">Terms</a> &middot; <a href="https://syndakat.com/contact.html" style="color:inherit;">Contact</a></p>
-    <p style="margin-top:0.5rem;font-size:0.85rem;color:var(--text-muted);">Built by islanders. Made useful.</p>
+    <p style="font-size:0.85rem;">&copy; 2026 <strong>BOUIOS by <a href="https://syndakat.com">Syndakat</a></strong> &middot; <a href="https://syndakat.com/privacy.html">Privacy</a> &middot; <a href="https://syndakat.com/terms.html">Terms</a> &middot; <a href="https://syndakat.com/contact.html">Contact</a></p>
+    <p style="margin-top:0.5rem;font-size:0.85rem;">Built by islanders. Made useful.</p>
 </footer>
+<!-- FOOTER:END -->
 
 <script src="https://syndakat.com/popup.js" defer></script>
-
 </body>
 </html>
