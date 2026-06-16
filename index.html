@@ -76,7 +76,7 @@
         </ul>
     </div>
 
-    <h2>How It Works</h2>
+    <h2>How</h2>
     <p>Bouios exposes a simple JSON-RPC 2.0 MCP server that your AI assistant calls at the start and end of conversations. Your assistant loads your memory, works on your task, then writes back what was learned. On the next conversation, it has the full context from before.</p>
 
     <h2>Built for Channel Islands</h2>
@@ -88,5 +88,43 @@
     <p>&copy; 2026 Syndakat &middot; Built by islanders, for the Channel Islands</p>
 </footer>
 
+<div class="floating-buttons">
+  <button id="back-to-top" title="Back to top">↑</button>
+  <button id="sark-bot-float" title="Chat with Sark Bot">🦞</button>
+</div>
+
+<script>
+const backToTop = document.getElementById("back-to-top");
+window.addEventListener("scroll", () => {
+  if (window.scrollY > 300) {
+    backToTop.style.opacity = "1";
+    backToTop.style.visibility = "visible";
+  } else {
+    backToTop.style.opacity = "0";
+    backToTop.style.visibility = "hidden";
+  }
+});
+backToTop.addEventListener("click", () => {
+  window.scrollTo({ top: 0, behavior: "smooth" });
+});
+document.getElementById("sark-bot-float").addEventListener("mouseenter", function() {
+  this.style.transform = "scale(1.1)";
+});
+document.getElementById("sark-bot-float").addEventListener("mouseleave", function() {
+  this.style.transform = "scale(1)";
+});
+</script>
+
+<div id="sark-bot-overlay"></div>
+<div class="sark-bot-popup" id="sark-bot-popup" style="display:none;">
+  <header>
+    Sark Bot
+    <button class="close-btn" onclick="closeSarkBotPopup()">×</button>
+  </header>
+  <div class="chat-body" style="padding:1.5rem;justify-content:center;">
+    <p style="text-align:center;margin:0 0 1rem;color:#666;">Ask about Sark — sailings, events, island news, and Chief Pleas decisions.</p>
+    <a href="https://sark.syndakat.com#sark-bot" style="display:inline-block;padding:0.75rem 1.5rem;background:var(--red,#C8102E);color:white;text-decoration:none;border-radius:0.5rem;font-weight:600;margin:0 auto;">Go to Sark Bot</a>
+  </div>
+</div>
 </body>
 </html>
