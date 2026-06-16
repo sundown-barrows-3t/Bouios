@@ -88,5 +88,34 @@
     <p>&copy; 2026 Syndakat &middot; Built by islanders, for the Channel Islands</p>
 </footer>
 
+<div class="floating-buttons">
+    <button id="back-to-top" title="Back to top">↑</button>
+    <button id="dark-sky-toggle" title="Toggle dark mode">◐</button>
+    <button id="sark-bot-float" title="Chat with Sark Bot">🦞</button>
+</div>
+
+<div id="sark-bot-overlay"></div>
+<div class="sark-bot-popup" id="sark-bot-popup">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:1rem;border-bottom:1px solid #eee">
+        <strong>Sark Bot</strong>
+        <button onclick="closeSarkBotPopup()" style="background:none;border:none;font-size:1.2rem;cursor:pointer;padding:0">&times;</button>
+    </div>
+    <div id="sark-bot-messages" style="flex:1;overflow-y:auto;padding:1rem;display:flex;flex-direction:column;gap:0.75rem"></div>
+    <div style="padding:1rem;border-top:1px solid #eee;display:flex;gap:0.5rem">
+        <input type="text" id="sark-bot-input" placeholder="Ask a question..." style="flex:1;padding:0.5rem;border:1px solid #ddd;border-radius:6px;font-size:0.9rem">
+        <button onclick="sendSarkBotMessage()" style="background:var(--sark-red);color:white;border:none;padding:0.5rem 1rem;border-radius:6px;cursor:pointer;font-weight:600;font-size:0.9rem">Send</button>
+    </div>
+</div>
+
+<script>
+function toggleDarkMode(){const html=document.documentElement;const current=html.getAttribute('data-theme');const next=current==='dark'?'light':'dark';html.setAttribute('data-theme',next);localStorage.setItem('theme',next);}
+function openSarkBotPopup(){document.getElementById('sark-bot-overlay').style.display='block';document.getElementById('sark-bot-popup').style.display='flex';document.getElementById('sark-bot-input').focus();}
+function closeSarkBotPopup(){document.getElementById('sark-bot-overlay').style.display='none';document.getElementById('sark-bot-popup').style.display='none';}
+async function sendSarkBotMessage(){const input=document.getElementById('sark-bot-input');const q=input.value.trim();if(!q)return;input.value='';const messages=document.getElementById('sark-bot-messages');const userMsg=document.createElement('div');userMsg.style.cssText='text-align:right;padding:0.5rem;background:#f0f0f0;border-radius:6px;font-size:0.9rem';userMsg.textContent=q;messages.appendChild(userMsg);messages.scrollTop=messages.scrollHeight;try{const res=await fetch('/api/archive/query?q='+encodeURIComponent(q),{headers:{'Accept':'application/json'}});const data=await res.json().catch(()=>({}));const botMsg=document.createElement('div');botMsg.style.cssText='text-align:left;padding:0.5rem;background:#e8f5e9;border-radius:6px;font-size:0.9rem';botMsg.textContent=data.answer||'Could not fetch response.';messages.appendChild(botMsg);messages.scrollTop=messages.scrollHeight;}catch(e){const errMsg=document.createElement('div');errMsg.style.cssText='text-align:left;padding:0.5rem;background:#ffebee;border-radius:6px;font-size:0.9rem;color:var(--sark-red)';errMsg.textContent='Error connecting to Sark Bot. Please try again.';messages.appendChild(errMsg);messages.scrollTop=messages.scrollHeight;}}
+window.addEventListener('scroll',()=>{const btn=document.getElementById('back-to-top');if(window.scrollY>300){btn.style.opacity='1';btn.style.visibility='visible';}else{btn.style.opacity='0';btn.style.visibility='hidden';}});
+document.addEventListener('DOMContentLoaded',()=>{const darkSkyToggle=document.getElementById('dark-sky-toggle');if(darkSkyToggle){darkSkyToggle.addEventListener('click',toggleDarkMode);}const savedTheme=localStorage.getItem('theme');if(savedTheme==='dark'){document.documentElement.setAttribute('data-theme','dark');}});
+document.getElementById('sark-bot-input')?.addEventListener('keypress',(e)=>{if(e.key==='Enter')sendSarkBotMessage();});
+</script>
+
 </body>
 </html>
