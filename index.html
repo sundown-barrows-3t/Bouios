@@ -79,6 +79,55 @@
     <h2>How</h2>
     <p>Bouios exposes a simple JSON-RPC 2.0 MCP server that your AI assistant calls at the start and end of conversations. Your assistant loads your memory, works on your task, then writes back what was learned. On the next conversation, it has the full context from before.</p>
 
+    <h2>Pricing</h2>
+    <p>Start free, then choose the plan that fits your needs.</p>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <h3>Trial Herder</h3>
+        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">Free</p>
+        <p style="font-size: 0.85rem; color: #999;">24 hours (5 days with referral)</p>
+        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
+          <li>• 1 project, 1 repo</li>
+          <li>• 2 skills</li>
+          <li>• D1 persistent memory</li>
+          <li>• No card required</li>
+        </ul>
+      </div>
+      <div class="feature-card">
+        <h3>Herder</h3>
+        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">$4.99<span style="font-size: 0.8rem; font-weight: normal;">/mo</span></p>
+        <p style="font-size: 0.85rem; color: #999;">30-day extended trial</p>
+        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
+          <li>• 1 project, 1 repo</li>
+          <li>• 2 skills</li>
+          <li>• 30-day history</li>
+          <li>• Same scope as Trial</li>
+        </ul>
+      </div>
+      <div class="feature-card">
+        <h3>Pro Herder</h3>
+        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">$19<span style="font-size: 0.8rem; font-weight: normal;">/mo</span></p>
+        <p style="font-size: 0.85rem; color: #999;">Professional use</p>
+        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
+          <li>• Unlimited projects</li>
+          <li>• All surfaces</li>
+          <li>• 10 skills</li>
+          <li>• 7-day history</li>
+        </ul>
+      </div>
+      <div class="feature-card">
+        <h3>Max Herder</h3>
+        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">$49<span style="font-size: 0.8rem; font-weight: normal;">/mo</span></p>
+        <p style="font-size: 0.85rem; color: #999;">Enterprise features</p>
+        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
+          <li>• Everything in Pro</li>
+          <li>• Shared memory</li>
+          <li>• 30-day history</li>
+          <li>• Unlimited skills</li>
+        </ul>
+      </div>
+    </div>
+
     <h2>Built for Channel Islands</h2>
     <p>Bouios is part of the Syndakat platform, built for life and work in the Channel Islands. If you need your AI assistant to remember things across conversations, context windows, and devices — integrate Bouios.</p>
 
@@ -106,6 +155,45 @@
     <button onclick="sendPopupMessage()">Ask</button>
   </div>
 </div>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Product",
+    "name": "Bouios",
+    "description": "Persistent memory for AI assistants that spans conversations, sessions, and devices.",
+    "offers": [
+      {
+        "@type": "Offer",
+        "name": "Trial Herder",
+        "description": "Free for 24 hours (5 days with a referral). 1 project, 1 repo, 2 skills, D1 persistent memory.",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      {
+        "@type": "Offer",
+        "name": "Herder",
+        "description": "30-day extended trial. 1 project, 1 repo, 2 skills, D1 persistent memory.",
+        "price": "4.99",
+        "priceCurrency": "USD"
+      },
+      {
+        "@type": "Offer",
+        "name": "Pro Herder",
+        "description": "Unlimited projects, all surfaces, 10 skills, 7-day history.",
+        "price": "19",
+        "priceCurrency": "USD"
+      },
+      {
+        "@type": "Offer",
+        "name": "Max Herder",
+        "description": "Everything in Pro plus shared memory, 30-day history, unlimited skills.",
+        "price": "49",
+        "priceCurrency": "USD"
+      }
+    ]
+  }
+  </script>
 
 <script>
 const backToTop = document.getElementById("back-to-top");
