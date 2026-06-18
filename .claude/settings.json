@@ -1,0 +1,89 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mkdir -p ~/.claude; if [ -f \"$PWD/.session/session-start.sh\" ]; then bash \"$PWD/.session/session-start.sh\"; else echo '=== LOAD MEMORY FIRST ==='; echo 'Use your registered memory tools to load your working set before any work.'; echo '==='; fi"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); if [ -f ~/.claude/pre-tool-enforcement.sh ]; then printf '%s' \"$input\" | bash ~/.claude/pre-tool-enforcement.sh; else tool=$(printf '%s' \"$input\" | jq -r '.tool_name // \"\"' 2>/dev/null); case \"$tool\" in Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__github__push_files|mcp__github__create_or_update_file|mcp__github__delete_file|mcp__github__merge_pull_request|mcp__github__create_pull_request) echo 'Enforcement guard missing (fail-closed): install the real pre-tool-enforcement.sh via the setup script before mutating.' >&2; exit 2 ;; *) exit 0 ;; esac; fi"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); sql=$(echo \"$input\" | jq -r '.tool_input.sql // \"\" | ascii_downcase' 2>/dev/null); echo \"$sql\" | grep -qE 'from[[:space:]]+rules' && touch ~/.claude/d1-loaded; exit 0"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f ~/.claude/pre-compact.sh ] && bash ~/.claude/pre-compact.sh || exit 0"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f ~/.claude/stop-context-check.sh ] && bash ~/.claude/stop-context-check.sh || exit 0"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f ~/.claude/stop-load-gate.sh ] && bash ~/.claude/stop-load-gate.sh || exit 0"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f ~/.claude/stop-memory-check.sh ] && bash ~/.claude/stop-memory-check.sh || exit 0"
+          }
+        ]
+      },
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -f ~/.claude/stop-hook-git-check.sh ] && bash ~/.claude/stop-hook-git-check.sh || exit 0"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": ["Skill"]
+  }
+}
