@@ -1,6 +1,12 @@
 {
   "name": "memory-gateway",
   "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  },
   "cloudflare": {
     "label": "Memory Gateway",
     "products": ["Workers", "D1"],
