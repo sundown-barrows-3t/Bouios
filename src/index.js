@@ -557,107 +557,281 @@ export default {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bouios - AI Memory Backend - Syndakat</title>
-    <meta name="description" content="Bouios is a memory backend for AI assistants. Keep context, decisions, and learned patterns across conversations and devices. Persistent memory for AI across sessions.">
-    <meta name="keywords" content="AI memory, context, persistent memory backend, AI assistant memory, conversation continuity">
+    <meta name="description" content="Bouios: persistent memory backend for AI assistants. Keep your assistant's context across sessions and devices with a stateful memory vault.">
+    <meta name="keywords" content="AI memory, assistant memory, context persistence, AI backend, Cloudflare Workers">
     <meta property="og:title" content="Bouios - AI Memory Backend">
-    <meta property="og:description" content="Persistent memory backend for AI assistants. Keep context across conversations and devices.">
+    <meta property="og:description" content="Persistent memory backend for AI assistants. Built by Syndakat.">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://bouios.syndakat.com/">
-    <meta property="og:image" content="https://syndakat.com/favicon.svg">
     <meta property="og:site_name" content="Syndakat">
-    <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:title" content="Bouios - AI Memory Backend">
-    <meta name="twitter:description" content="Persistent memory backend for AI assistants. Keep context across conversations and devices.">
-    <meta name="twitter:image" content="https://syndakat.com/favicon.svg">
     <meta name="theme-color" content="#C8102E">
     <link rel="canonical" href="https://bouios.syndakat.com/">
     <link rel="icon" type="image/svg+xml" href="https://syndakat.com/favicon.svg">
     <link rel="stylesheet" href="https://syndakat.com/syndakat.css">
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.6; margin: 0; padding: 0; background: #f9f9f9; }
-        header { background: white; padding: 2rem; border-bottom: 1px solid #eee; }
-        header a { text-decoration: none; font-size: 1.2rem; font-weight: 600; color: #333; }
-        header span { color: #C8102E; }
-        .by-syndakat { font-size: 0.85rem; color: #666; margin-left: 0.5rem; }
-        main { max-width: 960px; margin: 0 auto; padding: 2rem; }
-        h1 { font-size: 2rem; margin-bottom: 1rem; }
-        h2 { font-size: 1.5rem; margin-top: 2rem; margin-bottom: 1rem; }
-        p { max-width: 700px; margin: 1rem 0; }
-        ul { margin: 1rem 0; padding-left: 2rem; }
-        li { margin: 0.5rem 0; }
-        .features { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; margin: 2rem 0; }
-        .feature { padding: 1.5rem; background: white; border: 1px solid #eee; border-radius: 4px; }
-        .feature h3 { margin-top: 0; }
-        .cta { background: #C8102E; color: white; padding: 0.75rem 1.5rem; text-decoration: none; border-radius: 4px; display: inline-block; margin: 1rem 0; }
-        footer { text-align: center; padding: 2rem; color: #666; font-size: 0.9rem; margin-top: 3rem; border-top: 1px solid #eee; }
-        @media (max-width: 768px) {
-            .features { grid-template-columns: 1fr; }
-            h1 { font-size: 1.5rem; }
-        }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; }
+        header { background: #fff; border-bottom: 1px solid #eee; padding: 1.5rem 2rem; display: flex; align-items: center; gap: 2rem; }
+        .logo { font-size: 1.5rem; font-weight: 700; color: #000; text-decoration: none; }
+        .logo span { color: #C8102E; }
+        .by-syndakat { font-size: 0.9rem; color: #999; font-weight: 500; }
+        .content { max-width: 960px; margin: 0 auto; padding: 3rem 2rem; }
+        h1 { font-size: 2.2rem; margin: 0 0 1rem; color: #000; }
+        p { line-height: 1.6; color: #666; font-size: 1.05rem; }
+        .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 2rem; margin: 2rem 0; }
+        .feature-card { padding: 1.5rem; border: 1px solid #eee; border-radius: 8px; background: #fafafa; }
+        .feature-card h3 { margin: 0 0 0.5rem; font-size: 1.1rem; color: #000; }
+        .feature-card p { font-size: 0.95rem; margin: 0; color: #666; }
+        .tech-specs { background: #f5f5f5; padding: 2rem; border-radius: 8px; margin: 2rem 0; }
+        .tech-specs h2 { margin: 0 0 1rem; font-size: 1.3rem; }
+        .tech-specs ul { margin: 0; padding-left: 1.5rem; }
+        .tech-specs li { margin-bottom: 0.5rem; color: #666; }
+        footer { text-align: center; padding: 2rem; color: #999; font-size: 0.9rem; border-top: 1px solid #eee; }
     </style>
 </head>
 <body>
-    <header>
-        <a href="https://syndakat.com">BOUIOS<span>.</span></a>
-        <span class="by-syndakat">by Syndakat</span>
-    </header>
-    <main>
-        <h1>Persistent AI Memory Backend</h1>
-        <p>Keep your AI assistant's context, decisions, and learned patterns across conversations and devices. No more context window resets.</p>
 
-        <div class="features">
-            <div class="feature">
-                <h3>Session Memory</h3>
-                <p>Your assistant loads your full context at the start of each conversation. Resume where you left off.</p>
-            </div>
-            <div class="feature">
-                <h3>Cross-Device Sync</h3>
-                <p>Continue on your phone where you left off on desktop. Full context synchronised across all devices.</p>
-            </div>
-            <div class="feature">
-                <h3>Learned Patterns</h3>
-                <p>Your assistant remembers decisions and approaches from past conversations. Improves over time.</p>
-            </div>
-            <div class="feature">
-                <h3>Rules & Context</h3>
-                <p>Set standing instructions once. Your assistant applies them consistently in every conversation.</p>
-            </div>
+<header>
+    <a href="https://syndakat.com" class="logo">BOUIOS<span>.</span></a>
+    <span class="by-syndakat">by Syndakat</span>
+</header>
+
+<div class="content">
+    <h1>Persistent Memory for AI Assistants</h1>
+    <p>Bouios is a stateful memory backend that keeps your AI assistant's context, decisions, and learned patterns across conversations, sessions, and devices. No more context window resets. No more forgotten conversations.</p>
+
+    <div class="feature-grid">
+        <div class="feature-card">
+            <h3>Session Memory</h3>
+            <p>Your assistant loads your full context at the start of each conversation. Rules, decisions, and working state are always available.</p>
         </div>
+        <div class="feature-card">
+            <h3>Cross-Device Sync</h3>
+            <p>Continue on your phone where you left off on your desktop. Memory state syncs automatically across every surface.</p>
+        </div>
+        <div class="feature-card">
+            <h3>Learned Patterns</h3>
+            <p>Your assistant remembers decisions, approaches, and patterns from past conversations. Gets smarter the more you work together.</p>
+        </div>
+        <div class="feature-card">
+            <h3>Rules & Context</h3>
+            <p>Set standing rules once. Your assistant applies them consistently across all future conversations.</p>
+        </div>
+    </div>
 
-        <h2>How it Works</h2>
-        <ol>
-            <li>Register the Bouios MCP in your AI assistant at https://bouios.syndakat.com/mcp</li>
-            <li>Start a conversation with "load memory: PROJECTNAME"</li>
-            <li>Your assistant loads your full context and working state</li>
-            <li>Work on your task. The assistant handles complex reasoning with your memory context</li>
-            <li>When done, the assistant automatically writes your session back to memory</li>
-            <li>Next conversation: full context is available immediately</li>
-        </ol>
-
-        <h2>Use Cases</h2>
+    <div class="tech-specs">
+        <h2>What Bouios Stores</h2>
         <ul>
-            <li><strong>Research projects:</strong> Keep notes, highlights, and working outlines intact across sessions</li>
-            <li><strong>Business planning:</strong> Maintain strategic context and decision history across multiple conversations</li>
-            <li><strong>Creative work:</strong> Preserve your style, ideas, and project state between sessions</li>
-            <li><strong>Learning:</strong> Build cumulative knowledge that compounds across study sessions</li>
-            <li><strong>Sark planning:</strong> Combine with Travel MCP and Sark MCP to build a living knowledge base about island life</li>
+            <li><strong>Hot state:</strong> Current working context, active tasks, and conversation state</li>
+            <li><strong>Memory entries:</strong> Patterns, mistakes, decisions, and pending items your assistant has learned</li>
+            <li><strong>Rules:</strong> Standing instructions and constraints that apply across conversations</li>
+            <li><strong>Context:</strong> Project-specific information, metadata, and cross-session variables</li>
+            <li><strong>Logs:</strong> Audit trail of what happened in each session</li>
         </ul>
+    </div>
 
-        <h2>Getting Started</h2>
-        <p>Bouios is designed for users of AI assistants. To use it:</p>
-        <ul>
-            <li>You need an AI assistant that supports MCPs (Claude, etc.)</li>
-            <li>Register the Bouios MCP with your assistant</li>
-            <li>Create a memory project (projects are created on first write)</li>
-            <li>Start using it immediately with "load memory: PROJECTNAME"</li>
+    <h2>How</h2>
+    <p>Bouios exposes a simple JSON-RPC 2.0 MCP server that your AI assistant calls at the start and end of conversations. Your assistant loads your memory, works on your task, then writes back what was learned. On the next conversation, it has the full context from before.</p>
+
+    <h2>Pricing</h2>
+    <p>Start free, then choose the plan that fits your needs.</p>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <h3>Trial Herder</h3>
+        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">Free</p>
+        <p style="font-size: 0.85rem; color: #999;">24 hours (5 days with referral)</p>
+        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
+          <li>• 1 project, 1 repo</li>
+          <li>• 2 skills</li>
+          <li>• D1 persistent memory</li>
+          <li>• No card required</li>
         </ul>
-        <a href="https://ai.syndakat.com/" class="cta">View All AI Tools</a>
-    </main>
-    <footer>
-        <p>Bouios is part of Syndakat - Islander tools, built by islanders, made useful.</p>
-    </footer>
-</body>
-</html>`;
+      </div>
+      <div class="feature-card">
+        <h3>Herder</h3>
+        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">$4.99<span style="font-size: 0.8rem; font-weight: normal;">/mo</span></p>
+        <p style="font-size: 0.85rem; color: #999;">30-day extended trial</p>
+        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
+          <li>• 1 project, 1 repo</li>
+          <li>• 2 skills</li>
+          <li>• 30-day history</li>
+          <li>• Same scope as Trial</li>
+        </ul>
+      </div>
+      <div class="feature-card">
+        <h3>Pro Herder</h3>
+        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">$19<span style="font-size: 0.8rem; font-weight: normal;">/mo</span></p>
+        <p style="font-size: 0.85rem; color: #999;">Professional use</p>
+        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
+          <li>• Unlimited projects</li>
+          <li>• All surfaces</li>
+          <li>• 10 skills</li>
+          <li>• 7-day history</li>
+        </ul>
+      </div>
+      <div class="feature-card">
+        <h3>Max Herder</h3>
+        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">$49<span style="font-size: 0.8rem; font-weight: normal;">/mo</span></p>
+        <p style="font-size: 0.85rem; color: #999;">Enterprise features</p>
+        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
+          <li>• Everything in Pro</li>
+          <li>• Shared memory</li>
+          <li>• 30-day history</li>
+          <li>• Unlimited skills</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2>Built for Channel Islands</h2>
+    <p>Bouios is part of the Syndakat platform, built for life and work in the Channel Islands. If you need your AI assistant to remember things across conversations, context windows, and devices — integrate Bouios.</p>
+
+</div>
+
+<footer>
+    <p>&copy; 2026 Syndakat &middot; Built by islanders, for the Channel Islands</p>
+</footer>
+
+<div class="floating-buttons">
+  <button id="back-to-top" title="Back to top">↑</button>
+  <button id="dark-sky-toggle" title="Toggle dark mode">◐</button>
+  <button id="sark-bot-float" title="Chat with Sark Bot">🦞</button>
+</div>
+
+<div id="sark-bot-overlay"></div>
+<div class="sark-bot-popup" id="sark-bot-popup" style="display:none;">
+  <header>
+    Sark Bot
+    <button class="close-btn" onclick="closeSarkBotPopup()">×</button>
+  </header>
+  <div class="chat-body" id="popup-chat-body"></div>
+  <div class="chat-input">
+    <input id="popup-chat-input" type="text" placeholder="Ask about sailings, events, or news...">
+    <button onclick="sendPopupMessage()">Ask</button>
+  </div>
+</div>
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Product",
+    "name": "Bouios",
+    "description": "Persistent memory for AI assistants that spans conversations, sessions, and devices.",
+    "offers": [
+      {
+        "@type": "Offer",
+        "name": "Trial Herder",
+        "description": "Free for 24 hours (5 days with a referral). 1 project, 1 repo, 2 skills, D1 persistent memory.",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      {
+        "@type": "Offer",
+        "name": "Herder",
+        "description": "30-day extended trial. 1 project, 1 repo, 2 skills, D1 persistent memory.",
+        "price": "4.99",
+        "priceCurrency": "USD"
+      },
+      {
+        "@type": "Offer",
+        "name": "Pro Herder",
+        "description": "Unlimited projects, all surfaces, 10 skills, 7-day history.",
+        "price": "19",
+        "priceCurrency": "USD"
+      },
+      {
+        "@type": "Offer",
+        "name": "Max Herder",
+        "description": "Everything in Pro plus shared memory, 30-day history, unlimited skills.",
+        "price": "49",
+        "priceCurrency": "USD"
+      }
+    ]
+  }
+  </script>
+
+<script>
+const backToTop = document.getElementById("back-to-top");
+const botFloatBtn = document.getElementById("sark-bot-float");
+const botOverlay = document.getElementById("sark-bot-overlay");
+const botPopup = document.getElementById("sark-bot-popup");
+const popupChatBody = document.getElementById("popup-chat-body");
+const popupChatInput = document.getElementById("popup-chat-input");
+
+window.addEventListener("scroll", () => {
+  if (window.scrollY > 300) {
+    backToTop.style.opacity = "1";
+    backToTop.style.visibility = "visible";
+  } else {
+    backToTop.style.opacity = "0";
+    backToTop.style.visibility = "hidden";
+  }
+});
+backToTop.addEventListener("click", () => {
+  window.scrollTo({ top: 0, behavior: "smooth" });
+});
+
+botFloatBtn.addEventListener("click", () => {
+  botOverlay.style.display = "block";
+  botPopup.style.display = "flex";
+  popupChatInput.focus();
+});
+
+function closeSarkBotPopup() {
+  botOverlay.style.display = "none";
+  botPopup.style.display = "none";
+}
+
+botOverlay.addEventListener("click", closeSarkBotPopup);
+
+function sendPopupMessage() {
+  const q = popupChatInput.value.trim();
+  if (!q) return;
+  popupChatInput.value = '';
+  const userMsg = document.createElement("div");
+  userMsg.style.cssText = "text-align:right;padding:0.5rem;background:#f0f0f0;border-radius:6px;font-size:0.9rem";
+  userMsg.textContent = q;
+  popupChatBody.appendChild(userMsg);
+  popupChatBody.scrollTop = popupChatBody.scrollHeight;
+
+  fetch('/api/archive/query?q=' + encodeURIComponent(q), { headers: { 'Accept': 'application/json' } })
+    .then(r => r.json())
+    .then(d => {
+      const botMsg = document.createElement("div");
+      botMsg.style.cssText = "text-align:left;padding:0.5rem;background:#e8f5e9;border-radius:6px;font-size:0.9rem";
+      botMsg.textContent = d.answer || "Could not fetch response.";
+      popupChatBody.appendChild(botMsg);
+      popupChatBody.scrollTop = popupChatBody.scrollHeight;
+    })
+    .catch(() => {
+      const errMsg = document.createElement("div");
+      errMsg.style.cssText = "text-align:left;padding:0.5rem;background:#ffebee;border-radius:6px;font-size:0.9rem;color:var(--red,#C8102E)";
+      errMsg.textContent = "Error connecting to Sark Bot. Please try again.";
+      popupChatBody.appendChild(errMsg);
+    });
+}
+
+popupChatInput.addEventListener("keypress", (e) => {
+  if (e.key === "Enter") sendPopupMessage();
+});
+
+function toggleDarkMode() {
+  const html = document.documentElement;
+  const current = html.getAttribute("data-theme");
+  const next = current === "dark" ? "light" : "dark";
+  html.setAttribute("data-theme", next);
+  localStorage.setItem("theme", next);
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  const darkSkyToggle = document.getElementById("dark-sky-toggle");
+  if (darkSkyToggle) {
+    darkSkyToggle.addEventListener("click", toggleDarkMode);
+  }
+  const savedTheme = localStorage.getItem("theme");
+  if (savedTheme === "dark") {
+    document.documentElement.setAttribute("data-theme", "dark");
+  }
+});
+</script>`;
       return htmlResponse(html);
     }
     if (path === "/health") return json({ ok: true, service: "memory-gateway" });
