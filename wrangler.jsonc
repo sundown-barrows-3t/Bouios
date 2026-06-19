@@ -14,6 +14,9 @@
     }
   ],
   "vars": {
-    "AUTH_MODE": "bearer"
+    "AUTH_MODE": "bearer",
+    "REQUIRE_LICENCE": "false"
+    // Set REQUIRE_LICENCE to "true" to enforce tier limits.
+    // Also set the LICENCE_SIGNING_KEY secret (provided in your approval email).
   }
 }
