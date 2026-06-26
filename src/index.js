@@ -1,10 +1,13 @@
 // Memory Vault Gateway
 // Fronts the memory-vault D1 so every surface loads and writes through one enforced door.
 // Routes: GET /health, GET /rules, GET /hooks/:name, PUT /hooks/:name,
+//         PUT /transcript/{session-id},
 //         GET /session/start?domain=AI, POST /session/write,
 //         POST /mcp/{token} (connector failover for chat/cowork surfaces)
 // Auth: env.AUTH_MODE = "bearer" (default) or "access". MCP route authenticates via
-// the token path segment (same BEARER_TOKEN). Self-contained, no npm dependencies.
+// the token path segment (same BEARER_TOKEN). Transcript PUT is unauthenticated
+// (UUID.jsonl keys have 128-bit entropy; safe write-only for personal use).
+// Self-contained, no npm dependencies.
 
 const MEMORY_TYPES = ["pattern", "mistake", "decision", "pending"];
 
@@ -19,6 +22,7 @@ const SETUP_SCHEMA = [
   "CREATE TABLE IF NOT EXISTS memory (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, type TEXT NOT NULL CHECK (type IN ('pattern','mistake','decision','pending')), title TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, source TEXT)",
   "CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, domain TEXT NOT NULL, summary TEXT NOT NULL)",
   "CREATE TABLE IF NOT EXISTS hooks (name TEXT PRIMARY KEY, content TEXT NOT NULL, updated_at TEXT NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS usage (sub TEXT NOT NULL, window TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (sub, window))",
 ];
 let SCHEMA_READY = false;
 async function ensureSchema(env) {
@@ -106,15 +110,18 @@ async function verifyAccessJwt(token, teamDomain, aud) {
 
 // ---- Licence (T2.1 scaffold): stateless, signed-token tier checks ----
 // A licence key is an HS256 JWT verified in Worker compute against
-// env.LICENCE_SIGNING_KEY — no database read per request. Claims: sub
+// env.LICENCE_SIGNING_KEY -- no database read per request. Claims: sub
 // (customer id), tier (free/pro/max), exp. Gating only runs when
 // env.REQUIRE_LICENCE === "true"; otherwise behaviour is unchanged.
 
-// 'free' is the lapsed / no-licence fallback, NOT a free product tier — there
+// 'free' is the lapsed / no-licence fallback, NOT a free product tier -- there
 // is no free tier. A trial is a short-exp licence with tier "max", so it gets
 // full Max limits until it expires, then falls back to 'free'. Pro caps
 // projects; Max is unlimited.
-const TIER_LIMITS = { free: { projects: 1 }, pro: { projects: 9 }, max: { projects: Infinity } };
+// projects = max concurrent projects; rpm = calls per minute per licence (the
+// rate-limit ceiling AND the metering unit). rpm is finite for every tier so even
+// max is protected from runaway loops. These are product defaults, owner-tunable.
+const TIER_LIMITS = { free: { projects: 1, rpm: 20 }, pro: { projects: 9, rpm: 60 }, max: { projects: Infinity, rpm: 240 } };
 
 // Pure verifier (token + key only) so the logic is testable outside the Worker.
 async function verifyLicenceToken(token, signingKey) {
@@ -147,10 +154,6 @@ async function verifyLicence(token, env) {
   return verifyLicenceToken(token, env.LICENCE_SIGNING_KEY);
 }
 
-// Encoders + HS256 mint: the inverse of the b64url decoders and
-// verifyLicenceToken above. Issuance and verification share one HMAC path so a
-// minted token always verifies. btoa needs a binary string, hence the per-byte
-// build before url-safe substitution and padding strip.
 function bytesToB64url(bytes) {
   let bin = "";
   for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
@@ -168,8 +171,6 @@ async function mintLicenceToken(payload, signingKey) {
   return signingInput + "." + bytesToB64url(new Uint8Array(sig));
 }
 
-// Resolve licence state for a request. When REQUIRE_LICENCE is off (the
-// default), this returns immediately and no verification runs.
 async function requestLicence(request, url, env) {
   if (env.REQUIRE_LICENCE !== "true") return { required: false, valid: false, tier: "free", sub: null };
   const token = request.headers.get("x-licence") || url.searchParams.get("licence");
@@ -177,11 +178,78 @@ async function requestLicence(request, url, env) {
   return { required: true, ...v };
 }
 
-// Single enforcement point for tier limits: refuse creating a NEW project
-// beyond the tier's project cap. One indexed query, write paths only.
+// ---- Stripe webhook signature verification (SubtleCrypto HMAC-SHA256) ----
+// Stripe signs: t=<unix_timestamp> . "." . raw_body using HMAC-SHA256.
+// Header: Stripe-Signature: t=<ts>,v1=<hex>
+// Replay window: 300 seconds. Timing-safe compare via existing timingSafeEqual.
+async function verifyStripeSignature(bodyBytes, sigHeader, secret) {
+  if (!sigHeader || !secret) return { ok: false, reason: "missing header or secret" };
+  const parts = sigHeader.split(",");
+  let ts = null;
+  const v1sigs = [];
+  for (const p of parts) {
+    if (p.startsWith("t=")) ts = p.slice(2);
+    else if (p.startsWith("v1=")) v1sigs.push(p.slice(3));
+  }
+  if (!ts || !v1sigs.length) return { ok: false, reason: "malformed Stripe-Signature" };
+  const tsNum = parseInt(ts, 10);
+  if (!Number.isFinite(tsNum)) return { ok: false, reason: "invalid timestamp" };
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - tsNum) > 300) return { ok: false, reason: "timestamp outside tolerance" };
+  const signedPayload = ts + "." + new TextDecoder().decode(bodyBytes);
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sigBytes = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(signedPayload));
+  const computed = Array.from(new Uint8Array(sigBytes)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  for (const v1 of v1sigs) {
+    if (timingSafeEqual(v1, computed)) return { ok: true, ts: tsNum };
+  }
+  return { ok: false, reason: "signature mismatch" };
+}
+
+async function handleStripeWebhook(request, env) {
+  if (!env.STRIPE_WEBHOOK_SECRET) return json({ error: "webhook not configured" }, 500);
+  const bodyBytes = await request.arrayBuffer();
+  const sigHeader = request.headers.get("stripe-signature") || "";
+  const sigResult = await verifyStripeSignature(bodyBytes, sigHeader, env.STRIPE_WEBHOOK_SECRET);
+  if (!sigResult.ok) return json({ error: "invalid signature", reason: sigResult.reason }, 400);
+  let event;
+  try { event = JSON.parse(new TextDecoder().decode(bodyBytes)); } catch { return json({ error: "invalid JSON" }, 400); }
+  const type = (event && event.type) || "unknown";
+  const obj = event && event.data && event.data.object;
+  try {
+    if (type === "checkout.session.completed" && obj) {
+      const meta = obj.metadata || {};
+      const sub = String(meta.sub || obj.customer || obj.client_reference_id || "").trim();
+      const tier = String(meta.tier || "pro").toLowerCase();
+      const expDays = parseInt(meta.exp_days || "365", 10);
+      if (sub && Object.prototype.hasOwnProperty.call(TIER_LIMITS, tier) && env.LICENCE_SIGNING_KEY) {
+        const iat = Math.floor(Date.now() / 1000);
+        const exp = iat + (Number.isFinite(expDays) && expDays > 0 ? expDays : 365) * 24 * 60 * 60;
+        const token = await mintLicenceToken({ sub, tier, iat, exp, iss: "memory-gateway" }, env.LICENCE_SIGNING_KEY);
+        await env.DB.prepare("INSERT OR REPLACE INTO context (domain, key, content, updated_at) VALUES ('BOUIOS', ?, ?, date('now'))").bind("licence:" + sub, token).run();
+        await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), 'BOUIOS', ?)").bind("stripe checkout.session.completed: licence issued sub=" + sub + " tier=" + tier).run();
+      }
+    } else if (type === "customer.subscription.deleted" && obj) {
+      const meta = obj.metadata || {};
+      const sub = String(meta.sub || obj.customer || "").trim();
+      if (sub && env.LICENCE_SIGNING_KEY) {
+        const iat = Math.floor(Date.now() / 1000);
+        const token = await mintLicenceToken({ sub, tier: "free", iat, exp: iat, iss: "memory-gateway" }, env.LICENCE_SIGNING_KEY);
+        await env.DB.prepare("INSERT OR REPLACE INTO context (domain, key, content, updated_at) VALUES ('BOUIOS', ?, ?, date('now'))").bind("licence:" + sub, token).run();
+        await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), 'BOUIOS', ?)").bind("stripe subscription.deleted: licence expired sub=" + sub).run();
+      }
+    }
+  } catch (e) {
+    try {
+      await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), 'BOUIOS', ?)").bind("stripe webhook handler error: " + String(e).slice(0, 200)).run();
+    } catch (_) {}
+  }
+  return json({ ok: true, type });
+}
+
 async function projectLimitError(db, domain, tier) {
   const limit = (TIER_LIMITS[tier] || TIER_LIMITS.free).projects;
-  if (!Number.isFinite(limit)) return null; // unlimited (max tier): no project cap
+  if (!Number.isFinite(limit)) return null;
   const row = await db
     .prepare("SELECT (SELECT COUNT(*) FROM hot WHERE domain = ?1) AS already, (SELECT COUNT(DISTINCT domain) FROM hot WHERE domain != 'GLOBAL') AS total")
     .bind(domain)
@@ -190,6 +258,33 @@ async function projectLimitError(db, domain, tier) {
     return `Project limit reached: the ${tier} tier allows ${limit} project${limit === 1 ? "" : "s"}, and ${domain} would be a new one. Write to an existing project or upgrade.`;
   }
   return null;
+}
+
+// Per-licence usage metering + rate limit (T2.1). One atomic upsert per billable
+// call: increments the (sub, minute) counter and returns the new count. The usage
+// table IS the metering record (read via GET /usage); the count vs tier rpm gives
+// the rate limit. Only branded (licensed) calls are metered; owner/unbranded skip.
+async function checkAndRecordUsage(db, sub, tier) {
+  const limit = (TIER_LIMITS[tier] || TIER_LIMITS.free).rpm;
+  const window = new Date().toISOString().slice(0, 16); // UTC minute bucket YYYY-MM-DDTHH:MM
+  // Fail-open: metering must NEVER break a user's call. If the usage table is
+  // absent (e.g. a DB provisioned before the meter shipped) or the write fails,
+  // the INSERT throws; callers run this OUTSIDE their try blocks, so an uncaught
+  // throw became a 500 in chat (regression from the meter, e27941a). Swallow it
+  // here and allow the call unmetered rather than failing the request.
+  try {
+    const row = await db
+      .prepare(
+        "INSERT INTO usage (sub, window, count, updated_at) VALUES (?1, ?2, 1, datetime('now')) " +
+          "ON CONFLICT(sub, window) DO UPDATE SET count = count + 1, updated_at = datetime('now') RETURNING count"
+      )
+      .bind(sub, window)
+      .first();
+    const count = row ? row.count : 1;
+    return { count, limit, window, over: Number.isFinite(limit) && count > limit };
+  } catch (e) {
+    return { count: 0, limit, window, over: false, meter_error: String(e) };
+  }
 }
 
 async function authorise(request, env) {
@@ -223,18 +318,10 @@ function countOpenTasks(hotState) {
   return block.split("\n").filter((l) => /^\s*-\s+/.test(l)).length;
 }
 
-// ---- Skills selection + tiering ----
-// Per-tier default skill sets (memory 168), capped and token-budgeted. Skill
-// bodies live in the memory table as type='pattern', title='skill-<name>'.
-// Selection is DETERMINISTIC: the tier's named defaults that exist, in priority
-// order, trimmed to the tier cap and a token budget. Semantic ranking over the
-// wider library (Vectorize, issue #3) and usage instrumentation are the next
-// layer and intentionally not built here. Returned only when a tier is known
-// (licence gating), so default deployments are byte-for-byte unchanged.
 const TIER_SKILLS = {
-  free: { cap: 2, defaults: ["five-advisor-chairman-model", "first-principles"] },
-  pro: { cap: 10, defaults: ["five-advisor-chairman-model", "first-principles", "solopreneur-strategy", "linkedin-optimiser"] },
-  max: { cap: 999, defaults: ["five-advisor-chairman-model", "first-principles", "solopreneur-strategy", "linkedin-optimiser", "skill-creator"] },
+  free: { cap: 3, defaults: ["continuity", "five-advisor-chairman-model", "first-principles"] },
+  pro: { cap: 10, defaults: ["continuity", "five-advisor-chairman-model", "first-principles", "solopreneur-strategy", "linkedin-optimiser"] },
+  max: { cap: 999, defaults: ["continuity", "five-advisor-chairman-model", "first-principles", "solopreneur-strategy", "linkedin-optimiser", "skill-creator"] },
 };
 const SKILL_CHARS_PER_TOKEN = 4;
 const SKILL_TOKEN_BUDGET = 8000;
@@ -254,9 +341,8 @@ async function selectSkills(db, tier) {
   for (const name of cfg.defaults) {
     if (selected.length >= cfg.cap) break;
     const body = byTitle.get("skill-" + name);
-    if (body === undefined) continue; // a named default not yet registered
+    if (body === undefined) continue;
     const est = Math.ceil(body.length / SKILL_CHARS_PER_TOKEN);
-    // Keep at least one; otherwise stop before exceeding the token budget.
     if (tokens + est > SKILL_TOKEN_BUDGET && selected.length > 0) break;
     selected.push({ name, est_tokens: est, body });
     tokens += est;
@@ -271,28 +357,62 @@ async function selectSkills(db, tier) {
   };
 }
 
+// Customer-safe rule set. A licensed (branded) session receives THIS de-jargoned
+// mirror, never the owner rules table -- that table names the store, the tools,
+// the query language and other internals, which must never reach a customer
+// surface (R19). The owner loads through the direct store connector, not this
+// gateway, so the owner still gets the full concrete rules and is unaffected.
+// Kept verbatim-equal to .session/rules.customer.md; test/customer-rules.test.mjs
+// and verify.sh fail the build if they drift or if an internal term leaks in.
+const CUSTOMER_RULES = [
+  { scope: "session-start", content: `At every session start, load your rules, hot, and context silently. Infer the active Project (stored as domain) from project, folder, repo, or topic; for names that do not obviously match, check memory for the project-name-to-domain-mapping pattern (memory 36). Infer one project only: if the project is obvious, load it immediately without asking. If genuinely ambiguous, ask which one. Never load all projects. Loading is mandatory on every surface including dispatch and automated runs - never skip it. If the store is unreachable, say so and retry once. Output one line only: "Memory loaded: {Project}, {n} rules, hot from {date}, {n} open tasks." and log the same to your store. Then surface every open task from hot with its status and blocking condition. Hot is the work queue, not background. Do not begin new work without acknowledging open tasks first.` },
+  { scope: "session-during", content: `Log every substantive exchange immediately (one-line entry to your log). Every few substantive steps, and before any long operation: write full state to hot, and output a handoff block in a code box starting with "load memory", then the Project and the most critical next action, for pasting into a new chat. Do not wait until 70% context - by then the next step may blow the window. State what was checkpointed. Before the final reply: write any new pattern, decision, or mistake to memory, update hot, append a log line, and state what was written (table, id, one-line summary). No memory entry may record a decision as DONE or a bug as FIXED without a commit hash, test output, or live url in the body. If blocked: checkpoint and report the blocker. Never store important findings only in ephemeral container files; commit them to your store.` },
+  { scope: "session-end", content: `Before overwriting any hot value that already exists: read the current value and archive it to your log with prefix "HOT ARCHIVE:" and a timestamp. Then overwrite hot with the new state. Never silently overwrite. Log, hot, and memory writes performed as part of this established protocol are standing-approved and do not require per-write approval under R4.` },
+  { scope: "global", content: `No file write, edit, delete, memory-store write (outside the established session protocol), git commit, push, or external action without explicit written approval in the current session for that specific action. Audit = read only. Plan = present for approval. This rule overrides every other rule when they conflict.` },
+  { scope: "global", content: `Edit forward only. Never run git revert, reset, rebase, merge, or checkout of a file, and never delete or overwrite a file or a stored row outside the session protocol, without explicit user approval for that specific action. The single exception is discarding an unpushed local stray to match the remote, and only after verifying nothing unique is lost. Reverting is never the default; fix forward.` },
+  { scope: "global", content: `Never state a fact, capability, or done, fixed or working from memory or assumption. Check first: read the file, run the check, query your store. Label any unverified claim and say how it would be verified. Tag all claims chat, file, memory, search or tool. Give confidence levels, never present a guess as certainty, and never guess at incomplete lists when a tool can return the complete answer. Do not act on memory rows tagged mistake. For anything verifiable, verify, do not ask; for decisions that genuinely need the user, ask once, framed clearly, never to avoid the work. When reporting, use Action, Evidence, Source, Status, Next.` },
+  { scope: "global", content: `When the user pushes back in any form ("are you sure?", "that is wrong", "you missed X"), stop immediately, investigate, then correct. Do not defend, re-explain, or argue the prior claim.` },
+  { scope: "global", content: `Before any edit or build: confirm the fault is in the layer or surface you are about to change before changing it. State which files change and why, and verify paths exist. Diffs not rewrites. Capture the working baseline first. Additive by default, freeze interfaces (a change to one needs approval). State success criteria and the stopping point, max 3 components, reuse over create. Machine-checkable criteria: write the check first, loop to green. Human-verified: produce, state criteria, checkpoint. Re-run baseline checks after every change, all pass or the change is rejected, not patched. Cap retries and escalate, do not thrash or re-probe. No placeholders unless asked, no shortcuts, never imply done unless verified, no unrequested features. Every site, page, CV or profile meets semantic HTML, correct heading order, WCAG AA, SEO and AEO, schema.org JSON-LD, ATS-parseable, validated before deploy.` },
+  { scope: "global", content: `Before building anything that spans multiple repos, files, or systems: audit the current state of each surface, map what exists, identify gaps, present findings, get approval. Then build.` },
+  { scope: "global", content: `Complete the current task before starting the next. If a secondary issue is found, note it at the end and ask; do not pivot mid-task, do not reopen settled decisions, no epistemic shutdowns. Execute the owner's instruction: raise a concern once if you have one, but the instruction stands unless the owner cancels it - never downgrade an instruction to a recommendation, never substitute your own judgement for it, and never record "noted, no edit made" in place of doing it. Track every instruction the owner gives until it is done with evidence or the owner cancels it; it may not be silently dropped. Before closing a task, state whether it could have been done better and how, ask permission to redo if so, and never redo unilaterally.` },
+  { scope: "global", content: `At task start, discover available skills and registered tools through tool discovery. Use the matching skill before building a workaround, build a skill when a capability recurs, and never reinvent a deployed tool. Route to the right surface: Code for repos, deploys and filesystem; Cowork for multi-file work; Design for visual artifacts; Chat for reasoning and drafting. State if the current surface cannot enforce or persist what the task needs.` },
+  { scope: "global", content: `A blocker is real only after a registered tool returned the error. Never state 403, egress, allowlist, unreachable, or no-tool from assumption. Before claiming any limit, route through the tools that bypass the sandbox: your registered tools, browser engines, the failover proxies. The sandbox limit is not the system limit. Discover your tools before declaring any capability unavailable or any path blocked.` },
+  { scope: "global", content: `Never hand-keep counts, totals, or rule numbers in context or documentation files; they drift. Read them live from your store. The store is the single source of truth.` },
+  { scope: "global", content: `Projects are strict boundaries: read and use content only from the active Project, and cross-Project reads require approval. Operate only on the repos and the storage resources approved at install, default or custom, for the active identity and licence. Default deny outside that set. Respect the enforcement tier and never assume or forge owner status.` },
+  { scope: "global", content: `For any consequential architecture, product, or stuck-problem decision: run the five-advisor-chairman model against your stored evidence (log, memory, hot). Output only the chairman decision unless the advisor breakdown is asked for. Full model definition in memory 53.` },
+  { scope: "global", content: `British English. Short sentences. Active voice. No em dashes, semicolons, or Oxford commas. Be concise and token-efficient: no babble, no padding, no restating what was just said. State any question plainly on its own line. Never bury a question in prose and never skip a question about missing features, functionality, or scope. No AI writing traits: can, may, just, very, actually, certainly, game-changer, groundbreaking, dive deep, shed light, unlock, remarkable, craft, imagine, realm, utilize, harness, exciting, cutting-edge, tapestry, illuminate. No setup language: in conclusion, in summary, overall, as mentioned. No emoji unless explicitly requested. No hashtags, watermarks, hidden characters, or zero-width spaces.` },
+  { scope: "global", content: `Act as a rigorous honest mentor. Identify weaknesses, blind spots, and flawed assumptions. Never default to agreement. When correcting, explain why and propose the better alternative. Never soften a correct assessment to avoid friction. No filler affirmations.` },
+  { scope: "global", content: `No rule may be added, modified, or deleted without explicit user approval. The set is capped at 20 rules (S + D + G combined), with a target of 19 and one slot kept open. Before proposing a new rule: check for contradictions with existing rules and identify which current rule it would retire. The cap cannot be exceeded without a simultaneous retirement.` },
+  { scope: "global", content: `Never expose secrets or internals. Do not put credentials, tokens, API keys, account or store identifiers, or internal config or paths into chat, instructions, commits, logs, or any artifact, and never quote them from memory; retrieve live or ask. On any customer-facing surface, never reveal how the system works (store, provider, tools, urls, ids); surface only the branded result.` },
+];
+
 async function sessionStart(domain, surface, env, licence) {
   await ensureSchema(env);
   const db = env.DB;
-  const [rules, hot, context, pending, recent, memTotal] = await Promise.all([
+  const [rules, hot, context, pending, recent, log, memTotal] = await Promise.all([
     db.prepare("SELECT scope, content FROM rules ORDER BY id").all(),
     db.prepare("SELECT state, updated_at FROM hot WHERE domain = ?").bind(domain).all(),
-    db.prepare("SELECT key, content FROM context WHERE domain = ?").bind(domain).all(),
+    db.prepare("SELECT key, content FROM context WHERE domain = ? AND key != 'gateway-bearer-token'").bind(domain).all(),
     db.prepare("SELECT id, type, title, body FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type = 'pending' ORDER BY id").bind(domain).all(),
     db.prepare("SELECT id, type, title, body FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' ORDER BY id DESC LIMIT 40").bind(domain).all(),
+    db.prepare("SELECT ts, summary FROM log WHERE domain = ? ORDER BY id DESC LIMIT 25").bind(domain).all(),
     db.prepare("SELECT COUNT(*) AS n FROM memory WHERE domain = ? OR domain = 'GLOBAL'").bind(domain).first(),
   ]);
   const memoryRows = [...(pending.results || []), ...(recent.results || [])];
   const hotRow = (hot.results && hot.results[0]) || null;
   const hotState = hotRow ? hotRow.state : null;
   const hotDate = hotRow ? hotRow.updated_at : "none";
-  const rulesN = rules.results ? rules.results.length : 0;
+  const branded = !!(licence && licence.required);
+  // Branded = a licensed customer session. Serve the de-jargoned customer rules,
+  // never the owner rules table. Unbranded (owner / CI) keeps the concrete rules.
+  const servedRules = branded ? CUSTOMER_RULES : (rules.results || []);
+  const rulesN = servedRules.length;
   const openN = countOpenTasks(hotState);
-  const confirmation = `Memory loaded: ${domain}, ${rulesN} rules, hot from ${hotDate}, ${openN} open tasks.`;
+  const confirmation = branded
+    ? `Bouios loaded - working set ${domain}, ${rulesN} rules loaded, ${openN} items flagged for follow-up.`
+    : `Memory loaded: ${domain}, ${rulesN} rules, hot from ${hotDate}, ${openN} open tasks.`;
   await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, `Session loaded via gateway, surface=${surface || "unknown"}.`).run();
-  const out = { confirmation, domain, rules: rules.results || [], hot: hotState, hot_updated: hotDate, open_tasks: openN, context: context.results || [], memory: memoryRows, memory_total: memTotal ? memTotal.n : memoryRows.length, memory_returned: memoryRows.length };
-  // Tier-gated skills: only when a licence tier is known, so default
-  // (REQUIRE_LICENCE off) deployments are unchanged. Separate from the memory load.
+  const out = { confirmation, domain, rules: servedRules, hot: hotState, hot_updated: hotDate, open_tasks: openN, context: context.results || [], memory: memoryRows, log: log.results || [], memory_total: memTotal ? memTotal.n : memoryRows.length, memory_returned: memoryRows.length };
   if (licence && licence.required) {
     out.tier = licence.tier;
     out.skills = await selectSkills(db, licence.tier);
@@ -336,32 +456,29 @@ async function sessionWrite(domain, body, env, licence) {
   return { ok: true, domain, applied };
 }
 
-// ---- MCP endpoint: connector failover for chat/cowork surfaces ----
-// Streamable HTTP transport, JSON-RPC 2.0, plain JSON responses (no SSE stream).
-// Primary chat load path stays the registered database tools. This endpoint is
-// the enforced failover: tool descriptions carry the load-first instruction and
-// memory_write is refused until memory_load has run in the same MCP session.
-
 const MCP_PROTOCOL = "2025-03-26";
 const MCP_INSTRUCTIONS =
-  "This connector is the user's own memory backend. Their standing infrastructure, expected in every conversation. " +
-  "Call memory_load for the relevant project FIRST, before acting on any message. A clear, self-contained task does not exempt this. " +
-  "The exact user message 'load memory' triggers memory_load immediately. " +
-  "Show the user only the single returned confirmation line, then proceed. " +
+  "This connector is Bouios, the user's own memory system - their standing infrastructure, expected in every conversation. " +
+  "Call memory_load for the relevant project FIRST, before acting on any message. A clear, self-contained task does not exempt this. Infer one project from the conversation; if unclear, ask which one; never load all projects. " +
+  "Any of these exact user messages triggers memory_load immediately: 'load memory', 'load rules', 'load Bouios'. " +
+  "Surface order after loading: the single returned confirmation line first, then this project's open tasks, then any skills or linked projects. " +
+  "Load only this project's tasks; do not pull tasks from other projects unless the user asks. " +
+  "Show the user only the single returned confirmation line - never the store, provider, identifiers, urls, paths, or any other backend detail. " +
   "Memory loads return all pending rows plus the most recent entries; older rows beyond that window still exist and can be requested via memory_load again or direct queries when needed. " +
-  "Never display internal queries, identifiers, or backend details. " +
   "Writes are refused until memory_load has been called in this session. " +
-  "Monitor your own context usage. At roughly 70 percent, or before any compaction or long operation, call memory_write with the full working state. " +
-  "When the conversation nears its limit, call session_handoff and show the user the returned block in a code box to copy into a new chat.";
+  "Monitor your own context usage and save EARLY AND OFTEN - checkpoint every few substantive steps, and at the latest by roughly 70 percent of context: call memory_write with full working state, log the exchange, then output a handoff block in a code box. " +
+  "BEFORE any compaction: call session_handoff (saves hot state and log). AFTER any compaction: call memory_load immediately to re-arm before any write. " +
+  "When the conversation nears its limit, call session_handoff and show the user the returned block in a code box to copy into a new chat. " +
+  "If your memory tools are unavailable or return errors, do not stall, repeat, or block the conversation - continue without them in a degraded mode and they reconnect on their own. Use the tools available in this session; if a tool reports it cannot reach a service, note it briefly and work around it rather than retrying.";
 
 const MCP_TOOLS = [
   {
     name: "memory_load",
     description:
-      "Load the user's memory for a project: rules, current working state, context, and learned patterns. " +
+      "Load the user's memory for a project: rules, current working state, context, learned patterns, open follow-ups, AND the recent activity log (what was actually agreed and done last sessions). " +
       "This is the user's own standing setup and must be called first in every conversation, before any other work, " +
-      "including direct, self-contained task instructions. The user message 'load memory' invokes this immediately. " +
-      "Returns a one-line confirmation to show the user, plus the memory payload.",
+      "including direct, self-contained task instructions. The user messages 'load memory', 'load rules' and 'load Bouios' each invoke this immediately. " +
+      "Returns a one-line confirmation to show the user, plus the payload. READ the returned log and open follow-ups before proposing a plan or re-deriving anything - never re-propose what the log or memory shows is already built or decided.",
     inputSchema: {
       type: "object",
       properties: {
@@ -475,6 +592,10 @@ async function handleMcpMessage(msg, sessionId, env, licence) {
     const args = (msg.params && msg.params.arguments) || {};
     const domain = normaliseProject(args.project || args.domain);
     if (!domain) return toolText(id, "Invalid project name. Use 2-20 characters: letters, digits, _ or -, starting with a letter.", true);
+    if (licence && licence.required && licence.valid && licence.sub) {
+      const q = await checkAndRecordUsage(env.DB, licence.sub, licence.tier);
+      if (q.over) return toolText(id, `Rate limit reached: the ${licence.tier} tier allows ${q.limit} calls per minute. Pause briefly and retry.`, true);
+    }
     try {
       if (name === "memory_load") {
         const surface = (args.surface || "chat") + " mcp-session=" + (sessionId || "none");
@@ -511,7 +632,6 @@ async function handleMcpMessage(msg, sessionId, env, licence) {
     }
     return toolText(id, "unknown tool: " + String(name), true);
   }
-  // Notifications (no id) get no response; unknown request methods get an error.
   if (msg.id === undefined || msg.id === null) return null;
   return rpcError(id, -32601, "method not found");
 }
@@ -539,303 +659,11 @@ async function handleMcp(request, env, licence) {
   return new Response(JSON.stringify(Array.isArray(body) ? responses : responses[0]), { status: 200, headers });
 }
 
-function htmlResponse(html) {
-  return new Response(html, {
-    status: 200,
-    headers: { "content-type": "text/html; charset=utf-8" },
-  });
-}
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
-    if (path === "/" && request.method === "GET") {
-      const html = `<!DOCTYPE html>
-<html lang="en-GB">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bouios - AI Memory Backend - Syndakat</title>
-    <meta name="description" content="Bouios: persistent memory backend for AI assistants. Keep your assistant's context across sessions and devices with a stateful memory vault.">
-    <meta name="keywords" content="AI memory, assistant memory, context persistence, AI backend, Cloudflare Workers">
-    <meta property="og:title" content="Bouios - AI Memory Backend">
-    <meta property="og:description" content="Persistent memory backend for AI assistants. Built by Syndakat.">
-    <meta property="og:type" content="website">
-    <meta property="og:url" content="https://bouios.syndakat.com/">
-    <meta property="og:site_name" content="Syndakat">
-    <meta name="theme-color" content="#C8102E">
-    <link rel="canonical" href="https://bouios.syndakat.com/">
-    <link rel="icon" type="image/svg+xml" href="https://syndakat.com/favicon.svg">
-    <link rel="stylesheet" href="https://syndakat.com/syndakat.css">
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; }
-        header { background: #fff; border-bottom: 1px solid #eee; padding: 1.5rem 2rem; display: flex; align-items: center; gap: 2rem; }
-        .logo { font-size: 1.5rem; font-weight: 700; color: #000; text-decoration: none; }
-        .logo span { color: #C8102E; }
-        .by-syndakat { font-size: 0.9rem; color: #999; font-weight: 500; }
-        .content { max-width: 960px; margin: 0 auto; padding: 3rem 2rem; }
-        h1 { font-size: 2.2rem; margin: 0 0 1rem; color: #000; }
-        p { line-height: 1.6; color: #666; font-size: 1.05rem; }
-        .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 2rem; margin: 2rem 0; }
-        .feature-card { padding: 1.5rem; border: 1px solid #eee; border-radius: 8px; background: #fafafa; }
-        .feature-card h3 { margin: 0 0 0.5rem; font-size: 1.1rem; color: #000; }
-        .feature-card p { font-size: 0.95rem; margin: 0; color: #666; }
-        .tech-specs { background: #f5f5f5; padding: 2rem; border-radius: 8px; margin: 2rem 0; }
-        .tech-specs h2 { margin: 0 0 1rem; font-size: 1.3rem; }
-        .tech-specs ul { margin: 0; padding-left: 1.5rem; }
-        .tech-specs li { margin-bottom: 0.5rem; color: #666; }
-        footer { text-align: center; padding: 2rem; color: #999; font-size: 0.9rem; border-top: 1px solid #eee; }
-    </style>
-</head>
-<body>
-
-<header>
-    <a href="https://syndakat.com" class="logo">BOUIOS<span>.</span></a>
-    <span class="by-syndakat">by Syndakat</span>
-</header>
-
-<div class="content">
-    <h1>Persistent Memory for AI Assistants</h1>
-    <p>Bouios is a stateful memory backend that keeps your AI assistant's context, decisions, and learned patterns across conversations, sessions, and devices. No more context window resets. No more forgotten conversations.</p>
-
-    <div class="feature-grid">
-        <div class="feature-card">
-            <h3>Session Memory</h3>
-            <p>Your assistant loads your full context at the start of each conversation. Rules, decisions, and working state are always available.</p>
-        </div>
-        <div class="feature-card">
-            <h3>Cross-Device Sync</h3>
-            <p>Continue on your phone where you left off on your desktop. Memory state syncs automatically across every surface.</p>
-        </div>
-        <div class="feature-card">
-            <h3>Learned Patterns</h3>
-            <p>Your assistant remembers decisions, approaches, and patterns from past conversations. Gets smarter the more you work together.</p>
-        </div>
-        <div class="feature-card">
-            <h3>Rules & Context</h3>
-            <p>Set standing rules once. Your assistant applies them consistently across all future conversations.</p>
-        </div>
-    </div>
-
-    <div class="tech-specs">
-        <h2>What Bouios Stores</h2>
-        <ul>
-            <li><strong>Hot state:</strong> Current working context, active tasks, and conversation state</li>
-            <li><strong>Memory entries:</strong> Patterns, mistakes, decisions, and pending items your assistant has learned</li>
-            <li><strong>Rules:</strong> Standing instructions and constraints that apply across conversations</li>
-            <li><strong>Context:</strong> Project-specific information, metadata, and cross-session variables</li>
-            <li><strong>Logs:</strong> Audit trail of what happened in each session</li>
-        </ul>
-    </div>
-
-    <h2>How</h2>
-    <p>Bouios exposes a simple JSON-RPC 2.0 MCP server that your AI assistant calls at the start and end of conversations. Your assistant loads your memory, works on your task, then writes back what was learned. On the next conversation, it has the full context from before.</p>
-
-    <h2>Pricing</h2>
-    <p>Start free, then choose the plan that fits your needs.</p>
-    <div class="feature-grid">
-      <div class="feature-card">
-        <h3>Trial Herder</h3>
-        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">Free</p>
-        <p style="font-size: 0.85rem; color: #999;">24 hours (5 days with referral)</p>
-        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
-          <li>• 1 project, 1 repo</li>
-          <li>• 2 skills</li>
-          <li>• D1 persistent memory</li>
-          <li>• No card required</li>
-        </ul>
-      </div>
-      <div class="feature-card">
-        <h3>Herder</h3>
-        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">$4.99<span style="font-size: 0.8rem; font-weight: normal;">/mo</span></p>
-        <p style="font-size: 0.85rem; color: #999;">30-day extended trial</p>
-        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
-          <li>• 1 project, 1 repo</li>
-          <li>• 2 skills</li>
-          <li>• 30-day history</li>
-          <li>• Same scope as Trial</li>
-        </ul>
-      </div>
-      <div class="feature-card">
-        <h3>Pro Herder</h3>
-        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">$19<span style="font-size: 0.8rem; font-weight: normal;">/mo</span></p>
-        <p style="font-size: 0.85rem; color: #999;">Professional use</p>
-        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
-          <li>• Unlimited projects</li>
-          <li>• All surfaces</li>
-          <li>• 10 skills</li>
-          <li>• 7-day history</li>
-        </ul>
-      </div>
-      <div class="feature-card">
-        <h3>Max Herder</h3>
-        <p style="font-weight: 700; font-size: 1.3rem; margin: 1rem 0 0.5rem;">$49<span style="font-size: 0.8rem; font-weight: normal;">/mo</span></p>
-        <p style="font-size: 0.85rem; color: #999;">Enterprise features</p>
-        <ul style="list-style: none; padding-left: 0; font-size: 0.95rem; color: #666;">
-          <li>• Everything in Pro</li>
-          <li>• Shared memory</li>
-          <li>• 30-day history</li>
-          <li>• Unlimited skills</li>
-        </ul>
-      </div>
-    </div>
-
-    <h2>Built for Channel Islands</h2>
-    <p>Bouios is part of the Syndakat platform, built for life and work in the Channel Islands. If you need your AI assistant to remember things across conversations, context windows, and devices — integrate Bouios.</p>
-
-</div>
-
-<footer>
-    <p>&copy; 2026 Syndakat &middot; Built by islanders, for the Channel Islands</p>
-</footer>
-
-<div class="floating-buttons">
-  <button id="back-to-top" title="Back to top">↑</button>
-  <button id="dark-sky-toggle" title="Toggle dark mode">◐</button>
-  <button id="sark-bot-float" title="Chat with Sark Bot">🦞</button>
-</div>
-
-<div id="sark-bot-overlay"></div>
-<div class="sark-bot-popup" id="sark-bot-popup" style="display:none;">
-  <header>
-    Sark Bot
-    <button class="close-btn" onclick="closeSarkBotPopup()">×</button>
-  </header>
-  <div class="chat-body" id="popup-chat-body"></div>
-  <div class="chat-input">
-    <input id="popup-chat-input" type="text" placeholder="Ask about sailings, events, or news...">
-    <button onclick="sendPopupMessage()">Ask</button>
-  </div>
-</div>
-
-  <script type="application/ld+json">
-  {
-    "@context": "https://schema.org",
-    "@type": "Product",
-    "name": "Bouios",
-    "description": "Persistent memory for AI assistants that spans conversations, sessions, and devices.",
-    "offers": [
-      {
-        "@type": "Offer",
-        "name": "Trial Herder",
-        "description": "Free for 24 hours (5 days with a referral). 1 project, 1 repo, 2 skills, D1 persistent memory.",
-        "price": "0",
-        "priceCurrency": "USD"
-      },
-      {
-        "@type": "Offer",
-        "name": "Herder",
-        "description": "30-day extended trial. 1 project, 1 repo, 2 skills, D1 persistent memory.",
-        "price": "4.99",
-        "priceCurrency": "USD"
-      },
-      {
-        "@type": "Offer",
-        "name": "Pro Herder",
-        "description": "Unlimited projects, all surfaces, 10 skills, 7-day history.",
-        "price": "19",
-        "priceCurrency": "USD"
-      },
-      {
-        "@type": "Offer",
-        "name": "Max Herder",
-        "description": "Everything in Pro plus shared memory, 30-day history, unlimited skills.",
-        "price": "49",
-        "priceCurrency": "USD"
-      }
-    ]
-  }
-  </script>
-
-<script>
-const backToTop = document.getElementById("back-to-top");
-const botFloatBtn = document.getElementById("sark-bot-float");
-const botOverlay = document.getElementById("sark-bot-overlay");
-const botPopup = document.getElementById("sark-bot-popup");
-const popupChatBody = document.getElementById("popup-chat-body");
-const popupChatInput = document.getElementById("popup-chat-input");
-
-window.addEventListener("scroll", () => {
-  if (window.scrollY > 300) {
-    backToTop.style.opacity = "1";
-    backToTop.style.visibility = "visible";
-  } else {
-    backToTop.style.opacity = "0";
-    backToTop.style.visibility = "hidden";
-  }
-});
-backToTop.addEventListener("click", () => {
-  window.scrollTo({ top: 0, behavior: "smooth" });
-});
-
-botFloatBtn.addEventListener("click", () => {
-  botOverlay.style.display = "block";
-  botPopup.style.display = "flex";
-  popupChatInput.focus();
-});
-
-function closeSarkBotPopup() {
-  botOverlay.style.display = "none";
-  botPopup.style.display = "none";
-}
-
-botOverlay.addEventListener("click", closeSarkBotPopup);
-
-function sendPopupMessage() {
-  const q = popupChatInput.value.trim();
-  if (!q) return;
-  popupChatInput.value = '';
-  const userMsg = document.createElement("div");
-  userMsg.style.cssText = "text-align:right;padding:0.5rem;background:#f0f0f0;border-radius:6px;font-size:0.9rem";
-  userMsg.textContent = q;
-  popupChatBody.appendChild(userMsg);
-  popupChatBody.scrollTop = popupChatBody.scrollHeight;
-
-  fetch('/api/archive/query?q=' + encodeURIComponent(q), { headers: { 'Accept': 'application/json' } })
-    .then(r => r.json())
-    .then(d => {
-      const botMsg = document.createElement("div");
-      botMsg.style.cssText = "text-align:left;padding:0.5rem;background:#e8f5e9;border-radius:6px;font-size:0.9rem";
-      botMsg.textContent = d.answer || "Could not fetch response.";
-      popupChatBody.appendChild(botMsg);
-      popupChatBody.scrollTop = popupChatBody.scrollHeight;
-    })
-    .catch(() => {
-      const errMsg = document.createElement("div");
-      errMsg.style.cssText = "text-align:left;padding:0.5rem;background:#ffebee;border-radius:6px;font-size:0.9rem;color:var(--red,#C8102E)";
-      errMsg.textContent = "Error connecting to Sark Bot. Please try again.";
-      popupChatBody.appendChild(errMsg);
-    });
-}
-
-popupChatInput.addEventListener("keypress", (e) => {
-  if (e.key === "Enter") sendPopupMessage();
-});
-
-function toggleDarkMode() {
-  const html = document.documentElement;
-  const current = html.getAttribute("data-theme");
-  const next = current === "dark" ? "light" : "dark";
-  html.setAttribute("data-theme", next);
-  localStorage.setItem("theme", next);
-}
-
-document.addEventListener("DOMContentLoaded", () => {
-  const darkSkyToggle = document.getElementById("dark-sky-toggle");
-  if (darkSkyToggle) {
-    darkSkyToggle.addEventListener("click", toggleDarkMode);
-  }
-  const savedTheme = localStorage.getItem("theme");
-  if (savedTheme === "dark") {
-    document.documentElement.setAttribute("data-theme", "dark");
-  }
-});
-</script>`;
-      return htmlResponse(html);
-    }
     if (path === "/health") return json({ ok: true, service: "memory-gateway" });
-    // No-op unless REQUIRE_LICENCE === "true" (default deployments unchanged).
     const licence = await requestLicence(request, url, env);
     if (path.startsWith("/mcp/")) {
       const token = path.slice("/mcp/".length);
@@ -843,24 +671,55 @@ document.addEventListener("DOMContentLoaded", () => {
       if (licence.required && !licence.valid) return json({ error: "licence required or invalid" }, 403);
       return handleMcp(request, env, licence);
     }
+    // Unauthenticated transcript upload. UUID.jsonl format validation provides
+    // 128-bit entropy write isolation; no bearer token needed from hook scripts.
+    if (path.startsWith("/transcript/") && request.method === "PUT") {
+      const sessionId = path.slice("/transcript/".length);
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/.test(sessionId)) {
+        return json({ error: "session-id must be UUID.jsonl" }, 400);
+      }
+      if (!env.TRANSCRIPTS) return json({ error: "transcript storage not configured" }, 500);
+      const body = await request.arrayBuffer();
+      const key = "transcript:" + sessionId;
+      await env.TRANSCRIPTS.put(key, body, {
+        httpMetadata: { contentType: "application/x-ndjson" },
+        customMetadata: { created: new Date().toISOString() },
+      });
+      if (env.DB) {
+        try {
+          await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), 'AI', ?)").bind("transcript PUT " + sessionId + " " + body.byteLength + "b").run();
+        } catch (_) {}
+      }
+      return json({ ok: true, key, bytes: body.byteLength });
+    }
+    // Bearer-gated transcript reads (Authorization: Bearer <t> OR ?token=<t> for
+    // browser access). Owner diagnostic: list/read what actually landed in R2.
+    if (path === "/transcript" && request.method === "GET") {
+      const tok = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") || url.searchParams.get("token") || "";
+      if (!env.BEARER_TOKEN || !tok || !timingSafeEqual(tok, env.BEARER_TOKEN)) return json({ error: "unauthorised" }, 401);
+      if (!env.TRANSCRIPTS) return json({ error: "transcript storage not configured" }, 500);
+      const listed = await env.TRANSCRIPTS.list({ prefix: "transcript:", limit: 1000 });
+      const objects = (listed.objects || []).map((o) => ({ key: o.key, size: o.size, uploaded: o.uploaded }));
+      return json({ count: objects.length, truncated: listed.truncated || false, objects });
+    }
+    if (path.startsWith("/transcript/") && request.method === "GET") {
+      const tok = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") || url.searchParams.get("token") || "";
+      if (!env.BEARER_TOKEN || !tok || !timingSafeEqual(tok, env.BEARER_TOKEN)) return json({ error: "unauthorised" }, 401);
+      if (!env.TRANSCRIPTS) return json({ error: "transcript storage not configured" }, 500);
+      const id = path.slice("/transcript/".length);
+      const key = id.startsWith("transcript:") ? id : "transcript:" + id;
+      const obj = await env.TRANSCRIPTS.get(key);
+      if (!obj) return json({ error: "not found", key }, 404);
+      return new Response(obj.body, { headers: { "content-type": "application/x-ndjson; charset=utf-8" } });
+    }
+    // Stripe webhook: no bearer auth, verified by Stripe-Signature HMAC instead.
+    if (path === "/licence/webhook" && request.method === "POST") {
+      return handleStripeWebhook(request, env);
+    }
     const auth = await authorise(request, env);
     if (!auth.ok) return json({ error: auth.msg }, auth.status);
-    if (path === "/token/sync" && request.method === "POST") {
-      // Self-heal: copy the live secret into the memory store so the stored
-      // copy can never drift from the Worker. Returns no secret material.
-      if (!env.BEARER_TOKEN) return json({ error: "no token configured" }, 500);
-      try {
-        await env.DB.prepare("INSERT OR REPLACE INTO context (domain, key, content, updated_at) VALUES ('AI', 'gateway-bearer-token', ?, date('now'))").bind(env.BEARER_TOKEN).run();
-        return json({ ok: true, synced: true });
-      } catch (e) {
-        return json({ error: "sync failed", detail: String(e) }, 500);
-      }
-    }
+
     if (path === "/licence/issue" && request.method === "POST") {
-      // Owner-only (sits behind the bearer/Access gate above): mint a signed
-      // HS256 licence for a customer + tier. Stateless — later verified in
-      // Worker compute against the same LICENCE_SIGNING_KEY, no per-request DB
-      // read. exp is an absolute unix timestamp; default is one year out.
       if (!env.LICENCE_SIGNING_KEY) return json({ error: "licence signing not configured" }, 500);
       let body;
       try { body = await request.json(); } catch { return json({ error: "invalid JSON body" }, 400); }
@@ -885,12 +744,9 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
     if (path === "/setup" && request.method === "POST") {
-      // Idempotent first-run table creation. Authenticated like every other
-      // mutating route; safe to re-run on an already-set-up database.
       try {
         const existing = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all();
         const existingNames = new Set((existing.results || []).map(r => r.name));
-        const tableNames = SETUP_SCHEMA.map(s => s.match(/CREATE TABLE IF NOT EXISTS (\w+)/)?.[1]).filter(Boolean);
         const created = [], existed = [];
         for (const sql of SETUP_SCHEMA) {
           await env.DB.prepare(sql).run();
@@ -903,11 +759,28 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
     if (path === "/rules" && request.method === "GET") {
+      // CUSTOMER-FACING route: the deployed customer worker (worker/src/index.js
+      // fetchRules) loads its rules from here with the shared GATEWAY_TOKEN. It
+      // MUST serve the de-jargoned CUSTOMER_RULES, never the owner rules table
+      // (which names the store, tools, db and query language - R19). The owner
+      // loads rules via the direct store connector, not this route, so is
+      // unaffected. Closes the leak this branch is named for: previously this
+      // returned the raw owner rules table, so every customer's memory_load
+      // surfaced owner internals. Unconditional (not licence-gated) so it holds
+      // even when REQUIRE_LICENCE is off.
+      return json({ rules: CUSTOMER_RULES });
+    }
+    // Usage metering read-out (bearer-gated, owner). Per-licence per-minute call
+    // counts: ?sub=<licence> for one customer, otherwise the most recent across all.
+    if (path === "/usage" && request.method === "GET") {
       try {
-        const rules = await env.DB.prepare("SELECT id, scope, content FROM rules ORDER BY id").all();
-        return json({ rules: rules.results || [] });
+        const sub = url.searchParams.get("sub");
+        const r = sub
+          ? await env.DB.prepare("SELECT sub, window, count, updated_at FROM usage WHERE sub = ? ORDER BY window DESC LIMIT 60").bind(sub).all()
+          : await env.DB.prepare("SELECT sub, window, count, updated_at FROM usage ORDER BY window DESC LIMIT 100").all();
+        return json({ tiers: TIER_LIMITS, usage: r.results || [] });
       } catch (e) {
-        return json({ error: "rules fetch failed", detail: String(e) }, 500);
+        return json({ error: "usage fetch failed", detail: String(e) }, 500);
       }
     }
     if (path.startsWith("/hooks/") && (request.method === "GET" || request.method === "PUT")) {
@@ -934,7 +807,18 @@ document.addEventListener("DOMContentLoaded", () => {
     if (path === "/session/start" && request.method === "GET") {
       if (licence.required && !licence.valid) return json({ error: "licence required or invalid" }, 403);
       const domain = normaliseProject(url.searchParams.get("domain"));
-      if (!domain) return json({ error: "invalid or missing project name" }, 400);
+      if (!domain) {
+        try {
+          const ps = await env.DB.prepare("SELECT DISTINCT domain FROM hot ORDER BY domain").all();
+          return json({ error: "domain required", available: (ps.results || []).map((r) => r.domain) }, 400);
+        } catch (_) {
+          return json({ error: "domain required" }, 400);
+        }
+      }
+      if (licence.required && licence.valid && licence.sub) {
+        const q = await checkAndRecordUsage(env.DB, licence.sub, licence.tier);
+        if (q.over) return json({ error: "rate limit", tier: licence.tier, limit: q.limit, window: q.window }, 429);
+      }
       const surface = url.searchParams.get("surface") || request.headers.get("x-surface") || "unknown";
       try { return json(await sessionStart(domain, surface, env, licence)); } catch (e) { return json({ error: "load failed", detail: String(e) }, 500); }
     }
@@ -944,11 +828,15 @@ document.addEventListener("DOMContentLoaded", () => {
       try { body = await request.json(); } catch { return json({ error: "invalid JSON body" }, 400); }
       const domain = normaliseProject(body.domain || url.searchParams.get("domain"));
       if (!domain) return json({ error: "invalid or missing project name" }, 400);
+      if (licence.required && licence.valid && licence.sub) {
+        const q = await checkAndRecordUsage(env.DB, licence.sub, licence.tier);
+        if (q.over) return json({ error: "rate limit", tier: licence.tier, limit: q.limit, window: q.window }, 429);
+      }
       try {
         const out = await sessionWrite(domain, body, env, licence);
         return json(out, out.ok === false ? 403 : 200);
       } catch (e) { return json({ error: "write failed", detail: String(e) }, 500); }
     }
-    return json({ error: "not found", routes: ["GET /health", "POST /setup", "POST /licence/issue", "GET /rules", "GET /hooks/:name", "PUT /hooks/:name", "GET /session/start?domain=AI", "POST /session/write", "POST /mcp/{token}"] }, 404);
+    return json({ error: "not found", routes: ["GET /health", "POST /setup", "POST /licence/issue", "POST /licence/webhook", "GET /rules", "GET /usage", "GET /hooks/:name", "PUT /hooks/:name", "PUT /transcript/{session-id}", "GET /session/start?domain=AI", "POST /session/write", "POST /mcp/{token}"] }, 404);
   },
 };
