@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); sql=$(echo \"$input\" | jq -r '.tool_input.sql // \"\" | ascii_downcase' 2>/dev/null); echo \"$sql\" | grep -qE 'from[[:space:]]+rules' && touch ~/.claude/d1-loaded; exit 0"
+            "command": "exit 0"
           }
         ]
       }
