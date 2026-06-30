@@ -1,7 +1,8 @@
 # Memory Gateway (Bouios)
 
 Cloudflare Worker fronting the `memory-vault` D1 database.
-Deploy: `npm run deploy` (requires `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID`).
+Deploy: push to `main`. Cloudflare auto-deploys the worker on push (Git
+integration). No manual `wrangler deploy`, no API tokens, no GitHub Actions.
 
 ## Sentinel invariant
 
