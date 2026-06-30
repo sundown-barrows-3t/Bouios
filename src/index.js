@@ -392,7 +392,7 @@ async function sessionStart(domain, surface, env, licence) {
   const [rules, hot, context, pending, recent, log, memTotal] = await Promise.all([
     db.prepare("SELECT scope, content FROM rules ORDER BY id").all(),
     db.prepare("SELECT state, updated_at FROM hot WHERE domain = ?").bind(domain).all(),
-    db.prepare("SELECT key, content FROM context WHERE domain = ? AND key != 'gateway-bearer-token'").bind(domain).all(),
+    db.prepare("SELECT key, content FROM context WHERE domain = ? AND key != 'gateway-bearer-token' ORDER BY updated_at DESC LIMIT 100").bind(domain).all(),
     db.prepare("SELECT id, type, title, body FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type = 'pending' ORDER BY id").bind(domain).all(),
     db.prepare("SELECT id, type, title, body FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' ORDER BY id DESC LIMIT 40").bind(domain).all(),
     db.prepare("SELECT ts, summary FROM log WHERE domain = ? ORDER BY id DESC LIMIT 25").bind(domain).all(),
