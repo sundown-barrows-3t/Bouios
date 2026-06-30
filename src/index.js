@@ -718,6 +718,9 @@ export default {
     }
     const auth = await authorise(request, env);
     if (!auth.ok) return json({ error: auth.msg }, auth.status);
+    // Bearer-authenticated callers are the owner/operator. REQUIRE_LICENCE gates
+    // customer paths (/mcp/*) only; the owner is exempt from the licence gate.
+    const ownerLicence = { required: false, valid: false, tier: "free", sub: null };
 
     if (path === "/licence/issue" && request.method === "POST") {
       if (!env.LICENCE_SIGNING_KEY) return json({ error: "licence signing not configured" }, 500);
@@ -805,7 +808,6 @@ export default {
       }
     }
     if (path === "/session/start" && request.method === "GET") {
-      if (licence.required && !licence.valid) return json({ error: "licence required or invalid" }, 403);
       const domain = normaliseProject(url.searchParams.get("domain"));
       if (!domain) {
         try {
@@ -815,25 +817,16 @@ export default {
           return json({ error: "domain required" }, 400);
         }
       }
-      if (licence.required && licence.valid && licence.sub) {
-        const q = await checkAndRecordUsage(env.DB, licence.sub, licence.tier);
-        if (q.over) return json({ error: "rate limit", tier: licence.tier, limit: q.limit, window: q.window }, 429);
-      }
       const surface = url.searchParams.get("surface") || request.headers.get("x-surface") || "unknown";
-      try { return json(await sessionStart(domain, surface, env, licence)); } catch (e) { return json({ error: "load failed", detail: String(e) }, 500); }
+      try { return json(await sessionStart(domain, surface, env, ownerLicence)); } catch (e) { return json({ error: "load failed", detail: String(e) }, 500); }
     }
     if (path === "/session/write" && request.method === "POST") {
-      if (licence.required && !licence.valid) return json({ error: "licence required or invalid" }, 403);
       let body;
       try { body = await request.json(); } catch { return json({ error: "invalid JSON body" }, 400); }
       const domain = normaliseProject(body.domain || url.searchParams.get("domain"));
       if (!domain) return json({ error: "invalid or missing project name" }, 400);
-      if (licence.required && licence.valid && licence.sub) {
-        const q = await checkAndRecordUsage(env.DB, licence.sub, licence.tier);
-        if (q.over) return json({ error: "rate limit", tier: licence.tier, limit: q.limit, window: q.window }, 429);
-      }
       try {
-        const out = await sessionWrite(domain, body, env, licence);
+        const out = await sessionWrite(domain, body, env, ownerLicence);
         return json(out, out.ok === false ? 403 : 200);
       } catch (e) { return json({ error: "write failed", detail: String(e) }, 500); }
     }
