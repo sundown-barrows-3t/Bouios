@@ -22,7 +22,7 @@ Cloudflare will:
    you can run `openssl rand -hex 32`; otherwise use any long random string of
    letters and numbers and **keep a copy**.
 4. Deploy. When it finishes you get a web address ending in `.workers.dev` —
-   for example `https://memory-gateway.yourname.workers.dev`. **Copy it.**
+   for example `https://memory-vault.yourname.workers.dev`. **Copy it.**
 
 The database tables are created automatically on first use. There is nothing
 else to run.
@@ -37,7 +37,7 @@ Works on any Claude plan, including **Claude Free** (one connector allowed).
 2. For the URL, join your Worker address, `/mcp/`, and your token:
 
    ```
-   https://memory-gateway.yourname.workers.dev/mcp/YOUR_BEARER_TOKEN
+   https://memory-vault.yourname.workers.dev/mcp/YOUR_BEARER_TOKEN
    ```
 
    Use the address from Step 1 and the token you set in Step 1.

@@ -1,26 +1,20 @@
-# Memory Gateway (Bouios)
+# Your memory for Claude
 
-Cloudflare Worker fronting the `memory-vault` D1 database.
-Deploy: push to `main`. Cloudflare auto-deploys the worker on push (Git
-integration). No manual `wrangler deploy`, no API tokens, no GitHub Actions.
+This is a small Cloudflare Worker that gives Claude a persistent memory that
+follows you across conversations. It runs entirely on your own Cloudflare
+account and your data stays in your own database.
 
-## Sentinel invariant
+Deploy: push to `main`. Cloudflare auto-deploys the worker on push.
 
-`~/.claude/d1-loaded` is set **only** by `.session/session-start.sh` on HTTP 200 from `/session/start`.
-No other code path may arm it (no PostToolUse touch, no pattern-match escape).
+## What it does
 
-- `pre-tool-enforcement.sh` denies D1 writes and reads when the sentinel is absent.
-- `session-start.sh` clears the sentinel on non-200 or empty response.
+- `GET /health` — liveness check.
+- `POST /mcp/{your-token}` — the connector endpoint Claude talks to
+  (`memory_load`, `memory_write`, `session_handoff`), protected by your
+  `BEARER_TOKEN`.
 
-## Auth model
+Your memory (working state, notes, and history) is stored in your own
+`memory-vault` database. Writes are refused until memory has been loaded in a
+session, so nothing is saved before your context is loaded.
 
-- Owner: `Authorization: Bearer <BEARER_TOKEN>` — exempt from `REQUIRE_LICENCE` gate.
-- Customer: `POST /mcp/:token` — full licence validation via `requestLicence()`.
-
-The bearer path bypasses the licence gate in `/session/start` and `/session/write`
-via `ownerLicence = { required: false, valid: false, tier: "free", sub: null }`.
-This must never be applied to the `/mcp/:token` route.
-
-## Load size
-
-`sessionStart()` caps context rows at 100 (most recent), memory at 40 + all pending, log at 25.
+Keep your `BEARER_TOKEN` private — it is the password to your memory.

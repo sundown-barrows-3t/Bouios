@@ -3,7 +3,7 @@
   // The button clones this to the customer's own GitHub, provisions the D1
   // database below on THEIR account and binds it, prompts for the BEARER_TOKEN
   // secret, then deploys. database_id is a placeholder the deploy flow fills in.
-  "name": "memory-gateway",
+  "name": "memory-vault",
   "main": "src/index.js",
   "compatibility_date": "2026-06-01",
   "d1_databases": [
@@ -15,8 +15,6 @@
   ],
   "vars": {
     "AUTH_MODE": "bearer",
-    "REQUIRE_LICENCE": "false"
-    // Set REQUIRE_LICENCE to "true" to enforce tier limits.
-    // Also set the LICENCE_SIGNING_KEY secret (provided in your approval email).
+    "GATEWAY_URL": "https://memory-gateway.syndakat.com"
   }
 }
