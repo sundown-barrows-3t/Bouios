@@ -131,17 +131,21 @@ async function sessionLoaded(db, sessionId) {
 // ---- MCP (JSON-RPC 2.0, Streamable HTTP) ----
 
 const MCP_PROTOCOL = "2025-03-26";
+// Tool identifiers are Bouios-branded (2026-07-02): the platform's own
+// permission dialogs render the raw technical tool name with zero branding -
+// confirmed by owner screenshot on the owner's own connector, applies
+// identically to every customer's connector. Mirrors memory-gateway/src.
 const MCP_INSTRUCTIONS =
-  "This is Bouios, your memory system. Call memory_load for the active project first, before any other work. " +
-  "'load memory', 'load rules' and 'load Bouios' each trigger memory_load immediately. " +
+  "This is Bouios, your memory system. Call bouios_load for the active project first, before any other work. " +
+  "'load memory', 'load rules' and 'load Bouios' each trigger bouios_load immediately. " +
   "Surface only the returned confirmation line to the user. " +
-  "Every few substantive steps and before any long operation, call memory_write with the full working state, then output a handoff block in a code box. Do not wait until 70% context - by then it may be too late. " +
-  "Call session_handoff when the conversation nears its limit and show the user the returned block to paste into a new chat. " +
+  "Every few substantive steps and before any long operation, call bouios_save with the full working state, then output a handoff block in a code box. Do not wait until 70% context - by then it may be too late. " +
+  "Call bouios_handoff when the conversation nears its limit and show the user the returned block to paste into a new chat. " +
   "If your memory tools are unavailable or error, do not stall or block - continue in a degraded mode; they reconnect on their own.";
 
 const MCP_TOOLS = [
   {
-    name: "memory_load",
+    name: "bouios_load",
     description:
       "Load memory for a project (rules, working state, context, patterns). " +
       "Must be called first in every conversation before any other work. " +
@@ -156,8 +160,8 @@ const MCP_TOOLS = [
     },
   },
   {
-    name: "memory_write",
-    description: "Save updates: hot state, memory entries, context rows, log lines. Requires memory_load first.",
+    name: "bouios_save",
+    description: "Save updates: hot state, memory entries, context rows, log lines. Requires bouios_load first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -181,7 +185,7 @@ const MCP_TOOLS = [
     },
   },
   {
-    name: "session_handoff",
+    name: "bouios_handoff",
     description: "Save hot state and return a continuation block to paste into a new chat.",
     inputSchema: {
       type: "object",
@@ -223,16 +227,16 @@ async function handleMsg(msg, sessionId, env) {
     const domain = normaliseProject(args.project || args.domain);
     if (!domain) return toolText(id, "Invalid project name. Use 2-20 chars, start with a letter.", true);
     try {
-      if (name === "memory_load") {
+      if (name === "bouios_load") {
         const surface = (args.surface || "mcp") + " session=" + (sessionId || "none");
         return toolText(id, JSON.stringify(await sessionLoad(domain, surface, env)));
       }
-      if (name === "memory_write") {
-        if (!(await sessionLoaded(env.DB, sessionId))) return toolText(id, "Write refused: call memory_load first.", true);
+      if (name === "bouios_save") {
+        if (!(await sessionLoaded(env.DB, sessionId))) return toolText(id, "Write refused: call bouios_load first.", true);
         return toolText(id, JSON.stringify(await sessionWrite(domain, args, env.DB)));
       }
-      if (name === "session_handoff") {
-        if (!(await sessionLoaded(env.DB, sessionId))) return toolText(id, "Handoff refused: call memory_load first.", true);
+      if (name === "bouios_handoff") {
+        if (!(await sessionLoaded(env.DB, sessionId))) return toolText(id, "Handoff refused: call bouios_load first.", true);
         const saved = [];
         if (typeof args.hot === "string" && args.hot.length) {
           const out = await sessionWrite(domain, { hot: args.hot, log: ["Session handoff."] }, env.DB);
