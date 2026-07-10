@@ -40,91 +40,6 @@ function json(body, status = 200) {
   });
 }
 
-// ---- Licence verification (verify-only) ----------------------------------
-// Paid tiers are gated here against a signed licence. Signing happens ONLY on
-// the owner's gateway, with a private key that is never shipped. This worker
-// only VERIFIES, using the Ed25519 PUBLIC key below (safe to publish) — so a
-// self-hoster cannot forge a licence without the private key. This is inert
-// until REQUIRE_LICENCE="true" is set, so existing free deployments are
-// unaffected. Set LICENCE_PUBLIC_KEY_B64 to your gateway's Ed25519 public key
-// (base64 SPKI). Empty = licence checks disabled.
-const LICENCE_PUBLIC_KEY_B64 = "";
-
-// Per-tier ceilings. 'free' is the no-/lapsed-licence fallback (what a customer
-// drops to when a subscription ends). Values mirror bouios.syndakat.com/join.
-const TIER_LIMITS = {
-  free:   { projects: 1,        skills: 2 },
-  herder: { projects: 1,        skills: 2 },
-  pro:    { projects: Infinity, skills: Infinity },
-  max:    { projects: Infinity, skills: Infinity },
-};
-
-function b64urlToBytes(s) {
-  s = String(s).replace(/-/g, "+").replace(/_/g, "/");
-  while (s.length % 4) s += "=";
-  const bin = atob(s);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-const LAPSED = { valid: false, tier: "free", sub: null };
-
-// Verify an Ed25519-signed licence token (header.payload.signature, base64url).
-// Returns { valid, tier, sub }; falls back to the lapsed/free tier on any failure.
-async function verifyLicence(token) {
-  if (!token || !LICENCE_PUBLIC_KEY_B64) return LAPSED;
-  const parts = String(token).split(".");
-  if (parts.length !== 3) return LAPSED;
-  try {
-    const key = await crypto.subtle.importKey(
-      "spki",
-      b64urlToBytes(LICENCE_PUBLIC_KEY_B64),
-      { name: "Ed25519" },
-      false,
-      ["verify"]
-    );
-    const ok = await crypto.subtle.verify(
-      { name: "Ed25519" },
-      key,
-      b64urlToBytes(parts[2]),
-      new TextEncoder().encode(parts[0] + "." + parts[1])
-    );
-    if (!ok) return LAPSED;
-    const payload = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[1])));
-    if (payload.exp && Math.floor(Date.now() / 1000) > Number(payload.exp)) return LAPSED;
-    const tier = Object.prototype.hasOwnProperty.call(TIER_LIMITS, payload.tier) ? payload.tier : "free";
-    return { valid: true, tier, sub: payload.sub || null };
-  } catch {
-    return LAPSED;
-  }
-}
-
-function licenceFromRequest(request, url, env) {
-  return request.headers.get("x-licence") || url.searchParams.get("licence") || (env && env.LICENCE) || null;
-}
-
-// Refuse a NEW project once the tier's project ceiling is reached. Only enforced
-// when REQUIRE_LICENCE="true". Returns an error string, or null if allowed.
-async function projectLimitError(db, domain, lic, env) {
-  if (!env || env.REQUIRE_LICENCE !== "true") return null;
-  const limit = (TIER_LIMITS[lic.tier] || TIER_LIMITS.free).projects;
-  if (!Number.isFinite(limit)) return null;
-  const existing = await db
-    .prepare("SELECT 1 AS ok FROM (SELECT domain FROM hot UNION SELECT domain FROM memory UNION SELECT domain FROM context UNION SELECT domain FROM log) WHERE domain = ? LIMIT 1")
-    .bind(domain)
-    .first();
-  if (existing) return null;
-  const row = await db
-    .prepare("SELECT COUNT(*) AS n FROM (SELECT domain FROM hot UNION SELECT domain FROM memory UNION SELECT domain FROM context UNION SELECT domain FROM log)")
-    .first();
-  const count = (row && row.n) || 0;
-  if (count >= limit) {
-    return `Project limit reached: the ${lic.tier} tier allows ${limit} project${limit === 1 ? "" : "s"}. Upgrade at bouios.syndakat.com/join, or write to an existing project.`;
-  }
-  return null;
-}
-
 async function fetchRules(env) {
   if (!env.GATEWAY_URL) return [];
   try {
@@ -292,9 +207,8 @@ function toolText(id, text, isError) {
   return rpcResult(id, result);
 }
 
-async function handleMsg(msg, sessionId, env, lic) {
+async function handleMsg(msg, sessionId, env) {
   const id = msg && msg.id !== undefined ? msg.id : null;
-  lic = lic || LAPSED;
   const method = msg && msg.method;
   if (!method) return rpcError(id, -32600, "invalid request");
   if (method === "initialize") {
@@ -319,14 +233,10 @@ async function handleMsg(msg, sessionId, env, lic) {
       }
       if (name === "bouios_save") {
         if (!(await sessionLoaded(env.DB, sessionId))) return toolText(id, "Write refused: call bouios_load first.", true);
-        const limitErr = await projectLimitError(env.DB, domain, lic, env);
-        if (limitErr) return toolText(id, limitErr, true);
         return toolText(id, JSON.stringify(await sessionWrite(domain, args, env.DB)));
       }
       if (name === "bouios_handoff") {
         if (!(await sessionLoaded(env.DB, sessionId))) return toolText(id, "Handoff refused: call bouios_load first.", true);
-        const limitErr = await projectLimitError(env.DB, domain, lic, env);
-        if (limitErr) return toolText(id, limitErr, true);
         const saved = [];
         if (typeof args.hot === "string" && args.hot.length) {
           const out = await sessionWrite(domain, { hot: args.hot, log: ["Session handoff."] }, env.DB);
@@ -353,10 +263,9 @@ async function handleMcp(request, env) {
   let sessionId = request.headers.get("mcp-session-id");
   const msgs = Array.isArray(body) ? body : [body];
   if (!sessionId && msgs.some((m) => m && m.method === "initialize")) sessionId = crypto.randomUUID();
-  const lic = await verifyLicence(licenceFromRequest(request, new URL(request.url), env));
   const responses = [];
   for (const m of msgs) {
-    const r = await handleMsg(m, sessionId, env, lic);
+    const r = await handleMsg(m, sessionId, env);
     if (r) responses.push(r);
   }
   const headers = { "content-type": "application/json; charset=utf-8" };
