@@ -1,0 +1,32 @@
+name: Deploy to Cloudflare Workers
+
+# Auto-deploy from main. Added 2026-07-02 because the Cloudflare Workers Builds
+# git integration stopped deploying: its "API token" (Build configuration) was
+# rolled to None, so every automatic build Cancelled at the deploy step. This
+# workflow runs the same deploy command Workers Builds used
+# (`npm install && npx wrangler deploy`, which triggers the [build] hook in
+# wrangler.toml -> build-version.js), authenticated by a repo secret instead.
+#
+# REQUIRED (one-time): add a repo secret CLOUDFLARE_API_TOKEN
+#   Settings -> Secrets and variables -> Actions -> New repository secret
+#   Token scope: "Edit Cloudflare Workers" template.
+# If wrangler reports it cannot determine the account, also add CLOUDFLARE_ACCOUNT_ID.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
