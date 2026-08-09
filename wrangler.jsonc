@@ -4,7 +4,7 @@
   // database below on THEIR account and binds it, prompts for the BEARER_TOKEN
   // secret, then deploys.
   // Deploy trigger: keep Cloudflare native Git deployment on main authoritative.
-  "name": "bouios",
+  "name": "memory-vault",
   "main": "src/index.js",
   "compatibility_date": "2026-06-01",
   "d1_databases": [
