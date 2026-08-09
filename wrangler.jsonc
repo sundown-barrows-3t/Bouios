@@ -3,6 +3,7 @@
   // The button clones this to the customer's own GitHub, provisions the D1
   // database below on THEIR account and binds it, prompts for the BEARER_TOKEN
   // secret, then deploys. database_id is a placeholder the deploy flow fills in.
+  // Fixed: removed blocking GitHub Actions workflow that was preventing CF native auto-deploy (2026-08-09)
   "name": "memory-vault",
   "main": "src/index.js",
   "compatibility_date": "2026-06-01",
