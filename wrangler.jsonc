@@ -4,6 +4,7 @@
   // database below on THEIR account and binds it, prompts for the BEARER_TOKEN
   // secret, then deploys. database_id is a placeholder the deploy flow fills in.
   // Fixed: removed blocking GitHub Actions workflow that was preventing CF native auto-deploy (2026-08-09)
+  // Deploy trigger: keep Cloudflare native Git deployment on main authoritative.
   "name": "memory-vault",
   "main": "src/index.js",
   "compatibility_date": "2026-06-01",
@@ -18,12 +19,6 @@
     "AUTH_MODE": "bearer",
     "GATEWAY_URL": "https://memory-gateway.syndakat.com"
   },
-  // Declares BEARER_TOKEN as a required secret so the Deploy to Cloudflare
-  // button actually prompts for it and wrangler refuses to deploy without it
-  // (Cloudflare secrets.required property, shipped 2026-03-25). Without this,
-  // customer Workers deployed with BEARER_TOKEN unset and every /mcp/:token
-  // call 401'd - the button never had anything to attach the package.json
-  // description to.
   "secrets": {
     "required": ["BEARER_TOKEN"]
   }
