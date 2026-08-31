@@ -227,9 +227,10 @@ async function sessionWrite(domain, body, db) {
   if (Array.isArray(body.memory)) {
     // Evidence gate (Hard Rule 8, added 2026-07-15): a type=decision row claiming
     // done/fixed/deployed must carry a commit sha, url, or test-pass token, else
-    // it is skipped. Mirrors the same gate in memory-gateway/src/index.js.
+    // it is skipped. Mirrors the same gate in memory-gateway/src/index.js,
+    // including the 2026-08-31 widening for live-verification phrasing.
     const CLAIM_RE = /\b(done|fixed|resolved|deployed|shipped|completed?|verified)\b/i;
-    const EVIDENCE_RE = /\b[0-9a-f]{7,40}\b|https?:\/\/\S+|\btests?\s+(pass|green|passing)\b|\bPASS\b/i;
+    const EVIDENCE_RE = /\b[0-9a-f]{7,40}\b|https?:\/\/\S+|\btests?\s+(pass|green|passing)\b|\bPASS\b|\blive[- ]?(verified|checked|tested|confirmed|reproduced)\b|\b(verified|checked|tested|confirmed|reproduced)[- ]?live\b/i;
     for (const m of body.memory) {
       if (!m || !MEMORY_TYPES.includes(m.type) || !m.title || !m.body) continue;
       // Constraint-row gate - mirrors memory-gateway/src/index.js (parity).
