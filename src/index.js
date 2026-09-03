@@ -478,7 +478,11 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
-    if (path === "/health") return json({ ok: true, service: "memory-vault" });
+    // Build identity, mirroring the gateway (2026-09-03). A self-hoster has the
+    // same problem the owner just hit: no way to tell whether the worker running
+    // on their account is the code they deployed. null when unset - absent must
+    // read as "unknown", never as a version claim.
+    if (path === "/health") return json({ ok: true, service: "memory-vault", version: env.BUILD_SHA || null });
 
     if (path.startsWith("/mcp/")) {
       const token = path.slice(5);
