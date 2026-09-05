@@ -142,7 +142,7 @@ function countOpenTasks(hotState) {
 async function sessionLoad(domain, surface, env) {
   const db = env.DB;
   await ensureSchema(db);
-  const [rules, hot, context, pending, recent, memTotal] = await Promise.all([
+  const [rules, hot, context, pending, recent, lessons, memTotal] = await Promise.all([
     fetchRules(env),
     db.prepare("SELECT state, updated_at FROM hot WHERE domain = ?").bind(domain).all(),
     db.prepare("SELECT key, content FROM context WHERE domain = ?").bind(domain).all(),
@@ -152,6 +152,14 @@ async function sessionLoad(domain, surface, env) {
     // gateway<->worker tool-parity test.
     db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type = 'pending' ORDER BY id").bind(domain).all(),
     db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' ORDER BY id DESC LIMIT 40").bind(domain).all(),
+    // LESSONS - parity with the gateway (2026-09-05). The newest mistake and
+    // pattern rows arrive WITH their bodies, because those rows exist for one
+    // purpose - to stop the same failure happening again - and a title cannot
+    // do that. Everything else stays titles-only: this is a separate bounded
+    // field BESIDE the query above, never a widening of it, so the size
+    // decision titles-only exists to protect is kept intact on the customer
+    // side exactly as it is on the owner's.
+    db.prepare("SELECT id, type, title, substr(body, 1, 700) AS body FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type IN ('mistake','pattern') ORDER BY id DESC LIMIT 12").bind(domain).all(),
     db.prepare("SELECT COUNT(*) AS n FROM memory WHERE domain = ? OR domain = 'GLOBAL'").bind(domain).first(),
   ]);
   const hotRow = (hot.results && hot.results[0]) || null;
@@ -170,6 +178,9 @@ async function sessionLoad(domain, surface, env) {
     memory: [...(pending.results || []), ...(recent.results || [])],
     memory_note: MEMORY_NOTE,
     memory_total: memTotal ? memTotal.n : 0,
+    // The only rows here that arrive WITH a body - parity with the gateway.
+    lessons: lessons.results || [],
+    lessons_note: "lessons carries the newest mistake and pattern rows WITH their bodies, clipped to 700 characters, because these are the rows whose purpose is to stop a repeat and a title alone cannot do that. Read them before diagnosing or building - if one describes what you are about to do, you are about to repeat it. Everything in memory above is titles only by design; use bouios_get for any of those bodies.",
   };
 }
 
