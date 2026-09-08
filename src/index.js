@@ -167,7 +167,7 @@ async function sessionLoad(domain, surface, env) {
   const hotDate = hotRow ? hotRow.updated_at : "none";
   const openN = countOpenTasks(hotState);
   await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, "Session loaded, surface=" + (surface || "mcp")).run();
-  return {
+  const out = {
     confirmation: confirmationText(domain, rules.length, hotDate, openN, false),
     domain,
     rules,
@@ -182,6 +182,12 @@ async function sessionLoad(domain, surface, env) {
     lessons: lessons.results || [],
     lessons_note: "lessons carries the newest mistake and pattern rows WITH their bodies, clipped to 700 characters, because these are the rows whose purpose is to stop a repeat and a title alone cannot do that. Read them before diagnosing or building - if one describes what you are about to do, you are about to repeat it. Everything in memory above is titles only by design; use bouios_get for any of those bodies.",
   };
+  const _lt = await mintLoadToken(env, domain);
+  if (_lt) {
+    out.load_token = _lt;
+    out.load_token_note = "Pass this back as load_token on your next bouios_save or bouios_handoff for this project. It proves THIS load happened even if the connection is re-established underneath you.";
+  }
+  return out;
 }
 
 // Constraint-row write gate - MUST stay in parity with memory-gateway/src/index.js.
@@ -279,6 +285,59 @@ async function sessionWrite(domain, body, db) {
 // memory-gateway/src/index.js domainLoadedRecently). Keying on the project
 // instead of the session id also means it survives a reconnect/flap, so no
 // bypass is needed to avoid false negatives.
+// LOAD TOKEN - MUST stay in parity with memory-gateway/src/index.js.
+//
+// The gateway needs this because it keys the load record on the transport
+// session id and any reconnect rotates it, so a save could be refused minutes
+// after a real load. This deployment keys on the project instead and does not
+// have that failure - the token is carried here so the two payloads and the two
+// tool schemas stay identical, and so a session that passes the token is never
+// refused for offering it. Same secret shape, same 24-hour bound, same
+// additive-only placement after the existing check.
+const LOAD_TOKEN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function loadTokenSecret(env) {
+  return (env && (env.LOAD_TOKEN_SECRET || env.BEARER_TOKEN)) || "";
+}
+
+async function hmacHex(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function mintLoadToken(env, domain) {
+  const secret = loadTokenSecret(env);
+  if (!secret || !domain) return null;
+  const issued = Date.now();
+  const body = domain + "." + issued;
+  return body + "." + (await hmacHex(secret, body)).slice(0, 32);
+}
+
+async function verifyLoadToken(env, domain, token) {
+  if (!domain || typeof token !== "string" || token.length > 400) return false;
+  const secret = loadTokenSecret(env);
+  if (!secret) return false;
+  // Split from the RIGHT - a project name may contain a dot.
+  const lastDot = token.lastIndexOf(".");
+  if (lastDot < 0) return false;
+  const body = token.slice(0, lastDot);
+  const mac = token.slice(lastDot + 1);
+  const sep = body.lastIndexOf(".");
+  if (sep < 0) return false;
+  if (body.slice(0, sep) !== domain) return false;
+  const issued = Number(body.slice(sep + 1));
+  if (!Number.isFinite(issued)) return false;
+  const age = Date.now() - issued;
+  if (!(age >= 0 && age < LOAD_TOKEN_MAX_AGE_MS)) return false;
+  const expected = (await hmacHex(secret, body)).slice(0, 32);
+  if (expected.length !== mac.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ mac.charCodeAt(i);
+  return diff === 0;
+}
+
 async function domainLoadedRecently(db, domain) {
   if (!domain) return false;
   const row = await db.prepare("SELECT 1 AS ok FROM log WHERE domain = ? AND summary LIKE 'Session loaded%' AND ts > datetime('now', '-1 day') LIMIT 1").bind(domain).first();
@@ -331,6 +390,7 @@ const MCP_TOOLS = [
       type: "object",
       properties: {
         project: { type: "string" },
+        load_token: { type: "string", description: "Optional but always pass it: the load_token returned by the bouios_load you are building on, so the save is not refused because the connection was re-established since the load." },
         hot: { type: "string", description: "Full current working state." },
         memory: {
           type: "array",
@@ -417,8 +477,11 @@ async function handleMsg(msg, sessionId, env, request, url) {
         // identity, not that memory was loaded - it is not a substitute for this
         // check (2026-07-19 fix, mirrors the gateway). sessionWrite archives hot
         // before overwrite, covering "load before you clobber" independently.
-        if (!(await domainLoadedRecently(env.DB, domain))) {
-          return toolText(id, "Write refused: memory has not been loaded for this project recently. Call bouios_load for the project first, then retry.", true);
+        // Additive second chance, same as the gateway: consulted only after the
+        // existing check has refused, so no accepted save changes behaviour.
+        if (!(await domainLoadedRecently(env.DB, domain))
+            && !(await verifyLoadToken(env, domain, args.load_token))) {
+          return toolText(id, "Write refused: memory has not been loaded for this project recently. Call bouios_load for the project first, then retry - passing back the load_token it returns.", true);
         }
         const access = await checkAccess(env.DB, domain, request, url, env);
         if (!access.ok) return toolText(id, access.note || 'Write refused.', true);
@@ -426,8 +489,9 @@ async function handleMsg(msg, sessionId, env, request, url) {
       }
       if (name === "bouios_handoff") {
         // Same domain-keyed check as bouios_save (2026-07-19 fix, mirrors the gateway).
-        if (!(await domainLoadedRecently(env.DB, domain))) {
-          return toolText(id, "Handoff refused: memory has not been loaded for this project recently. Call bouios_load for the project first, then retry.", true);
+        if (!(await domainLoadedRecently(env.DB, domain))
+            && !(await verifyLoadToken(env, domain, args.load_token))) {
+          return toolText(id, "Handoff refused: memory has not been loaded for this project recently. Call bouios_load for the project first, then retry - passing back the load_token it returns.", true);
         }
         const access = await checkAccess(env.DB, domain, request, url, env);
         if (!access.ok) return toolText(id, access.note || 'Handoff refused.', true);
