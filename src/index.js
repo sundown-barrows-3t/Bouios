@@ -139,6 +139,66 @@ function countOpenTasks(hotState) {
   return block.split("\n").filter((l) => /^\s*-\s+/.test(l)).length;
 }
 
+
+// RELEVANCE RETRIEVAL - parity with the gateway (2026-09-08). The load returned
+// 41 rows out of 707 and called itself loaded, so a session could report
+// "memory loaded" four times and still work blind on an older row that answered
+// its exact question. bouios_get closes nothing there: you cannot ask for an id
+// you have never been shown. Titles-only is KEPT - `memory` above is untouched -
+// and this is a second bounded array of at most 8 rows with a 400-character
+// excerpt, chosen by relevance to a topic the caller names rather than by age.
+// Term filtering is deliberately harsh (nothing under four characters, plus a
+// stop list of words that appear in nearly every row) because a matcher that
+// matches everything is the over-firing failure this codebase has shipped twice.
+const RELEVANCE_STOPWORDS = new Set([
+  "this", "that", "with", "from", "have", "what", "when", "were", "will",
+  "they", "them", "then", "than", "into", "over", "your", "yours", "about",
+  "because", "which", "would", "could", "should", "there", "their", "been",
+  "does", "done", "make", "made", "just", "also", "only", "same", "such",
+  "every", "still", "must", "need", "needs", "want", "wants", "like",
+  "bouios", "memory", "session", "sessions", "claude", "owner", "project",
+]);
+
+function relevanceTerms(topic) {
+  if (!topic || typeof topic !== "string") return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of topic.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 4) continue;
+    if (RELEVANCE_STOPWORDS.has(raw)) continue;
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    out.push(raw);
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+async function relevantMemory(db, domain, topic, excludeIds) {
+  const terms = relevanceTerms(topic);
+  if (!terms.length) return [];
+  const score = terms
+    .map(() => "(CASE WHEN lower(title) LIKE ? THEN 3 ELSE 0 END) + (CASE WHEN lower(COALESCE(body,'')) LIKE ? THEN 1 ELSE 0 END)")
+    .join(" + ");
+  const sql =
+    "SELECT id, type, title, substr(body, 1, 400) AS body, (" + score + ") AS score " +
+    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND (" + score + ") > 0 " +
+    "ORDER BY score DESC, id DESC LIMIT 24";
+  const binds = [];
+  for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
+  binds.push(domain);
+  for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
+  let rows;
+  try {
+    rows = await db.prepare(sql).bind(...binds).all();
+  } catch (e) {
+    // A search that fails must never take the load down with it.
+    return [];
+  }
+  const skip = new Set(excludeIds || []);
+  return (rows.results || []).filter((r) => !skip.has(r.id)).slice(0, 8);
+}
+
 async function sessionLoad(domain, surface, env) {
   const db = env.DB;
   await ensureSchema(db);
@@ -162,6 +222,15 @@ async function sessionLoad(domain, surface, env) {
     db.prepare("SELECT id, type, title, substr(body, 1, 700) AS body FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type IN ('mistake','pattern') ORDER BY id DESC LIMIT 12").bind(domain).all(),
     db.prepare("SELECT COUNT(*) AS n FROM memory WHERE domain = ? OR domain = 'GLOBAL'").bind(domain).first(),
   ]);
+  let loadTopic = "";
+  {
+    const tm = / topic=(\S+)/.exec(String(surface || ""));
+    if (tm) { try { loadTopic = decodeURIComponent(tm[1]); } catch (e) { loadTopic = tm[1]; } }
+  }
+  const relevantRows = await relevantMemory(
+    db, domain, loadTopic,
+    [...(recent.results || []).map((r) => r.id), ...(lessons.results || []).map((r) => r.id)]
+  );
   const hotRow = (hot.results && hot.results[0]) || null;
   const hotState = hotRow ? hotRow.state : null;
   const hotDate = hotRow ? hotRow.updated_at : "none";
@@ -178,6 +247,14 @@ async function sessionLoad(domain, surface, env) {
     memory: [...(pending.results || []), ...(recent.results || [])],
     memory_note: MEMORY_NOTE,
     memory_total: memTotal ? memTotal.n : 0,
+    // Say out loud how little of the store this is - parity with the gateway.
+    memory_coverage: relevantRows.length
+      ? "Returned " + (recent.results || []).length + " newest titles + " + relevantRows.length + " rows matched on your topic, out of " + (memTotal ? memTotal.n : 0) + " total."
+      : "Returned the " + (recent.results || []).length + " NEWEST titles out of " + (memTotal ? memTotal.n : 0) + " rows. The rest are not shown and their ids cannot be guessed from this window. If your task is not covered by what you see, call bouios_load again with a topic to search ALL rows by relevance - do not assume the store has nothing on it.",
+    ...(relevantRows.length ? {
+      relevant: relevantRows,
+      relevant_note: "relevant carries rows matched against the topic you named, searched across ALL rows rather than the newest window, with a 400-character body excerpt. These are the rows the age-ordered window above would have hidden from you. Read them before diagnosing or proposing.",
+    } : {}),
     // The only rows here that arrive WITH a body - parity with the gateway.
     lessons: lessons.results || [],
     lessons_note: "lessons carries the newest mistake and pattern rows WITH their bodies, clipped to 700 characters, because these are the rows whose purpose is to stop a repeat and a title alone cannot do that. Read them before diagnosing or building - if one describes what you are about to do, you are about to repeat it. Everything in memory above is titles only by design; use bouios_get for any of those bodies.",
