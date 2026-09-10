@@ -148,6 +148,13 @@ async function checkAccess(db, domain, request, url, env) {
 // NEXT block, and lines carrying an explicit unfinished marker. Bounded to 12
 // items of 160 characters so it cannot grow into the payload.
 const OPEN_MARKER = /\b(not yet (?:verified|confirmed|checked|done)|still (?:open|unverified|outstanding|not)|unverified|remains? open|outstanding|to do|todo)\b/i;
+// A SENTENCE SAYING THERE IS NOTHING OUTSTANDING IS NOT AN OUTSTANDING ITEM.
+// Caught by this reader's own over-counting case rather than by reading it:
+// "Everything landed and both runs are green. Nothing outstanding." matched on
+// the word outstanding and reported one open item, so a finished state produced
+// a false count in the one line every session reads. Checked BEFORE the marker,
+// because the marker word is present either way.
+const OPEN_NEGATED = /\b(no|none|nothing|not)\b[^.]{0,40}\b(outstanding|open|unverified|remaining|left|to do|todo)\b/i;
 
 function openItems(hotState, pendingRows) {
   const out = [];
@@ -180,6 +187,7 @@ function openItems(hotState, pendingRows) {
       // bullets beneath it - caught by P4 rather than by reading.
       if (/^#/.test(t)) continue;
       if (/^NEXT\b/i.test(t)) { push(t.replace(/^NEXT[:\s-]*/i, "")); continue; }
+      if (OPEN_NEGATED.test(t)) continue;
       if (OPEN_MARKER.test(t)) push(t);
     }
   }
@@ -311,7 +319,9 @@ async function sessionLoad(domain, surface, env) {
   const openItemList = openItems(hotState, (pending.results || []));
   await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, "Session loaded, surface=" + (surface || "mcp")).run();
   const out = {
-    confirmation: confirmationText(domain, rules.length, hotDate, openN, false),
+    // Parity with the gateway: the number in the line a customer reads is the
+    // real count of what the record says is unfinished, not a heading match.
+    confirmation: confirmationText(domain, rules.length, hotDate, openItemList.length, false),
     domain,
     rules,
     hot: hotState,
