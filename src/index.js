@@ -227,13 +227,29 @@ async function sessionLoad(domain, surface, env) {
     const tm = / topic=(\S+)/.exec(String(surface || ""));
     if (tm) { try { loadTopic = decodeURIComponent(tm[1]); } catch (e) { loadTopic = tm[1]; } }
   }
-  const relevantRows = await relevantMemory(
-    db, domain, loadTopic,
-    [...(recent.results || []).map((r) => r.id), ...(lessons.results || []).map((r) => r.id)]
-  );
+  // NO TOPIC GIVEN IS THE COMMON CASE, and an opt-in search that nobody opts
+  // into is the same blindness it was built to fix (cb3c070 shipped the search;
+  // nothing forces a caller to use it). The gateway already holds the one thing
+  // that describes the current work on every surface - the hot state - so when
+  // no topic is named, the terms come from that. It reaches Chat and Cowork,
+  // where none of the hook-layer gates exist at all. Same term filter and the
+  // same 8-row, 400-character cap, so the worst case is unchanged; an empty hot
+  // state derives nothing and returns no relevant array rather than matching
+  // everything.
+  // hot is read BEFORE the search, because the search derives its terms from it
+  // when no topic is named. Written the other way round first: node --check
+  // passes on that, because using a const before its declaration is a runtime
+  // ReferenceError and not a syntax error, so it would have shipped and broken
+  // every customer load. Third time this class has bitten this codebase - see
+  // the claims declaration dropped from licence issuance, and degraded_ok
+  // defined below its own call site.
   const hotRow = (hot.results && hot.results[0]) || null;
   const hotState = hotRow ? hotRow.state : null;
   const hotDate = hotRow ? hotRow.updated_at : "none";
+  const relevantRows = await relevantMemory(
+    db, domain, loadTopic || String(hotState || "").slice(0, 600),
+    [...(recent.results || []).map((r) => r.id), ...(lessons.results || []).map((r) => r.id)]
+  );
   const openN = countOpenTasks(hotState);
   await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, "Session loaded, surface=" + (surface || "mcp")).run();
   const out = {
