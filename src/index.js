@@ -129,6 +129,63 @@ async function checkAccess(db, domain, request, url, env) {
   }
 }
 
+// OPEN ITEMS ARE COUNTED FROM WHAT THE RECORD ACTUALLY SAYS (2026-09-10).
+//
+// countOpenTasks below matches bullets under a literal "## STILL OPEN" heading.
+// Measured against the live store: no hot state has used that heading in
+// months, so it returned 0 on every load - while the store held ONE pending row
+// and the current hot named seven unfinished items in prose. Every session on
+// every surface was told "0 open tasks" and started believing nothing was
+// outstanding. Over the same period the owner raised "you left items open" 48
+// times. That is a mechanical cause, not a behaviour one, and it is in the
+// gateway, so fixing it reaches Chat and Cowork where no hook exists.
+//
+// CONSERVATIVE ON PURPOSE. hot is free prose, and a loose matcher would turn
+// every sentence describing FINISHED work into a false open item - worse than
+// zero, because a list that is always wrong gets ignored, which is the
+// over-firing failure this repo has shipped twice. Only four sources count:
+// real pending rows, bullets under the existing heading (kept, not replaced), a
+// NEXT block, and lines carrying an explicit unfinished marker. Bounded to 12
+// items of 160 characters so it cannot grow into the payload.
+const OPEN_MARKER = /\b(not yet (?:verified|confirmed|checked|done)|still (?:open|unverified|outstanding|not)|unverified|remains? open|outstanding|to do|todo)\b/i;
+
+function openItems(hotState, pendingRows) {
+  const out = [];
+  const push = (s) => {
+    const t = String(s || "").replace(/\s+/g, " ").trim();
+    if (t.length < 8) return;
+    if (out.length >= 12) return;
+    if (out.some((o) => o.slice(0, 60) === t.slice(0, 60))) return;
+    out.push(t.slice(0, 160));
+  };
+
+  for (const r of pendingRows || []) push("pending " + r.id + ": " + r.title);
+
+  const hot = String(hotState || "");
+  if (hot) {
+    // The existing heading, kept so a hot state written the old way still works.
+    const h = hot.search(/##\s*STILL OPEN/i);
+    if (h !== -1) {
+      const after = hot.slice(h);
+      const nxt = after.slice(3).search(/\n##\s/);
+      for (const l of (nxt === -1 ? after : after.slice(0, nxt + 3)).split("\n")) {
+        if (/^\s*-\s+/.test(l)) push(l.replace(/^\s*-\s+/, ""));
+      }
+    }
+    for (const line of hot.split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      // A HEADING IS NOT AN ITEM. "## STILL OPEN" carries the marker words in
+      // its own title, so the line scan counted the heading itself alongside the
+      // bullets beneath it - caught by P4 rather than by reading.
+      if (/^#/.test(t)) continue;
+      if (/^NEXT\b/i.test(t)) { push(t.replace(/^NEXT[:\s-]*/i, "")); continue; }
+      if (OPEN_MARKER.test(t)) push(t);
+    }
+  }
+  return out;
+}
+
 function countOpenTasks(hotState) {
   if (!hotState) return 0;
   const idx = hotState.search(/##\s*STILL OPEN/i);
@@ -251,6 +308,7 @@ async function sessionLoad(domain, surface, env) {
     [...(recent.results || []).map((r) => r.id), ...(lessons.results || []).map((r) => r.id)]
   );
   const openN = countOpenTasks(hotState);
+  const openItemList = openItems(hotState, (pending.results || []));
   await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, "Session loaded, surface=" + (surface || "mcp")).run();
   const out = {
     confirmation: confirmationText(domain, rules.length, hotDate, openN, false),
@@ -259,6 +317,10 @@ async function sessionLoad(domain, surface, env) {
     hot: hotState,
     hot_updated: hotDate,
     open_tasks: openN,
+    // Parity with the gateway - a customer session is told the same truth about
+    // what is outstanding as the owner's is.
+    open_items: openItemList,
+    open_items_note: "open_items lists what the record itself says is unfinished: real pending rows, bullets under a STILL OPEN heading, a NEXT block, and lines carrying an explicit unfinished marker. It exists because open_tasks counted only one heading format that no working state had used in months, so every load reported 0 while a dozen things were outstanding - and a session told nothing is open leaves things open. Read it before starting new work, and close what you finish.",
     context: context.results || [],
     memory: [...(pending.results || []), ...(recent.results || [])],
     memory_note: MEMORY_NOTE,
