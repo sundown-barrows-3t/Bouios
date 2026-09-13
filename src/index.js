@@ -418,6 +418,19 @@ async function sessionWrite(domain, body, db) {
       // Constraint-row gate - mirrors memory-gateway/src/index.js (parity).
       if (constraintRowError(m)) continue;
       if (m.type === "decision" && CLAIM_RE.test(m.body) && !EVIDENCE_RE.test(m.body)) continue;
+      // ONE-READ ABSENCE WRITTEN INTO THE PERMANENT RECORD (2026-09-13, memory
+      // row 2019). A session read a KV key once, saw nothing for the depth it
+      // was chasing, and stated "no row at all, not even a start row" as fact -
+      // into a commit message and a gate test's comment. A re-read of the same
+      // key minutes later returned that row, written 0.3s after the value first
+      // read. KV and R2 are eventually consistent: a stale read and an empty one
+      // are indistinguishable, so a single read can never evidence absence.
+      // SCOPED TO type=decision for the same reason CLAIM_RE is - a mistake or
+      // pattern row DESCRIBING this failure (row 2019 itself does) must keep
+      // saving. The hook layer catches it in the reply; this catches it on the
+      // one path every surface goes through, which is where the damage lasts.
+      const STALE_ABSENCE_RE = /(?:\bkv\b|\br2\b|the cache|the store|the bucket)[^.!?]{0,90}?\b(?:no|zero|not a single)\s+(?:rows?|entr(?:y|ies)|records?|values?|keys?)\b|\b(?:no|zero|not a single)\s+(?:rows?|entr(?:y|ies)|records?|values?|keys?)\b[^.!?]{0,90}?(?:\bkv\b|\br2\b|the cache|the store|the bucket)/i;
+      if (m.type === "decision" && STALE_ABSENCE_RE.test(m.body) && !EVIDENCE_RE.test(m.body)) continue;
       await db.prepare("INSERT INTO memory (domain, type, title, body, created_at) VALUES (?, ?, ?, ?, date('now'))").bind(domain, m.type, m.title, m.body).run();
       applied.push("memory:" + m.title);
     }
