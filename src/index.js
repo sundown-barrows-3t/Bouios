@@ -377,6 +377,7 @@ function constraintRowError(m) {
 
 async function sessionWrite(domain, body, db) {
   await ensureSchema(db);
+  const batched = [];   // must land together or not at all - see db.batch() below
   const applied = [];
   // The load-before-write gate's ONLY evidence is a log row matching
   // 'Session loaded%' (domainLoadedRecently). Log summaries are caller-supplied,
@@ -441,23 +442,29 @@ async function sessionWrite(domain, body, db) {
       // one path every surface goes through, which is where the damage lasts.
       const STALE_ABSENCE_RE = /(?:\bkv\b|\br2\b|the cache|the store|the bucket)[^.!?]{0,90}?\b(?:no|zero|not a single)\s+(?:rows?|entr(?:y|ies)|records?|values?|keys?)\b|\b(?:no|zero|not a single)\s+(?:rows?|entr(?:y|ies)|records?|values?|keys?)\b[^.!?]{0,90}?(?:\bkv\b|\br2\b|the cache|the store|the bucket)/i;
       if (m.type === "decision" && STALE_ABSENCE_RE.test(m.body) && !hasEvidence(m.body)) continue;
-      await db.prepare("INSERT INTO memory (domain, type, title, body, created_at) VALUES (?, ?, ?, ?, date('now'))").bind(domain, m.type, m.title, m.body).run();
+      batched.push(db.prepare("INSERT INTO memory (domain, type, title, body, created_at) VALUES (?, ?, ?, ?, date('now'))").bind(domain, m.type, m.title, m.body));
       applied.push("memory:" + m.title);
     }
   }
   if (Array.isArray(body.context)) {
     for (const c of body.context) {
       if (!c || !c.key || typeof c.content !== "string") continue;
-      await db.prepare("INSERT OR REPLACE INTO context (domain, key, content, updated_at) VALUES (?, ?, ?, date('now'))").bind(domain, c.key, c.content).run();
+      batched.push(db.prepare("INSERT OR REPLACE INTO context (domain, key, content, updated_at) VALUES (?, ?, ?, date('now'))").bind(domain, c.key, c.content));
       applied.push("context:" + c.key);
     }
   }
   const logs = Array.isArray(body.log) ? body.log : typeof body.log === "string" ? [body.log] : [];
   for (const s of logs) {
     if (typeof s !== "string" || !s) continue;
-    await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, s).run();
+    batched.push(db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, s));
     applied.push("log");
   }
+  // ONE TRANSACTION for the row writes, mirroring the gateway (parity). They were
+  // separate awaited statements, so a failure part-way through left some rows
+  // written and the rest not, with the caller told only that the write failed.
+  // The hot write deliberately stays outside: it is one statement either way and
+  // the gateway's compare-and-swap needs its own result.
+  if (batched.length) await db.batch(batched);
   return { ok: true, domain, applied };
 }
 
