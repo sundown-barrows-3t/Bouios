@@ -412,12 +412,22 @@ async function sessionWrite(domain, body, db) {
     // it is skipped. Mirrors the same gate in memory-gateway/src/index.js,
     // including the 2026-08-31 widening for live-verification phrasing.
     const CLAIM_RE = /\b(done|fixed|resolved|deployed|shipped|completed?|verified)\b/i;
-    const EVIDENCE_RE = /\b[0-9a-f]{7,40}\b|https?:\/\/\S+|\btests?\s+(pass|green|passing)\b|\bPASS\b|\blive[- ]?(verified|checked|tested|confirmed|reproduced)\b|\b(verified|checked|tested|confirmed|reproduced)[- ]?live\b/i;
+    // THE LOWERCASE-"pass" HOLE, closed 2026-09-15 (memory row 2026). \bPASS\b
+    // sat inside a case-INSENSITIVE regex, so any body containing the ordinary
+    // word "pass" - "the second pass never ran" - counted as evidence and walked
+    // straight through every gate that shares this escape. Split, not deleted:
+    // real test output is upper-case, and the "tests pass/green/passing" arm
+    // stays case-insensitive, so honest evidence is untouched and only the bare
+    // word loses its free ride. hasEvidence() is the single call site for both
+    // halves so they cannot drift apart.
+    const EVIDENCE_RE = /\b[0-9a-f]{7,40}\b|https?:\/\/\S+|\btests?\s+(pass|green|passing)\b|\blive[- ]?(verified|checked|tested|confirmed|reproduced)\b|\b(verified|checked|tested|confirmed|reproduced)[- ]?live\b/i;
+    const EVIDENCE_PASS_RE = /\bPASS\b/;   // case-SENSITIVE on purpose
+    const hasEvidence = (t) => EVIDENCE_RE.test(t) || EVIDENCE_PASS_RE.test(t);
     for (const m of body.memory) {
       if (!m || !MEMORY_TYPES.includes(m.type) || !m.title || !m.body) continue;
       // Constraint-row gate - mirrors memory-gateway/src/index.js (parity).
       if (constraintRowError(m)) continue;
-      if (m.type === "decision" && CLAIM_RE.test(m.body) && !EVIDENCE_RE.test(m.body)) continue;
+      if (m.type === "decision" && CLAIM_RE.test(m.body) && !hasEvidence(m.body)) continue;
       // ONE-READ ABSENCE WRITTEN INTO THE PERMANENT RECORD (2026-09-13, memory
       // row 2019). A session read a KV key once, saw nothing for the depth it
       // was chasing, and stated "no row at all, not even a start row" as fact -
@@ -430,7 +440,7 @@ async function sessionWrite(domain, body, db) {
       // saving. The hook layer catches it in the reply; this catches it on the
       // one path every surface goes through, which is where the damage lasts.
       const STALE_ABSENCE_RE = /(?:\bkv\b|\br2\b|the cache|the store|the bucket)[^.!?]{0,90}?\b(?:no|zero|not a single)\s+(?:rows?|entr(?:y|ies)|records?|values?|keys?)\b|\b(?:no|zero|not a single)\s+(?:rows?|entr(?:y|ies)|records?|values?|keys?)\b[^.!?]{0,90}?(?:\bkv\b|\br2\b|the cache|the store|the bucket)/i;
-      if (m.type === "decision" && STALE_ABSENCE_RE.test(m.body) && !EVIDENCE_RE.test(m.body)) continue;
+      if (m.type === "decision" && STALE_ABSENCE_RE.test(m.body) && !hasEvidence(m.body)) continue;
       await db.prepare("INSERT INTO memory (domain, type, title, body, created_at) VALUES (?, ?, ?, ?, date('now'))").bind(domain, m.type, m.title, m.body).run();
       applied.push("memory:" + m.title);
     }
