@@ -239,6 +239,34 @@ function relevanceTerms(topic) {
   return out;
 }
 
+// ROWS MATCHING THIS TOPIC IN ANOTHER PROJECT - TITLES ONLY. Ported from the
+// gateway 2026-09-16, same reason: relevantMemory below is scoped to this project
+// plus GLOBAL, so a row in another project cannot be returned by any load at any
+// topic, and the only way to reach it is for someone to name its id. Titles and
+// ids only - never content - so the project boundary is not crossed; the bug
+// being fixed is invisibility, not access. Errors return [] and the load stands.
+async function relatedElsewhere(db, domain, topic) {
+  const terms = relevanceTerms(topic);
+  if (!terms.length) return [];
+  const score = terms
+    .map(() => "(CASE WHEN lower(title) LIKE ? THEN 3 ELSE 0 END) + (CASE WHEN lower(COALESCE(body,'')) LIKE ? THEN 1 ELSE 0 END)")
+    .join(" + ");
+  const sql =
+    "SELECT id, domain, type, title, (" + score + ") AS score " +
+    "FROM memory WHERE domain != ? AND domain != 'GLOBAL' AND (" + score + ") > 0 " +
+    "ORDER BY score DESC, id DESC LIMIT 5";
+  const binds = [];
+  for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
+  binds.push(domain);
+  for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
+  try {
+    const rows = await db.prepare(sql).bind(...binds).all();
+    return (rows.results || []).map((r) => ({ id: r.id, project: r.domain, type: r.type, title: r.title }));
+  } catch (e) {
+    return [];
+  }
+}
+
 async function relevantMemory(db, domain, topic, excludeIds) {
   const terms = relevanceTerms(topic);
   if (!terms.length) return [];
@@ -315,6 +343,7 @@ async function sessionLoad(domain, surface, env) {
     db, domain, loadTopic || String(hotState || "").slice(0, 600),
     [...(recent.results || []).map((r) => r.id), ...(lessons.results || []).map((r) => r.id)]
   );
+  const relatedRows = await relatedElsewhere(db, domain, loadTopic || String(hotState || "").slice(0, 600));
   const openN = countOpenTasks(hotState);
   const openItemList = openItems(hotState, (pending.results || []));
   await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, "Session loaded, surface=" + (surface || "mcp")).run();
@@ -340,6 +369,7 @@ async function sessionLoad(domain, surface, env) {
       ? "Returned " + (recent.results || []).length + " newest titles + " + relevantRows.length + " rows matched on your topic, out of " + (memTotal ? memTotal.n : 0) + " total."
       : "Returned the " + (recent.results || []).length + " NEWEST titles out of " + (memTotal ? memTotal.n : 0) + " rows. The rest are not shown and their ids cannot be guessed from this window. If your task is not covered by what you see, call bouios_load again with a topic to search ALL rows by relevance - do not assume the store has nothing on it.",
     ...(relevantRows.length ? {
+      related_elsewhere: relatedRows,
       relevant: relevantRows,
       relevant_note: "relevant carries rows matched against the topic you named, searched across ALL rows rather than the newest window, with a 400-character body excerpt. These are the rows the age-ordered window above would have hidden from you. Read them before diagnosing or proposing.",
     } : {}),
@@ -373,6 +403,30 @@ function constraintRowError(m) {
   if (prov === "OWNER-SAID" && !VERBATIM_RE.test(m.body)) return "constraint refused: an OWNER-SAID ban must quote the owner's actual words verbatim (in quotes)";
   if (prov === "OWNER-SAID" && REACH_RE.test(text)) return "constraint refused: reach beyond the owner's words ('everything derived from it' etc.) is a separate claim - tag it INFERRED and confirm before acting";
   return null;
+}
+
+
+// SUPERSEDE MARKER - ported from the gateway 2026-09-16, parity gap found by
+// reading memory row 1867 rather than by any test. That row's whole subject is
+// that a titles-only load can be trusted blind, and its candidate fix (c) was a
+// first-class supersede link so a disproved row cannot come back as live
+// guidance. The gateway has had it for weeks; the CUSTOMER worker never did, so
+// on a customer's own deployment a row that has been refuted still returns with
+// a clean title and no signal at all - which is exactly the failure the row
+// describes, shipped to the people paying for it.
+//
+// Identical logic to memory-gateway/src/index.js on purpose: same regex, same
+// idempotent UPDATE, same domain scoping. memory-gateway/test/supersede-marker
+// .test.mjs asserts both copies.
+function findSupersededIds(body) {
+  const ids = new Set();
+  const re = /supersedes\s+memory\s+(?:rows?\s+)?((?:\d+\s*(?:,|and|&)?\s*)+)/gi;
+  let m;
+  while ((m = re.exec(body))) {
+    const nums = m[1].match(/\d+/g) || [];
+    for (const n of nums) ids.add(Number(n));
+  }
+  return [...ids];
 }
 
 async function sessionWrite(domain, body, db) {
@@ -444,6 +498,11 @@ async function sessionWrite(domain, body, db) {
       if (m.type === "decision" && STALE_ABSENCE_RE.test(m.body) && !hasEvidence(m.body)) continue;
       batched.push(db.prepare("INSERT INTO memory (domain, type, title, body, created_at) VALUES (?, ?, ?, ?, date('now'))").bind(domain, m.type, m.title, m.body));
       applied.push("memory:" + m.title);
+      for (const supId of findSupersededIds(m.body)) {
+        batched.push(db.prepare(
+          "UPDATE memory SET title = '[SUPERSEDED] ' || title WHERE id = ? AND domain = ? AND title NOT LIKE '[SUPERSEDED]%'"
+        ).bind(supId, domain));
+      }
     }
   }
   if (Array.isArray(body.context)) {
