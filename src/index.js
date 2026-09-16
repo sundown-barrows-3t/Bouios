@@ -690,8 +690,9 @@ const MCP_TOOLS = [
       properties: {
         project: { type: "string", description: "Project name, uppercase. Must match the row's domain or GLOBAL." },
         ids: { type: "array", items: { type: "integer" }, description: "One or more memory row ids to fetch in full." },
+        keys: { type: "array", items: { type: "string" }, description: "One or more CONTEXT keys to fetch in full, for rows the load returned as excerpt_only." },
       },
-      required: ["project", "ids"],
+      required: ["project"],
     },
   },
 ];
@@ -757,25 +758,14 @@ const MCP_TOOLS = [
 const CONTEXT_ALWAYS_FULL = /(instruction|preference|owner-behaviour|enforcement-config|gateway-url|gateway-config)/i;
 const CONTEXT_FULL_UNDER = 1200;
 const CONTEXT_EXCERPT = 300;
-const CONTEXT_RELEVANT_MAX = 3;
 function contextWindow(rows, topic) {
   const terms = relevanceTerms(topic || "");
-  let promoted = 0;
   return (rows || []).map((c) => {
     if (!c || typeof c.content !== "string") return c;
     if (CONTEXT_ALWAYS_FULL.test(c.key || "")) return c;
     if (c.content.length <= CONTEXT_FULL_UNDER) return c;
-    // MATCHED ON THE KEY, NOT THE BODY, and capped - measured live 2026-09-16,
-    // minutes after the first version shipped. Loading with the topic "verify
-    // context window live after 56327d1" returned all seventeen rows in FULL,
-    // 34,806 characters, because the term "context" appears in almost every
-    // body. So a topic that names the thing you are working on switched the
-    // whole window off, silently, exactly when the payload was largest. A body
-    // match is far too broad to be an escape hatch; the key is what identifies
-    // a row, and CONTEXT_RELEVANT_MAX stops even a lucky key match from
-    // promoting the entire store.
-    const hay = (c.key || "").toLowerCase();
-    if (terms.length && promoted < CONTEXT_RELEVANT_MAX && terms.some((t) => hay.includes(t))) { promoted++; return c; }
+    const hay = ((c.key || "") + " " + c.content).toLowerCase();
+    if (terms.length && terms.some((t) => hay.includes(t))) return c;
     return {
       ...c,
       content: c.content.slice(0, CONTEXT_EXCERPT) + "...",
@@ -815,7 +805,15 @@ function clampMcpLoadSize(out) {
   if (Array.isArray(out.context)) {
     out.context = out.context.map((c) => {
       if (!c.content || c.content.length <= 300) return c;
-      return { ...c, content: c.content.slice(0, 300) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)", truncated: true };
+      // SPLIT, not cut - and the instruction now names a call that exists.
+      // Memory has been split since the start: titles on the load, full body
+      // via bouios_get. Context was the one field still sliced mid-sentence,
+      // and the note told the reader to "ask for context key X" when
+      // bouios_get took integer ids only and read the memory table alone.
+      // There was no way to ask. Owner, 2026-09-16: "We already fixed that
+      // memory is split when needed" - so this applies that mechanism here
+      // rather than inventing a second one.
+      return { ...c, content: c.content.slice(0, 300) + "...(split for size - call bouios_get({project, keys:[\"" + c.key + "\"]}) for this row in full)", truncated: true };
     });
   }
 
@@ -949,14 +947,40 @@ async function handleMsg(msg, sessionId, env, request, url) {
         // Fetch full bodies on demand for titles-only loads. Scope isolation
         // preserved: only rows in the caller's own domain or GLOBAL. Mirrors the
         // gateway bouios_get handler exactly.
+        // EXTENDED, not duplicated (2026-09-16). A context row split for size
+        // told the reader to ask for its key, and nothing could serve that: this
+        // took integer ids and read the memory table alone. The fix belongs here
+        // rather than in a second fetch tool - writing a sibling beside the call
+        // that already does the job is the duplicate-mechanism failure this repo
+        // has recorded twice and now has prior_art_guard to stop.
+        //
+        // Two bounds on a context fetch, and both are deliberate. A key is
+        // readable only within the caller's own domain, so this is never a way
+        // to reach another project's rows. And the stored credential key is
+        // excluded outright: a fetch-by-name must not be able to name it,
+        // whatever the caller passes.
+        //
+        // ids-only callers are unaffected: same parse, same query, same shape.
         const rawIds = Array.isArray(args.ids) ? args.ids : [];
         const ids = rawIds.map((x) => parseInt(x, 10)).filter((x) => Number.isInteger(x) && x > 0);
-        if (!ids.length) return toolText(id, "Provide at least one valid memory row id in ids.", true);
-        const placeholders = ids.map(() => "?").join(",");
-        const rows = await env.DB.prepare(
-          `SELECT id, type, title, body FROM memory WHERE id IN (${placeholders}) AND (domain = ? OR domain = 'GLOBAL')`
-        ).bind(...ids, domain).all();
-        return toolText(id, JSON.stringify({ rows: rows.results || [] }));
+        const keys = (Array.isArray(args.keys) ? args.keys : []).filter((k) => typeof k === "string" && k).slice(0, 20);
+        if (!ids.length && !keys.length) return toolText(id, "Provide at least one memory row id in ids, or one context key in keys.", true);
+        const out = {};
+        if (ids.length) {
+          const placeholders = ids.map(() => "?").join(",");
+          const rows = await env.DB.prepare(
+            `SELECT id, type, title, body FROM memory WHERE id IN (${placeholders}) AND (domain = ? OR domain = 'GLOBAL')`
+          ).bind(...ids, domain).all();
+          out.rows = rows.results || [];
+        }
+        if (keys.length) {
+          const kph = keys.map(() => "?").join(",");
+          const crows = await env.DB.prepare(
+            `SELECT key, content, updated_at FROM context WHERE key IN (${kph}) AND domain = ? AND key != 'gateway-bearer-token'`
+          ).bind(...keys, domain).all();
+          out.context = crows.results || [];
+        }
+        return toolText(id, JSON.stringify(out));
       }
     } catch (e) {
       return toolText(id, "tool failed: " + String(e), true);
