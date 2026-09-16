@@ -515,7 +515,8 @@ async function sessionWrite(domain, body, db) {
   const logs = Array.isArray(body.log) ? body.log : typeof body.log === "string" ? [body.log] : [];
   for (const s of logs) {
     if (typeof s !== "string" || !s) continue;
-    batched.push(db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, s));
+    const line = clipLogLine(s);
+    batched.push(db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, line.text));
     applied.push("log");
   }
   // ONE TRANSACTION for the row writes, mirroring the gateway (parity). They were
@@ -716,6 +717,32 @@ const MCP_TOOLS = [
 // remains fetchable by asking for that memory id). Pending rows and hot
 // state are NEVER touched - those are exactly what bouios_handoff and the
 // checkpoint protocol depend on being complete every time.
+
+// A LOG LINE IS ONE LINE, AND NOTHING EVER ENFORCED THAT (2026-09-16).
+// Measured in the store: 3 September, 67 rows totalling 44,857 characters; 16
+// September, 34 rows totalling 36,411; individual rows up to 3,995. Sessions -
+// mine among them - write paragraphs into a field the load returns in full,
+// twenty-five at a time, and that is what pushed the payload past the transport
+// ceiling and started getting whole loads rejected.
+//
+// IT SURFACED ONLY NOW, and not as a regression: row 1518/1643 filtered the junk
+// rows out of the window ("Session loaded", "transcript PUT", hot-archive
+// echoes - eighteen of twenty-five on a real load, ~40 characters each). That
+// fix is right and stays. It also replaced eighteen short rows with eighteen
+// long real ones, roughly tripling the field, which is what made the missing cap
+// start to hurt.
+//
+// Detail belongs in a memory row, which is retrievable by id; the log is the
+// index of what was agreed and done. Clipping is visible, never silent: the
+// stored line says so, and sessionWrite reports it back to the writer.
+const LOG_LINE_MAX = 400;
+function clipLogLine(s) {
+  if (typeof s !== "string" || s.length <= LOG_LINE_MAX) return { text: s, clipped: false };
+  return {
+    text: s.slice(0, LOG_LINE_MAX) + "...(clipped - a log line is one line; put the detail in a memory row)",
+    clipped: true,
+  };
+}
 
 const MCP_LOAD_SIZE_CEILING = 60000;
 function clampMcpLoadSize(out) {
