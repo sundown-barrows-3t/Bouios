@@ -360,7 +360,8 @@ async function sessionLoad(domain, surface, env) {
     // what is outstanding as the owner's is.
     open_items: openItemList,
     open_items_note: "open_items lists what the record itself says is unfinished: real pending rows, bullets under a STILL OPEN heading, a NEXT block, and lines carrying an explicit unfinished marker. It exists because open_tasks counted only one heading format that no working state had used in months, so every load reported 0 while a dozen things were outstanding - and a session told nothing is open leaves things open. Read it before starting new work, and close what you finish.",
-    context: context.results || [],
+    context: contextWindow(context.results || [], loadTopic),
+    context_note: "context carries the reference material for this project. Rows that bind behaviour (preferences, instructions), rows under 1200 characters, and rows matching the topic you named come back IN FULL. The rest are an excerpt plus their real length, marked excerpt_only - because after the log was capped, context became the largest block in the payload and the size guard's last resort would otherwise have started cutting it. Nothing is hidden: every key is listed with its date, and the full content is one bouios_get({project, keys:[...]}) call away. Fetch the ones your task actually needs, never all of them.",
     memory: [...(pending.results || []), ...(recent.results || [])],
     memory_note: MEMORY_NOTE,
     memory_total: memTotal ? memTotal.n : 0,
@@ -735,6 +736,44 @@ const MCP_TOOLS = [
 // Detail belongs in a memory row, which is retrievable by id; the log is the
 // index of what was agreed and done. Clipping is visible, never silent: the
 // stored line says so, and sessionWrite reports it back to the writer.
+// CONTEXT: the same titles-and-ids discipline memory has had since 523933a.
+//
+// WHY NOW. After the log was capped (60726f4) context became the largest block
+// in the payload - measured on a live load 2026-09-16, 34,806 of 58,924
+// characters against a 60,000 ceiling, about a thousand characters of headroom.
+// The size guard's last step would then have started cutting context again, and
+// cutting the owner's context is the exact thing he objected to. Better that the
+// load never carries the bulk in the first place than that a guard chops it.
+//
+// WHAT IS NEVER EXCERPTED, and this is the whole safety of it: anything that
+// BINDS BEHAVIOUR. profile-preferences and layer2-instructions-for-claude are
+// the instruction layer on surfaces where no hook can run - excerpting those
+// would silently drop enforcement text, which is worse than any payload size.
+// Small rows are not worth excerpting either, and a row that matches the topic
+// the session actually named comes back whole, exactly like `relevant`.
+//
+// Nothing is lost: every key, its date and its length are always listed, and
+// the full content is one bouios_get({project, keys:[...]}) away.
+const CONTEXT_ALWAYS_FULL = /(instruction|preference|owner-behaviour|enforcement-config|gateway-url|gateway-config)/i;
+const CONTEXT_FULL_UNDER = 1200;
+const CONTEXT_EXCERPT = 300;
+function contextWindow(rows, topic) {
+  const terms = relevanceTerms(topic || "");
+  return (rows || []).map((c) => {
+    if (!c || typeof c.content !== "string") return c;
+    if (CONTEXT_ALWAYS_FULL.test(c.key || "")) return c;
+    if (c.content.length <= CONTEXT_FULL_UNDER) return c;
+    const hay = ((c.key || "") + " " + c.content).toLowerCase();
+    if (terms.length && terms.some((t) => hay.includes(t))) return c;
+    return {
+      ...c,
+      content: c.content.slice(0, CONTEXT_EXCERPT) + "...",
+      chars: c.content.length,
+      excerpt_only: true,
+    };
+  });
+}
+
 const LOG_LINE_MAX = 400;
 function clipLogLine(s) {
   if (typeof s !== "string" || s.length <= LOG_LINE_MAX) return { text: s, clipped: false };
