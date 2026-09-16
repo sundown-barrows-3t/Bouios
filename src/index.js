@@ -757,14 +757,25 @@ const MCP_TOOLS = [
 const CONTEXT_ALWAYS_FULL = /(instruction|preference|owner-behaviour|enforcement-config|gateway-url|gateway-config)/i;
 const CONTEXT_FULL_UNDER = 1200;
 const CONTEXT_EXCERPT = 300;
+const CONTEXT_RELEVANT_MAX = 3;
 function contextWindow(rows, topic) {
   const terms = relevanceTerms(topic || "");
+  let promoted = 0;
   return (rows || []).map((c) => {
     if (!c || typeof c.content !== "string") return c;
     if (CONTEXT_ALWAYS_FULL.test(c.key || "")) return c;
     if (c.content.length <= CONTEXT_FULL_UNDER) return c;
-    const hay = ((c.key || "") + " " + c.content).toLowerCase();
-    if (terms.length && terms.some((t) => hay.includes(t))) return c;
+    // MATCHED ON THE KEY, NOT THE BODY, and capped - measured live 2026-09-16,
+    // minutes after the first version shipped. Loading with the topic "verify
+    // context window live after 56327d1" returned all seventeen rows in FULL,
+    // 34,806 characters, because the term "context" appears in almost every
+    // body. So a topic that names the thing you are working on switched the
+    // whole window off, silently, exactly when the payload was largest. A body
+    // match is far too broad to be an escape hatch; the key is what identifies
+    // a row, and CONTEXT_RELEVANT_MAX stops even a lucky key match from
+    // promoting the entire store.
+    const hay = (c.key || "").toLowerCase();
+    if (terms.length && promoted < CONTEXT_RELEVANT_MAX && terms.some((t) => hay.includes(t))) { promoted++; return c; }
     return {
       ...c,
       content: c.content.slice(0, CONTEXT_EXCERPT) + "...",
