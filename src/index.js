@@ -694,6 +694,116 @@ const MCP_TOOLS = [
   },
 ];
 
+
+// MCP transport size ceiling - MIRROR of memory-gateway/src/index.js, added to
+// this customer worker 2026-09-16. Until today it had NO ceiling at all: the
+// bouios_load result went out at whatever size sessionLoad() produced, so a
+// customer whose log and lessons had grown hit exactly the failure the owner
+// hit on the gateway - the client rejects the whole tool result, the model
+// never sees the load, and the load gate reads it as never loaded, leaving the
+// session unable to write. Keep this function byte-equivalent to the gateway's.
+//
+// MCP transport size ceiling. sessionStart() output was measured at ~127KB for
+// a real account (max tier, 46 memory rows, 6 full skill bodies) - proven
+// 2026-07-02 to repeatedly trip the client's "exceeds maximum allowed tokens"
+// error inside a live session. An oversized single-line tool result is a
+// plausible cause of the chronic MCP disconnect/reconnect cycling (mem440/
+// 469/609/642/etc) that survived the earlier 403/licence fix (c7833b9) -
+// that fix addressed one confirmed 403 cause; this addresses a second,
+// independent, now-measured cause. Shrinks in order of least information
+// loss: skill bodies (re-derivable, rarely change) first, then memory row
+// bodies (kept as a preview + id so nothing is silently lost - full body
+// remains fetchable by asking for that memory id). Pending rows and hot
+// state are NEVER touched - those are exactly what bouios_handoff and the
+// checkpoint protocol depend on being complete every time.
+
+const MCP_LOAD_SIZE_CEILING = 60000;
+function clampMcpLoadSize(out) {
+  let size = JSON.stringify(out).length;
+  if (size <= MCP_LOAD_SIZE_CEILING) return out;
+  if (out.skills && Array.isArray(out.skills.skills)) {
+    out.skills.skills = out.skills.skills.map((s) => ({ name: s.name, est_tokens: s.est_tokens, bodyOmitted: true }));
+    out.skills.note = "Skill bodies omitted this load (response size guard). Names unchanged from your prior load in this session; ask if a body is needed.";
+  }
+  size = JSON.stringify(out).length;
+  if (size <= MCP_LOAD_SIZE_CEILING) return out;
+  if (Array.isArray(out.memory)) {
+    out.memory = out.memory.map((m) => {
+      if (m.type === "pending" || !m.body || m.body.length <= 300) return m;
+      return { ...m, body: m.body.slice(0, 300) + "...(truncated, size guard - ask for memory id " + m.id + " if the rest is needed)", truncated: true };
+    });
+  }
+  size = JSON.stringify(out).length;
+  if (size <= MCP_LOAD_SIZE_CEILING) return out;
+  if (Array.isArray(out.context)) {
+    out.context = out.context.map((c) => {
+      if (!c.content || c.content.length <= 300) return c;
+      return { ...c, content: c.content.slice(0, 300) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)", truncated: true };
+    });
+  }
+
+  // EXTENDED 2026-09-16, because this guard had been outgrown rather than
+  // broken. It was written on 2026-07-02 against a 127KB payload made of
+  // skills, memory and context, and it still trims exactly those three. Every
+  // field added since is invisible to it: log, lessons (2026-09-05), relevant
+  // (2026-09-09), recent_transcripts, hot_archives. Measured on a real load
+  // from this account today - 62,037 bytes, of which log 24%, rules 19%,
+  // lessons 16%, context 11% - so the three fields it knows are a minority of
+  // the payload and it cannot get under the ceiling no matter how hard it trims.
+  //
+  // That is the regression the owner reported: loads went 50.0 -> 61.1KB
+  // delivered, then 64.0 -> 77.0KB REJECTED whole by the harness, which reads
+  // to the model AND to the load gate as a failed load, leaving the session
+  // read-only. The growth was the session's own checkpoints - each save writes a
+  // log row and the next load returns it - so diligent saving is what bricks it.
+  //
+  // Steps are ordered by what is least costly to lose and stop the moment it
+  // fits. hot, pending and the confirmation line are never touched, here or
+  // above.
+  const _clip = (s, n) => (typeof s === "string" && s.length > n ? s.slice(0, n) + "...(truncated, size guard)" : s);
+  const _fits = () => JSON.stringify(out).length <= MCP_LOAD_SIZE_CEILING;
+  const _steps = [
+    () => { delete out.recent_transcripts; delete out.transcripts_note; },
+    () => { (out.log || []).forEach((r) => { if (r && r.summary) r.summary = _clip(r.summary, 400); }); },
+    () => { (out.relevant || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
+    () => { (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 250); }); },
+    () => { delete out.hot_archives; delete out.hot_archives_note; },
+    () => { if (Array.isArray(out.log)) out.log = out.log.slice(0, 10); },
+    () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 20); },
+  ];
+  for (const step of _steps) {
+    if (_fits()) return out;
+    step();
+  }
+
+  // AND A LAST RESORT THAT DOES NOT KNOW FIELD NAMES AT ALL, which is the whole
+  // lesson of this regression: a guard that lists the fields it knows goes quietly
+  // out of date the next time the payload gains one, and the failure it then
+  // allows is a session that cannot write. Halve the largest remaining
+  // non-protected field until it fits. The protected set is never eligible, so a
+  // payload whose core alone exceeds the ceiling still goes out whole rather than
+  // gutted - an oversized load is bad, a load missing its pending rows is worse.
+  const _PROTECTED = new Set([
+    "confirmation", "domain", "read_order", "pending", "pending_suspect",
+    "open_items", "hot", "hot_updated", "load_token", "load_token_note",
+  ]);
+  let _guard = 0;
+  while (!_fits() && _guard++ < 40) {
+    let big = null, bigSize = 0;
+    for (const k of Object.keys(out)) {
+      if (_PROTECTED.has(k)) continue;
+      const n = JSON.stringify(out[k] === undefined ? null : out[k]).length;
+      if (n > bigSize) { big = k; bigSize = n; }
+    }
+    if (!big || bigSize < 200) break;
+    const v = out[big];
+    if (Array.isArray(v)) out[big] = v.slice(0, Math.max(1, Math.floor(v.length / 2)));
+    else if (typeof v === "string") out[big] = v.slice(0, Math.max(200, Math.floor(v.length / 2))) + "...(truncated, size guard)";
+    else delete out[big];
+  }
+  return out;
+}
+
 function rpcResult(id, result) { return { jsonrpc: "2.0", id, result }; }
 function rpcError(id, code, message) { return { jsonrpc: "2.0", id, error: { code, message } }; }
 function toolText(id, text, isError) {
@@ -724,7 +834,7 @@ async function handleMsg(msg, sessionId, env, request, url) {
     try {
       if (name === "bouios_load") {
         const surface = (args.surface || "mcp") + " session=" + (sessionId || "none");
-        return toolText(id, JSON.stringify(await sessionLoad(domain, surface, env)));
+        return toolText(id, JSON.stringify(clampMcpLoadSize(await sessionLoad(domain, surface, env))));
       }
       if (name === "bouios_save") {
         // Bearer auth (the /mcp/{token} gate this call already passed) proves
