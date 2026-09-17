@@ -312,7 +312,38 @@ async function sessionLoad(domain, surface, env) {
     // field BESIDE the query above, never a widening of it, so the size
     // decision titles-only exists to protect is kept intact on the customer
     // side exactly as it is on the owner's.
-    db.prepare("SELECT id, type, title, substr(body, 1, 700) AS body FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type IN ('mistake','pattern') ORDER BY id DESC LIMIT 12").bind(domain).all(),
+    db.prepare(
+      // CROSS-PROJECT BY BEHAVIOUR, NOT BY PROJECT (2026-09-17). Measured in the
+      // store: 937 mistake/pattern rows exist - AI 326, SARK 226, TRAVEL 176,
+      // SYNDAKAT 89, REBUILD 26 - and a session saw at most 12, scoped to its own
+      // project plus GLOBAL. So everything learned in another project was
+      // structurally unreachable from the session about to repeat it, and it got
+      // worse every month as new rows pushed the window past everything older.
+      // The owner's complaint - "over and over again in every area we repeat the
+      // same errors" - is that shape exactly.
+      //
+      // The four classes that recur every single month (unverified claim, did not
+      // read the record, rebuilt what existed, regression) are NOT project
+      // specific: trusting a stale note in TRAVEL is the same failure as trusting
+      // one in AI. So 4 of the 12 slots are given to the newest cross-project rows
+      // whose titles carry that vocabulary, and the other 8 stay in-project.
+      //
+      // TWELVE EITHER WAY - this REPLACES, it does not add. The load is already
+      // 31% behaviour instruction and the owner's stated aim is fewer tokens, so a
+      // retrieval fix that grows the payload would trade one complaint for another.
+      "SELECT id, type, title, body, rank FROM (" +
+        "SELECT id, type, title, substr(body,1,700) AS body, 0 AS rank FROM memory " +
+          "WHERE (domain = ? OR domain = 'GLOBAL') AND type IN ('mistake','pattern') " +
+          "ORDER BY id DESC LIMIT 8" +
+      ") UNION ALL SELECT id, type, title, body, rank FROM (" +
+        "SELECT id, type, title, substr(body,1,700) AS body, 1 AS rank FROM memory " +
+          "WHERE domain != ? AND domain != 'GLOBAL' AND type IN ('mistake','pattern') " +
+          "AND (title LIKE '%verif%' OR title LIKE '%claim%' OR title LIKE '%stale%' " +
+               "OR title LIKE '%record%' OR title LIKE '%duplicat%' OR title LIKE '%already%' " +
+               "OR title LIKE '%regress%' OR title LIKE '%broke%') " +
+          "ORDER BY id DESC LIMIT 4" +
+      ") ORDER BY rank, id DESC"
+    ).bind(domain, domain).all(),
     db.prepare("SELECT COUNT(*) AS n FROM memory WHERE domain = ? OR domain = 'GLOBAL'").bind(domain).first(),
   ]);
   let loadTopic = "";
