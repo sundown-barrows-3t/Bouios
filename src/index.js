@@ -293,8 +293,14 @@ async function relevantMemory(db, domain, topic, excludeIds) {
   const ids = Array.from(new Set((excludeIds || []).filter((n) => Number.isInteger(n))));
   const excludeClause = ids.length ? " AND id NOT IN (" + ids.map(() => "?").join(",") + ")" : "";
   const sql =
-    "SELECT id, type, title, substr(body, 1, 400) AS body, (" + score + ") AS score " +
-    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending'" + excludeClause +
+    // Lessons are searched across EVERY project, everything else stays
+    // in-project (2026-09-22, mirroring the gateway). The recurring failure
+    // classes are not project specific, and a lesson recorded under another
+    // project was structurally unreachable from the session about to repeat it.
+    // Scoped to mistake/pattern on purpose: project FACTS must not bleed
+    // between projects. `domain` rides along so a reader sees where it happened.
+    "SELECT id, domain, type, title, substr(body, 1, 400) AS body, (" + score + ") AS score " +
+    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL' OR type IN ('mistake','pattern')) AND type != 'pending'" + excludeClause +
     " AND (" + score + ") > 0 " +
     "ORDER BY score DESC, id DESC LIMIT 24";
   const binds = [];
