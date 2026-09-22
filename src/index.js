@@ -286,13 +286,21 @@ async function relevantMemory(db, domain, topic, excludeIds) {
   const score = terms
     .map(() => "(CASE WHEN lower(title) LIKE ? THEN 3 ELSE 0 END) + (CASE WHEN lower(COALESCE(body,'')) LIKE ? THEN 1 ELSE 0 END)")
     .join(" + ");
+  // Row 2206 residue: exclusion used to happen HERE, in JS, after the SQL
+  // had already applied LIMIT 24 - see memory-gateway/src/index.js for the
+  // full note. Excluding in SQL means LIMIT 24 always yields 24 CANDIDATE
+  // rows that are not already visible elsewhere in the load.
+  const ids = Array.from(new Set((excludeIds || []).filter((n) => Number.isInteger(n))));
+  const excludeClause = ids.length ? " AND id NOT IN (" + ids.map(() => "?").join(",") + ")" : "";
   const sql =
     "SELECT id, type, title, substr(body, 1, 400) AS body, (" + score + ") AS score " +
-    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND (" + score + ") > 0 " +
+    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending'" + excludeClause +
+    " AND (" + score + ") > 0 " +
     "ORDER BY score DESC, id DESC LIMIT 24";
   const binds = [];
   for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
   binds.push(domain);
+  for (const id of ids) binds.push(id);
   for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
   let rows;
   try {
@@ -301,8 +309,7 @@ async function relevantMemory(db, domain, topic, excludeIds) {
     // A search that fails must never take the load down with it.
     return [];
   }
-  const skip = new Set(excludeIds || []);
-  return (rows.results || []).filter((r) => !skip.has(r.id)).slice(0, 8);
+  return (rows.results || []).slice(0, 8);
 }
 
 async function sessionLoad(domain, surface, env) {
