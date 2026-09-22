@@ -481,8 +481,34 @@ function findSupersededIds(body) {
 }
 
 async function sessionWrite(domain, body, db) {
+  // Every log line a caller writes carries WHERE it was written from (2026-09-22),
+  // mirroring the gateway. Loads recorded surface= and writes did not, so which
+  // surfaces are actually working could not be read off the log at all. An
+  // undeclared caller is tagged "undeclared" rather than left blank: a blank tag
+  // is indistinguishable from a pre-2026-09-22 row. Additive - it gates nothing.
+  // Local to sessionWrite on purpose: session-write-atomic.test.mjs extracts this
+  // function by brace-match and evals it alone, so a module-level helper is not
+  // in scope there and the extracted copy throws instead of asserting anything.
+  const surfaceTag = (body) => {
+    const raw = body && typeof body.surface === "string" ? body.surface.trim() : "";
+    const clean = raw.slice(0, 24).replace(/[^A-Za-z0-9_.-]/g, "");
+    return " [surface=" + (clean || "undeclared") + "]";
+  };
   await ensureSchema(db);
   const batched = [];   // must land together or not at all - see db.batch() below
+  const CLAIM_RE = /\b(done|fixed|resolved|deployed|shipped|completed?|verified)\b/i;
+  // THE LOWERCASE-"pass" HOLE, closed 2026-09-15 (memory row 2026). \bPASS\b
+  // sat inside a case-INSENSITIVE regex, so any body containing the ordinary
+  // word "pass" - "the second pass never ran" - counted as evidence and walked
+  // straight through every gate that shares this escape. Split, not deleted:
+  // real test output is upper-case, and the "tests pass/green/passing" arm
+  // stays case-insensitive, so honest evidence is untouched and only the bare
+  // word loses its free ride. hasEvidence() is the single call site for both
+  // halves so they cannot drift apart.
+  const EVIDENCE_RE = /\b[0-9a-f]{7,40}\b|https?:\/\/\S+|\btests?\s+(pass|green|passing)\b|\blive[- ]?(verified|checked|tested|confirmed|reproduced)\b|\b(verified|checked|tested|confirmed|reproduced)[- ]?live\b/i;
+  const EVIDENCE_PASS_RE = /\bPASS\b/;   // case-SENSITIVE on purpose
+  const hasEvidence = (t) => EVIDENCE_RE.test(t) || EVIDENCE_PASS_RE.test(t);
+
   const applied = [];
   // The load-before-write gate's ONLY evidence is a log row matching
   // 'Session loaded%' (domainLoadedRecently). Log summaries are caller-supplied,
@@ -517,18 +543,6 @@ async function sessionWrite(domain, body, db) {
     // done/fixed/deployed must carry a commit sha, url, or test-pass token, else
     // it is skipped. Mirrors the same gate in memory-gateway/src/index.js,
     // including the 2026-08-31 widening for live-verification phrasing.
-    const CLAIM_RE = /\b(done|fixed|resolved|deployed|shipped|completed?|verified)\b/i;
-    // THE LOWERCASE-"pass" HOLE, closed 2026-09-15 (memory row 2026). \bPASS\b
-    // sat inside a case-INSENSITIVE regex, so any body containing the ordinary
-    // word "pass" - "the second pass never ran" - counted as evidence and walked
-    // straight through every gate that shares this escape. Split, not deleted:
-    // real test output is upper-case, and the "tests pass/green/passing" arm
-    // stays case-insensitive, so honest evidence is untouched and only the bare
-    // word loses its free ride. hasEvidence() is the single call site for both
-    // halves so they cannot drift apart.
-    const EVIDENCE_RE = /\b[0-9a-f]{7,40}\b|https?:\/\/\S+|\btests?\s+(pass|green|passing)\b|\blive[- ]?(verified|checked|tested|confirmed|reproduced)\b|\b(verified|checked|tested|confirmed|reproduced)[- ]?live\b/i;
-    const EVIDENCE_PASS_RE = /\bPASS\b/;   // case-SENSITIVE on purpose
-    const hasEvidence = (t) => EVIDENCE_RE.test(t) || EVIDENCE_PASS_RE.test(t);
     for (const m of body.memory) {
       if (!m || !MEMORY_TYPES.includes(m.type) || !m.title || !m.body) continue;
       // Constraint-row gate - mirrors memory-gateway/src/index.js (parity).
@@ -567,7 +581,13 @@ async function sessionWrite(domain, body, db) {
   for (const s of logs) {
     if (typeof s !== "string" || !s) continue;
     const line = clipLogLine(s);
-    batched.push(db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, line.text));
+    // A log line claiming done/fixed/deployed with no evidence is MARKED, not
+    // refused (2026-09-22, mirroring the gateway). The evidence gate covered
+    // type=decision memory rows only; the log is what the next session actually
+    // reads, and an unbacked claim there was indistinguishable from a backed
+    // one. Never refuses: a blocked save is the worst failure this system has.
+    const claimTag = CLAIM_RE.test(line.text) && !hasEvidence(line.text) ? " [unevidenced claim]" : "";
+    batched.push(db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, line.text + claimTag + surfaceTag(body)));
     applied.push("log");
   }
   // ONE TRANSACTION for the row writes, mirroring the gateway (parity). They were
@@ -696,6 +716,7 @@ const MCP_TOOLS = [
       type: "object",
       properties: {
         project: { type: "string" },
+        surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch. Pass it on every save - it is what makes the log show which surfaces are actually working." },
         load_token: { type: "string", description: "Optional but always pass it: the load_token returned by the bouios_load you are building on, so the save is not refused because the connection was re-established since the load." },
         hot: { type: "string", description: "Full current working state." },
         memory: {
@@ -988,7 +1009,7 @@ async function handleMsg(msg, sessionId, env, request, url) {
         if (!access.ok) return toolText(id, access.note || 'Handoff refused.', true);
         const saved = [];
         if (typeof args.hot === "string" && args.hot.length) {
-          const out = await sessionWrite(domain, { hot: args.hot, log: ["Session handoff."] }, env.DB);
+          const out = await sessionWrite(domain, { hot: args.hot, surface: args.surface, log: ["Session handoff."] }, env.DB);
           saved.push(...out.applied);
         }
         const next = typeof args.next_step === "string" && args.next_step.length ? args.next_step : "resume open tasks";
