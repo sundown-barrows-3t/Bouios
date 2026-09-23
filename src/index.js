@@ -503,6 +503,10 @@ async function sessionWrite(domain, body, db) {
   };
   await ensureSchema(db);
   const batched = [];   // must land together or not at all - see db.batch() below
+  // What counts as a stated done-condition. Deliberately loose: any of these
+  // phrasings is a real commitment about what finished means, and a matcher
+  // that demanded one exact spelling would just teach sessions the password.
+  const DONE_RE = /\bdone when\b|\bclosed when\b|\bcomplete when\b|\bresolved when\b|\bsuccess (is|looks like)\b|\bacceptance\b/i;
   const CLAIM_RE = /\b(done|fixed|resolved|deployed|shipped|completed?|verified)\b/i;
   // THE LOWERCASE-"pass" HOLE, closed 2026-09-15 (memory row 2026). \bPASS\b
   // sat inside a case-INSENSITIVE regex, so any body containing the ordinary
@@ -568,7 +572,31 @@ async function sessionWrite(domain, body, db) {
       // one path every surface goes through, which is where the damage lasts.
       const STALE_ABSENCE_RE = /(?:\bkv\b|\br2\b|the cache|the store|the bucket)[^.!?]{0,90}?\b(?:no|zero|not a single)\s+(?:rows?|entr(?:y|ies)|records?|values?|keys?)\b|\b(?:no|zero|not a single)\s+(?:rows?|entr(?:y|ies)|records?|values?|keys?)\b[^.!?]{0,90}?(?:\bkv\b|\br2\b|the cache|the store|the bucket)/i;
       if (m.type === "decision" && STALE_ABSENCE_RE.test(m.body) && !hasEvidence(m.body)) continue;
-      batched.push(db.prepare("INSERT INTO memory (domain, type, title, body, created_at) VALUES (?, ?, ?, ?, date('now'))").bind(domain, m.type, m.title, m.body));
+      // AN OPEN ITEM WITH NO STATED DONE-CONDITION IS MARKED (2026-09-23).
+      // Measured that day: 105 open items in the store and not one of them says
+      // what finished would look like. That is why they sit - the oldest since
+      // 2026-06-07 - because no session can close what has no closing condition,
+      // and every session that meets one re-derives the question instead.
+      //
+      // MARKED, NEVER REFUSED, and the reason is not squeamishness: a refused
+      // write is the worst failure this system has had (an overnight run lost
+      // 2026-07-03, test-save-never-gated.sh exists for it), and refusing here
+      // would push a session to file the item as some other type to get past the
+      // gate, losing the item altogether - strictly worse than an unstated
+      // condition. The mark is visible in the title every future load reads, so
+      // the next session can supply the condition instead of guessing it.
+      //
+      // The counterpart at the other end is the evidence gate above: that one
+      // refuses a DECISION claiming done with no proof. Opening without a
+      // definition of done and closing without evidence are the same gap.
+      // `m` is the loop's const, so the mark goes on a local rather than
+      // reassigning it - the first cut assigned to m and threw
+      // "Assignment to constant variable", turning every memory write into a
+      // 500. The negative-space case caught it before it left this machine.
+      const openTitle = m.type === "pending" && !DONE_RE.test(m.body)
+        ? m.title + " [no done-condition]"
+        : m.title;
+      batched.push(db.prepare("INSERT INTO memory (domain, type, title, body, created_at) VALUES (?, ?, ?, ?, date('now'))").bind(domain, m.type, openTitle, m.body));
       applied.push("memory:" + m.title);
       for (const supId of findSupersededIds(m.body)) {
         batched.push(db.prepare(
