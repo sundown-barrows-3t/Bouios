@@ -1032,20 +1032,22 @@ async function handleMsg(msg, sessionId, env, request, url) {
         // existing check has refused, so no accepted save changes behaviour.
         if (!(await domainLoadedRecently(env.DB, domain))
             && !(await verifyLoadToken(env, domain, args.load_token))) {
+          await logRefusal(env, domain, "bouios_save: memory not loaded for this project recently (no load record and no valid load_token)");
           return toolText(id, "Write refused: memory has not been loaded for this project recently. Call bouios_load for the project first, then retry - passing back the load_token it returns.", true);
         }
         const access = await checkAccess(env.DB, domain, request, url, env);
-        if (!access.ok) return toolText(id, access.note || 'Write refused.', true);
+        if (!access.ok) { await logRefusal(env, domain, "bouios_save: " + (access.note || "access check refused")); return toolText(id, access.note || 'Write refused.', true); }
         return toolText(id, JSON.stringify(await sessionWrite(domain, args, env.DB)));
       }
       if (name === "bouios_handoff") {
         // Same domain-keyed check as bouios_save (2026-07-19 fix, mirrors the gateway).
         if (!(await domainLoadedRecently(env.DB, domain))
             && !(await verifyLoadToken(env, domain, args.load_token))) {
+          await logRefusal(env, domain, "bouios_handoff: memory not loaded for this project recently (no load record and no valid load_token)");
           return toolText(id, "Handoff refused: memory has not been loaded for this project recently. Call bouios_load for the project first, then retry - passing back the load_token it returns.", true);
         }
         const access = await checkAccess(env.DB, domain, request, url, env);
-        if (!access.ok) return toolText(id, access.note || 'Handoff refused.', true);
+        if (!access.ok) { await logRefusal(env, domain, "bouios_handoff: " + (access.note || "access check refused")); return toolText(id, access.note || 'Handoff refused.', true); }
         const saved = [];
         if (typeof args.hot === "string" && args.hot.length) {
           const out = await sessionWrite(domain, { hot: args.hot, surface: args.surface, log: ["Session handoff."] }, env.DB);
@@ -1098,6 +1100,18 @@ async function handleMcp(request, env) {
   if (sessionId) headers["Mcp-Session-Id"] = sessionId;
   if (!responses.length) return new Response(null, { status: 202, headers });
   return new Response(JSON.stringify(Array.isArray(body) ? responses : responses[0]), { status: 200, headers });
+}
+
+// REFUSALS LEAVE A TRACE (2026-09-24, parity with the gateway's b5a0edc). A
+// refused save used to go back to the caller only, so a session whose every
+// save was refused looked in this log like one that never tried. One row per
+// refusal, starting "REFUSED". It never matches the "Session loaded" rows the
+// load check reads, and a failed insert never turns the refusal into an error.
+async function logRefusal(env, domain, what) {
+  if (!env || !env.DB) return;
+  try {
+    await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain || "GLOBAL", "REFUSED " + String(what).slice(0, 300)).run();
+  } catch (_) {}
 }
 
 export default {
