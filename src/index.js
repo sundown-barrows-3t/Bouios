@@ -487,7 +487,7 @@ function findSupersededIds(body) {
   return [...ids];
 }
 
-async function sessionWrite(domain, body, db) {
+async function sessionWrite(domain, body, db, tz) {
   // Every log line a caller writes carries WHERE it was written from (2026-09-22),
   // mirroring the gateway. Loads recorded surface= and writes did not, so which
   // surfaces are actually working could not be read off the log at all. An
@@ -631,7 +631,31 @@ async function sessionWrite(domain, body, db) {
   // The hot write deliberately stays outside: it is one statement either way and
   // the gateway's compare-and-swap needs its own result.
   if (batched.length) await db.batch(batched);
-  return { ok: true, domain, applied };
+  const savedAt = new Date();
+  return { ok: true, domain, applied, saved_at: savedAt.toISOString(), confirmation: saveConfirmation(applied, savedAt, tz) };
+}
+
+// SAVE TIME (2026-09-24). A save hands back the moment it was written and a
+// ready confirmation line carrying it. Every "saved at HH:MM" line one evening
+// was an estimate - 19:40 for a write logged at 19:52 UTC - because nothing
+// gave the session a clock. The zone is DISPLAY_TZ (an IANA name); unset or
+// unknown, the line says UTC, never an unlabelled time. Counts only what was
+// applied. Kept identical in memory-gateway/src/index.js and
+// worker/src/index.js; memory-gateway/test/save-time.test.mjs.
+function saveConfirmation(applied, now, tz) {
+  const n = (p) => applied.filter((a) => a === p || a.startsWith(p + ":") || a.startsWith(p + " ")).length;
+  const parts = [];
+  if (n("hot")) parts.push("hot");
+  if (n("log")) parts.push("log");
+  let s = parts.join(" + ") || "nothing new";
+  const plural = (k, one) => k + " " + one + (k === 1 ? "" : "s");
+  if (n("memory")) s += ", " + plural(n("memory"), "new memory row");
+  if (n("context")) s += ", " + plural(n("context"), "context row");
+  if (n("resolved")) s += ", " + plural(n("resolved"), "resolved row");
+  const fmt = (zone) => new Intl.DateTimeFormat("en-GB", { timeZone: zone, hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" }).format(now);
+  let t;
+  try { t = fmt(tz || "UTC"); } catch (_) { t = fmt("UTC"); }
+  return "Bouios memory saved: " + s + " at " + t + ".";
 }
 
 // Load-before-write gate, keyed to the PROJECT, not the MCP session id.
@@ -1039,7 +1063,7 @@ async function handleMsg(msg, sessionId, env, request, url) {
         }
         const access = await checkAccess(env.DB, domain, request, url, env);
         if (!access.ok) { await logRefusal(env, domain, "bouios_save: " + (access.note || "access check refused")); return toolText(id, access.note || 'Write refused.', true); }
-        return toolText(id, JSON.stringify(await sessionWrite(domain, args, env.DB)));
+        return toolText(id, JSON.stringify(await sessionWrite(domain, args, env.DB, env.DISPLAY_TZ)));
       }
       if (name === "bouios_handoff") {
         // Same domain-keyed check as bouios_save (2026-07-19 fix, mirrors the gateway).
@@ -1052,7 +1076,7 @@ async function handleMsg(msg, sessionId, env, request, url) {
         if (!access.ok) { await logRefusal(env, domain, "bouios_handoff: " + (access.note || "access check refused")); return toolText(id, access.note || 'Handoff refused.', true); }
         const saved = [];
         if (typeof args.hot === "string" && args.hot.length) {
-          const out = await sessionWrite(domain, { hot: args.hot, surface: args.surface, log: ["Session handoff."] }, env.DB);
+          const out = await sessionWrite(domain, { hot: args.hot, surface: args.surface, log: ["Session handoff."] }, env.DB, env.DISPLAY_TZ);
           saved.push(...out.applied);
         }
         const next = typeof args.next_step === "string" && args.next_step.length ? args.next_step : "resume open tasks";
