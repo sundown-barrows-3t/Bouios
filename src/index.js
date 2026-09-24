@@ -739,7 +739,7 @@ const MCP_TOOLS = [
       type: "object",
       properties: {
         project: { type: "string", description: "Project name (uppercase, 2-20 chars)." },
-        surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch." },
+        surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch, chatgpt (ChatGPT, any surface), codex (OpenAI Codex)." },
       },
       required: ["project"],
     },
@@ -751,7 +751,7 @@ const MCP_TOOLS = [
       type: "object",
       properties: {
         project: { type: "string" },
-        surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch. Pass it on every save - it is what makes the log show which surfaces are actually working." },
+        surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch, chatgpt (ChatGPT, any surface), codex (OpenAI Codex). Pass it on every save - it is what makes the log show which surfaces are actually working." },
         load_token: { type: "string", description: "Optional but always pass it: the load_token returned by the bouios_load you are building on, so the save is not refused because the connection was re-established since the load." },
         hot: { type: "string", description: "Full current working state." },
         memory: {
@@ -786,6 +786,10 @@ const MCP_TOOLS = [
   },
   {
     name: "bouios_get",
+    // Read-only (only SELECTs). ChatGPT treats a tool without this hint as a
+    // write and asks the user to confirm every call. The other tools write
+    // (a load logs itself), so they stay unmarked. chatgpt-ready.test.mjs.
+    annotations: { readOnlyHint: true },
     description:
       "Fetch the FULL body of one or more specific memory rows by id. bouios_load returns titles only " +
       "(id, type, title - no body) to keep the load small; call this to read a specific row's full content " +
