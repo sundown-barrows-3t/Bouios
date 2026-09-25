@@ -252,12 +252,14 @@ function relevanceTerms(topic) {
   return out;
 }
 
-// ROWS MATCHING THIS TOPIC IN ANOTHER PROJECT - TITLES ONLY. Ported from the
+// ROWS MATCHING THIS TOPIC IN ANOTHER PROJECT. Ported from the
 // gateway 2026-09-16, same reason: relevantMemory below is scoped to this project
 // plus GLOBAL, so a row in another project cannot be returned by any load at any
-// topic, and the only way to reach it is for someone to name its id. Titles and
-// ids only - never content - so the project boundary is not crossed; the bug
-// being fixed is invisibility, not access. Errors return [] and the load stands.
+// topic, and the only way to reach it is for someone to name its id. Decision
+// and pattern rows (rulings and lessons) carry their full body, because a ruling
+// seen only as a title was ignored and contradicted (2026-09-25, parity with the
+// gateway). Mistake and pending bodies are never fetched - the split is in the
+// SQL. Errors return [] and the load stands.
 async function relatedElsewhere(db, domain, topic) {
   const terms = relevanceTerms(topic);
   if (!terms.length) return [];
@@ -265,7 +267,7 @@ async function relatedElsewhere(db, domain, topic) {
     .map(() => "(CASE WHEN lower(title) LIKE ? THEN 3 ELSE 0 END) + (CASE WHEN lower(COALESCE(body,'')) LIKE ? THEN 1 ELSE 0 END)")
     .join(" + ");
   const sql =
-    "SELECT id, domain, type, title, (" + score + ") AS score " +
+    "SELECT id, domain, type, title, CASE WHEN type IN ('decision','pattern') THEN body END AS body, (" + score + ") AS score " +
     "FROM memory WHERE domain != ? AND domain != 'GLOBAL' AND (" + score + ") > 0 " +
     "ORDER BY score DESC, id DESC LIMIT 5";
   const binds = [];
@@ -274,7 +276,11 @@ async function relatedElsewhere(db, domain, topic) {
   for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
   try {
     const rows = await db.prepare(sql).bind(...binds).all();
-    return (rows.results || []).map((r) => ({ id: r.id, project: r.domain, type: r.type, title: r.title }));
+    return (rows.results || []).map((r) => {
+      const o = { id: r.id, project: r.domain, type: r.type, title: r.title };
+      if (typeof r.body === "string") o.body = r.body;
+      return o;
+    });
   } catch (e) {
     return [];
   }
@@ -429,6 +435,7 @@ async function sessionLoad(domain, surface, env) {
       : "Returned the " + (recent.results || []).length + " NEWEST titles out of " + (memTotal ? memTotal.n : 0) + " rows. The rest are not shown and their ids cannot be guessed from this window. If your task is not covered by what you see, call bouios_load again with a topic to search ALL rows by relevance - do not assume the store has nothing on it.",
     ...(relevantRows.length ? {
       related_elsewhere: relatedRows,
+      related_elsewhere_note: "Rows from your other projects matched on the same topic. Decisions and patterns come with their full body so they are read, not skimmed. Mistakes and pending rows stay title only. SEEING A RULING HERE IS NOT PERMISSION TO WORK IN THAT PROJECT: obey a ruling that bears on the work you were given, and ask before any work over there.",
       relevant: relevantRows,
     } : {}),
     // The only rows here that arrive WITH a body - parity with the gateway.
@@ -891,6 +898,7 @@ const MCP_TOOLS = [
 // Nothing is lost: every key, its date and its length are always listed, and
 // the full content is one bouios_get({project, keys:[...]}) away.
 const CONTEXT_ALWAYS_FULL = /(instruction|preference|owner-behaviour|enforcement-config|gateway-url|gateway-config)/i;
+// A handoff is read whole (parity with the gateway, 2026-09-25).
 const CONTEXT_FULL_UNDER = 1200;
 const CONTEXT_EXCERPT = 300;
 const CONTEXT_RELEVANT_MAX = 3;
@@ -900,6 +908,7 @@ function contextWindow(rows, topic) {
   return (rows || []).map((c) => {
     if (!c || typeof c.content !== "string") return c;
     if (CONTEXT_ALWAYS_FULL.test(c.key || "")) return c;
+    if (/handoff/i.test(c.key || "")) return c;
     if (c.content.length <= CONTEXT_FULL_UNDER) return c;
     // MATCHED ON THE KEY, NOT THE BODY, and capped - measured live 2026-09-16,
     // minutes after the first version shipped. Loading with the topic "verify
@@ -950,7 +959,7 @@ function clampMcpLoadSize(out) {
   if (size <= MCP_LOAD_SIZE_CEILING) return out;
   if (Array.isArray(out.context)) {
     out.context = out.context.map((c) => {
-      if (!c.content || c.content.length <= 300) return c;
+      if (!c.content || c.content.length <= 300 || /handoff/i.test(c.key || "")) return c;
       return { ...c, content: c.content.slice(0, 300) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)", truncated: true };
     });
   }
@@ -983,6 +992,29 @@ function clampMcpLoadSize(out) {
     () => { delete out.hot_archives; delete out.hot_archives_note; },
     () => { if (Array.isArray(out.log)) out.log = out.log.slice(0, 10); },
     () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 20); },
+    // Handoffs and other projects' rulings are read whole, so everything else
+    // pays first (parity with the gateway, 2026-09-25).
+    () => {
+      (out.context || []).forEach((c) => {
+        if (c && c.truncated && typeof c.content === "string" && c.content.length > 200) c.content = c.content.slice(0, 120) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)";
+      });
+    },
+    () => { (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
+    () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 12); },
+    // Only then are they clipped, to a visible pointer, before the last resort.
+    () => {
+      (out.related_elsewhere || []).forEach((r) => {
+        if (r && typeof r.body === "string" && r.body.length > 400) r.body = r.body.slice(0, 400) + "...(truncated, size guard - bouios_get({project:\"" + r.project + "\", ids:[" + r.id + "]}) for the rest)";
+      });
+    },
+    () => {
+      (out.context || []).forEach((c) => {
+        if (c && /handoff/i.test(c.key || "") && typeof c.content === "string" && c.content.length > 1500) {
+          c.content = c.content.slice(0, 1500) + "...(truncated, size guard - bouios_get({keys:[\"" + c.key + "\"]}) for the rest)";
+          c.truncated = true;
+        }
+      });
+    },
   ];
   for (const step of _steps) {
     if (_fits()) return out;
