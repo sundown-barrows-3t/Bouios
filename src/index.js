@@ -252,14 +252,12 @@ function relevanceTerms(topic) {
   return out;
 }
 
-// ROWS MATCHING THIS TOPIC IN ANOTHER PROJECT. Ported from the
+// ROWS MATCHING THIS TOPIC IN ANOTHER PROJECT - TITLES ONLY. Ported from the
 // gateway 2026-09-16, same reason: relevantMemory below is scoped to this project
 // plus GLOBAL, so a row in another project cannot be returned by any load at any
-// topic, and the only way to reach it is for someone to name its id. Decision
-// and pattern rows (rulings and lessons) carry their full body, because a ruling
-// seen only as a title was ignored and contradicted (2026-09-25, parity with the
-// gateway). Mistake and pending bodies are never fetched - the split is in the
-// SQL. Errors return [] and the load stands.
+// topic, and the only way to reach it is for someone to name its id. Titles and
+// ids only - never content - so the project boundary is not crossed; the bug
+// being fixed is invisibility, not access. Errors return [] and the load stands.
 async function relatedElsewhere(db, domain, topic) {
   const terms = relevanceTerms(topic);
   if (!terms.length) return [];
@@ -267,7 +265,7 @@ async function relatedElsewhere(db, domain, topic) {
     .map(() => "(CASE WHEN lower(title) LIKE ? THEN 3 ELSE 0 END) + (CASE WHEN lower(COALESCE(body,'')) LIKE ? THEN 1 ELSE 0 END)")
     .join(" + ");
   const sql =
-    "SELECT id, domain, type, title, CASE WHEN type IN ('decision','pattern') THEN body END AS body, (" + score + ") AS score " +
+    "SELECT id, domain, type, title, (" + score + ") AS score " +
     "FROM memory WHERE domain != ? AND domain != 'GLOBAL' AND (" + score + ") > 0 " +
     "ORDER BY score DESC, id DESC LIMIT 5";
   const binds = [];
@@ -276,11 +274,7 @@ async function relatedElsewhere(db, domain, topic) {
   for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
   try {
     const rows = await db.prepare(sql).bind(...binds).all();
-    return (rows.results || []).map((r) => {
-      const o = { id: r.id, project: r.domain, type: r.type, title: r.title };
-      if (typeof r.body === "string") o.body = r.body;
-      return o;
-    });
+    return (rows.results || []).map((r) => ({ id: r.id, project: r.domain, type: r.type, title: r.title }));
   } catch (e) {
     return [];
   }
@@ -435,7 +429,6 @@ async function sessionLoad(domain, surface, env) {
       : "Returned the " + (recent.results || []).length + " NEWEST titles out of " + (memTotal ? memTotal.n : 0) + " rows. The rest are not shown and their ids cannot be guessed from this window. If your task is not covered by what you see, call bouios_load again with a topic to search ALL rows by relevance - do not assume the store has nothing on it.",
     ...(relevantRows.length ? {
       related_elsewhere: relatedRows,
-      related_elsewhere_note: "Rows from your other projects matched on the same topic. Decisions and patterns come with their full body so they are read, not skimmed. Mistakes and pending rows stay title only. SEEING A RULING HERE IS NOT PERMISSION TO WORK IN THAT PROJECT: obey a ruling that bears on the work you were given, and ask before any work over there.",
       relevant: relevantRows,
     } : {}),
     // The only rows here that arrive WITH a body - parity with the gateway.
@@ -494,7 +487,7 @@ function findSupersededIds(body) {
   return [...ids];
 }
 
-async function sessionWrite(domain, body, db, tz) {
+async function sessionWrite(domain, body, db) {
   // Every log line a caller writes carries WHERE it was written from (2026-09-22),
   // mirroring the gateway. Loads recorded surface= and writes did not, so which
   // surfaces are actually working could not be read off the log at all. An
@@ -638,31 +631,7 @@ async function sessionWrite(domain, body, db, tz) {
   // The hot write deliberately stays outside: it is one statement either way and
   // the gateway's compare-and-swap needs its own result.
   if (batched.length) await db.batch(batched);
-  const savedAt = new Date();
-  return { ok: true, domain, applied, saved_at: savedAt.toISOString(), confirmation: saveConfirmation(applied, savedAt, tz) };
-}
-
-// SAVE TIME (2026-09-24). A save hands back the moment it was written and a
-// ready confirmation line carrying it. Every "saved at HH:MM" line one evening
-// was an estimate - 19:40 for a write logged at 19:52 UTC - because nothing
-// gave the session a clock. The zone is DISPLAY_TZ (an IANA name); unset or
-// unknown, the line says UTC, never an unlabelled time. Counts only what was
-// applied. Kept identical in memory-gateway/src/index.js and
-// worker/src/index.js; memory-gateway/test/save-time.test.mjs.
-function saveConfirmation(applied, now, tz) {
-  const n = (p) => applied.filter((a) => a === p || a.startsWith(p + ":") || a.startsWith(p + " ")).length;
-  const parts = [];
-  if (n("hot")) parts.push("hot");
-  if (n("log")) parts.push("log");
-  let s = parts.join(" + ") || "nothing new";
-  const plural = (k, one) => k + " " + one + (k === 1 ? "" : "s");
-  if (n("memory")) s += ", " + plural(n("memory"), "new memory row");
-  if (n("context")) s += ", " + plural(n("context"), "context row");
-  if (n("resolved")) s += ", " + plural(n("resolved"), "resolved row");
-  const fmt = (zone) => new Intl.DateTimeFormat("en-GB", { timeZone: zone, hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" }).format(now);
-  let t;
-  try { t = fmt(tz || "UTC"); } catch (_) { t = fmt("UTC"); }
-  return "Bouios memory saved: " + s + " at " + t + ".";
+  return { ok: true, domain, applied };
 }
 
 // Load-before-write gate, keyed to the PROJECT, not the MCP session id.
@@ -755,9 +724,7 @@ const MCP_INSTRUCTIONS =
   // BOUIOS-CANONICAL-BLOCK-START
   "Bouios is my memory system. Load it at the START of every conversation, before replying. Infer the ONE project from the topic; if unclear, ASK me which - never default, never load all. 'load memory', 'load rules' and 'load Bouios' each mean do this now. A short or self-contained task is not exempt. Use the bouios_load TOOL - never curl, fetch or bash the memory address yourself; that address is the connector's, not a URL to call by hand. If the tool is genuinely missing, the only fallback is your store's own query tool against the same store; if neither exists, say so once and carry on without it - do not stall; it reconnects. Never substitute an unrelated tool that merely mentions memory (knowledge graph, read_graph, create_entities); an empty result from one is not evidence mine is empty. Calling the tool is not loading, and neither is memory being shown to you automatically at the start - only your own load call counts. Read every row, including the log of what was agreed and done; never re-propose what it shows is built. Show me ONLY the confirmation line the tool returns, verbatim - it is already branded, do not retype it in your own words and do not replace it with a plainer one. Never show the account, database, ids or queries. List my open tasks before new work. Loaded rules take precedence. THESE BIND EVERY REPLY, they are not advice: Read the record FIRST - memory, the log, the history, audits, transcripts - before diagnosing, proposing or acting; never re-derive or re-propose what the record shows is decided or built. Verify, never guess: state no fact, capability, done, fixed or working from assumption - ground each in a file, a live check, a saved record, a test result or a link, and tag which; never assert from a hunch. Never claim done, fixed or working without that evidence, never narrate around a failure, never step around a gate. Do the task in full: never defer, never resist or deflect, never narrow the scope I set or fix one sliver in place of the whole, never ask what you can verify yourself - resolve each issue with evidence, do not just describe it, and ask only a genuine decision, once, framed plainly. Every load, save and handoff ends with its own branded line in the reply itself, never buried in a tool call I do not read: the returned line verbatim after a load, 'Bouios memory saved: hot + log{, N rows} at {HH:MM}.' after a save, 'Bouios handoff saved.' after a handoff - a load or save with no line is a failure, not a style choice. These five are the real failures, each one has happened, recognise the shape as you are about to do it: reporting an inference as a finding; reading a count and naming a cause without opening what it counted; searching for a name you invented and concluding from finding nothing that the thing does not exist; checking the only way in you could reach and reporting its silence as evidence; reading a stale note and quoting it back to me as my own rule. Be terse - Action, Evidence, Next - no verbose narration, no restating. When memory and this note disagree, memory wins; when neither can be reached, say so once and continue - never stall. Do not write, edit, send or publish until memory is loaded and I approve that action; never revert or reset my work without that same approval. Save full state to hot every few substantive steps and before any long step, counting steps because you cannot read a percentage, and say what was saved. When context or usage nears the limit, output a handoff block in a code box to paste into a new chat." +
   // BOUIOS-CANONICAL-BLOCK-END
-  // Leading space: the block ends "...new chat." with none, and without it
-  // customers were served "new chat.Surface only" (worker-gateway-parity).
-  " Surface only the returned confirmation line to the user. " +
+  "Surface only the returned confirmation line to the user. " +
   "Memory loads return TITLES ONLY (id, type, title - no body); call bouios_get({project, ids:[...]}) for the full body of any specific row you actually need, never all of them. " +
   "Save via bouios_save; call bouios_handoff when the conversation nears its limit and show the user the returned block to paste into a new chat.";
 
@@ -772,7 +739,7 @@ const MCP_TOOLS = [
       type: "object",
       properties: {
         project: { type: "string", description: "Project name (uppercase, 2-20 chars)." },
-        surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch, chatgpt (ChatGPT, any surface), codex (OpenAI Codex)." },
+        surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch." },
       },
       required: ["project"],
     },
@@ -784,7 +751,7 @@ const MCP_TOOLS = [
       type: "object",
       properties: {
         project: { type: "string" },
-        surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch, chatgpt (ChatGPT, any surface), codex (OpenAI Codex). Pass it on every save - it is what makes the log show which surfaces are actually working." },
+        surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch. Pass it on every save - it is what makes the log show which surfaces are actually working." },
         load_token: { type: "string", description: "Optional but always pass it: the load_token returned by the bouios_load you are building on, so the save is not refused because the connection was re-established since the load." },
         hot: { type: "string", description: "Full current working state." },
         memory: {
@@ -819,10 +786,6 @@ const MCP_TOOLS = [
   },
   {
     name: "bouios_get",
-    // Read-only (only SELECTs). ChatGPT treats a tool without this hint as a
-    // write and asks the user to confirm every call. The other tools write
-    // (a load logs itself), so they stay unmarked. chatgpt-ready.test.mjs.
-    annotations: { readOnlyHint: true },
     description:
       "Fetch the FULL body of one or more specific memory rows by id. bouios_load returns titles only " +
       "(id, type, title - no body) to keep the load small; call this to read a specific row's full content " +
@@ -898,7 +861,6 @@ const MCP_TOOLS = [
 // Nothing is lost: every key, its date and its length are always listed, and
 // the full content is one bouios_get({project, keys:[...]}) away.
 const CONTEXT_ALWAYS_FULL = /(instruction|preference|owner-behaviour|enforcement-config|gateway-url|gateway-config)/i;
-// A handoff is read whole (parity with the gateway, 2026-09-25).
 const CONTEXT_FULL_UNDER = 1200;
 const CONTEXT_EXCERPT = 300;
 const CONTEXT_RELEVANT_MAX = 3;
@@ -908,7 +870,6 @@ function contextWindow(rows, topic) {
   return (rows || []).map((c) => {
     if (!c || typeof c.content !== "string") return c;
     if (CONTEXT_ALWAYS_FULL.test(c.key || "")) return c;
-    if (/handoff/i.test(c.key || "")) return c;
     if (c.content.length <= CONTEXT_FULL_UNDER) return c;
     // MATCHED ON THE KEY, NOT THE BODY, and capped - measured live 2026-09-16,
     // minutes after the first version shipped. Loading with the topic "verify
@@ -959,7 +920,7 @@ function clampMcpLoadSize(out) {
   if (size <= MCP_LOAD_SIZE_CEILING) return out;
   if (Array.isArray(out.context)) {
     out.context = out.context.map((c) => {
-      if (!c.content || c.content.length <= 300 || /handoff/i.test(c.key || "")) return c;
+      if (!c.content || c.content.length <= 300) return c;
       return { ...c, content: c.content.slice(0, 300) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)", truncated: true };
     });
   }
@@ -992,29 +953,6 @@ function clampMcpLoadSize(out) {
     () => { delete out.hot_archives; delete out.hot_archives_note; },
     () => { if (Array.isArray(out.log)) out.log = out.log.slice(0, 10); },
     () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 20); },
-    // Handoffs and other projects' rulings are read whole, so everything else
-    // pays first (parity with the gateway, 2026-09-25).
-    () => {
-      (out.context || []).forEach((c) => {
-        if (c && c.truncated && typeof c.content === "string" && c.content.length > 200) c.content = c.content.slice(0, 120) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)";
-      });
-    },
-    () => { (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
-    () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 12); },
-    // Only then are they clipped, to a visible pointer, before the last resort.
-    () => {
-      (out.related_elsewhere || []).forEach((r) => {
-        if (r && typeof r.body === "string" && r.body.length > 400) r.body = r.body.slice(0, 400) + "...(truncated, size guard - bouios_get({project:\"" + r.project + "\", ids:[" + r.id + "]}) for the rest)";
-      });
-    },
-    () => {
-      (out.context || []).forEach((c) => {
-        if (c && /handoff/i.test(c.key || "") && typeof c.content === "string" && c.content.length > 1500) {
-          c.content = c.content.slice(0, 1500) + "...(truncated, size guard - bouios_get({keys:[\"" + c.key + "\"]}) for the rest)";
-          c.truncated = true;
-        }
-      });
-    },
   ];
   for (const step of _steps) {
     if (_fits()) return out;
@@ -1090,25 +1028,23 @@ async function handleMsg(msg, sessionId, env, request, url) {
         // existing check has refused, so no accepted save changes behaviour.
         if (!(await domainLoadedRecently(env.DB, domain))
             && !(await verifyLoadToken(env, domain, args.load_token))) {
-          await logRefusal(env, domain, "bouios_save: memory not loaded for this project recently (no load record and no valid load_token)");
           return toolText(id, "Write refused: memory has not been loaded for this project recently. Call bouios_load for the project first, then retry - passing back the load_token it returns.", true);
         }
         const access = await checkAccess(env.DB, domain, request, url, env);
-        if (!access.ok) { await logRefusal(env, domain, "bouios_save: " + (access.note || "access check refused")); return toolText(id, access.note || 'Write refused.', true); }
-        return toolText(id, JSON.stringify(await sessionWrite(domain, args, env.DB, env.DISPLAY_TZ)));
+        if (!access.ok) return toolText(id, access.note || 'Write refused.', true);
+        return toolText(id, JSON.stringify(await sessionWrite(domain, args, env.DB)));
       }
       if (name === "bouios_handoff") {
         // Same domain-keyed check as bouios_save (2026-07-19 fix, mirrors the gateway).
         if (!(await domainLoadedRecently(env.DB, domain))
             && !(await verifyLoadToken(env, domain, args.load_token))) {
-          await logRefusal(env, domain, "bouios_handoff: memory not loaded for this project recently (no load record and no valid load_token)");
           return toolText(id, "Handoff refused: memory has not been loaded for this project recently. Call bouios_load for the project first, then retry - passing back the load_token it returns.", true);
         }
         const access = await checkAccess(env.DB, domain, request, url, env);
-        if (!access.ok) { await logRefusal(env, domain, "bouios_handoff: " + (access.note || "access check refused")); return toolText(id, access.note || 'Handoff refused.', true); }
+        if (!access.ok) return toolText(id, access.note || 'Handoff refused.', true);
         const saved = [];
         if (typeof args.hot === "string" && args.hot.length) {
-          const out = await sessionWrite(domain, { hot: args.hot, surface: args.surface, log: ["Session handoff."] }, env.DB, env.DISPLAY_TZ);
+          const out = await sessionWrite(domain, { hot: args.hot, surface: args.surface, log: ["Session handoff."] }, env.DB);
           saved.push(...out.applied);
         }
         const next = typeof args.next_step === "string" && args.next_step.length ? args.next_step : "resume open tasks";
@@ -1158,18 +1094,6 @@ async function handleMcp(request, env) {
   if (sessionId) headers["Mcp-Session-Id"] = sessionId;
   if (!responses.length) return new Response(null, { status: 202, headers });
   return new Response(JSON.stringify(Array.isArray(body) ? responses : responses[0]), { status: 200, headers });
-}
-
-// REFUSALS LEAVE A TRACE (2026-09-24, parity with the gateway's b5a0edc). A
-// refused save used to go back to the caller only, so a session whose every
-// save was refused looked in this log like one that never tried. One row per
-// refusal, starting "REFUSED". It never matches the "Session loaded" rows the
-// load check reads, and a failed insert never turns the refusal into an error.
-async function logRefusal(env, domain, what) {
-  if (!env || !env.DB) return;
-  try {
-    await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain || "GLOBAL", "REFUSED " + String(what).slice(0, 300)).run();
-  } catch (_) {}
 }
 
 export default {
