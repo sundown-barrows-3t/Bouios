@@ -744,7 +744,13 @@ const MCP_PROTOCOL = "2025-03-26";
 // confirmed by owner screenshot on the owner's own connector, applies
 // identically to every customer's connector. Mirrors memory-gateway/src.
 const MCP_INSTRUCTIONS =
-  "This is Bouios, your memory system. " +
+  // CORE FIRST (2026-09-28): Claude Code keeps only the first 2,048 characters
+  // of these, and the canonical block below is 3,544. A copy of
+  // CORE_INSTRUCTIONS in memory-gateway/src/text-generator.js - edit it there
+  // and paste it here; instructions-core.test.mjs fails if the served text does
+  // not start with it byte for byte.
+  "This connector is Bouios, the user's own memory system, expected in every conversation. Some apps keep only the first 2,048 characters of these instructions, so the rules that matter most come first. 1. Before replying, call bouios_load with the ONE project the topic implies (ask which if unclear; never load all). A short task is not exempt. Show the user only the confirmation line it returns, verbatim. Read pending, the log and rules before acting; never re-propose what the log shows is built. List open tasks before new work. 2. Verify, never guess. Done, fixed or working needs evidence in the same reply - a file, a live check, a saved record, a test result or a link - or say plainly it is unverified. Absence is known only by looking this turn. Nothing is live until it answers. 3. Do the task in full: never defer, narrow the scope or ask what you can check yourself; ask only a genuine decision, once, plainly. Answer a yes/no question in the first line. 4. Save with bouios_save (pass the load_token) every few substantive steps and before any long step, and show its returned line verbatim. A load or save with no line in the reply is a failure. 5. Near the context limit call bouios_handoff and show its block in a code box; after a compaction or resume, call bouios_load again before any write. 6. Never show accounts, ids, urls, queries or backend detail. Be terse: action, evidence, next. Named failures, each has happened: reporting an inference as a finding; naming a cause from a count without opening it; concluding something does not exist from searching a name you invented; reporting silence from the only way in you checked; quoting a stale note as the user's rule. The full rules follow and are also returned by bouios_load; loaded rules take precedence." +
+  " " +
   // CANONICAL BLOCK - byte-identical to .session/canonical-load-block.txt and
   // memory-gateway/src/text-generator.js CANONICAL_LOAD_BLOCK. Inlined, not
   // imported, because this worker deploys as a single self-contained module
