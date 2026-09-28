@@ -10,7 +10,7 @@ Deploy: push to `main`. Cloudflare auto-deploys the worker on push.
 
 - `GET /health` — liveness check.
 - `POST /mcp/{your-token}` — the connector endpoint Claude talks to
-  (`memory_load`, `memory_write`, `session_handoff`), protected by your
+  (`bouios_load`, `bouios_save`, `bouios_handoff`, `bouios_get`), protected by your
   `BEARER_TOKEN`.
 
 Your memory (working state, notes, and history) is stored in your own

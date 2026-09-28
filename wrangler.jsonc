@@ -15,7 +15,6 @@
     }
   ],
   "vars": {
-    "AUTH_MODE": "bearer",
     "GATEWAY_URL": "https://memory-gateway.syndakat.com"
   },
   "secrets": {
