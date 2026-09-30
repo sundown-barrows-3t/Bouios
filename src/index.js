@@ -843,7 +843,53 @@ const MCP_TOOLS = [
       required: ["project", "ids"],
     },
   },
+  {
+    // No-marks, a Max Herder feature. Your settings stay in YOUR database; each
+    // call sends the text or file, with your settings and licence, to the Bouios
+    // service, which returns the report or the cleaned result and keeps nothing.
+    name: "bouios_no_marks",
+    description:
+      "Check text or a file for marks you did not mean to publish, or clean them: hidden characters, tool attribution lines, " +
+      "long dashes and curly quotes, look-alike letters, AI tool leftovers, generator tags, provenance links, private details " +
+      "(reported, never edited), and file metadata such as GPS, credit, software and document properties. " +
+      "Actions: scan_text, clean_text (text), scan_file, clean_file (file_base64 + name), get_settings, set_settings. " +
+      "Settings are saved per project and say, for each kind of mark, fix/report/off (text) or remove/keep/off (files), plus add.credit. " +
+      "Included with Max Herder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Project the settings belong to, uppercase." },
+        action: { type: "string", enum: ["scan_text", "clean_text", "scan_file", "clean_file", "get_settings", "set_settings"] },
+        text: { type: "string", description: "The text to scan or clean (scan_text, clean_text)." },
+        file_base64: { type: "string", description: "The file, base64 encoded (scan_file, clean_file)." },
+        name: { type: "string", description: "The file name, used to report where a finding is." },
+        return_file: { type: "boolean", description: "clean_file only: return the cleaned bytes as file_base64 when they are small enough." },
+        settings: { type: "object", description: "set_settings: the settings to save (merged over the current ones). Other actions: settings for this call only." },
+      },
+      required: ["project", "action"],
+    },
+  },
 ];
+
+// Layer settings: b over a, one level deep for text/file/add (same rule as the service).
+function mergeNoMarksSettings(a = {}, b = {}) {
+  const A = a && typeof a === "object" ? a : {}, B = b && typeof b === "object" ? b : {};
+  const out = { ...A, ...B };
+  for (const k of ["text", "file", "add"]) if (A[k] || B[k]) out[k] = { ...(A[k] || {}), ...(B[k] || {}) };
+  return out;
+}
+// The one call to the no-marks service (checkAccess above calls /licence/verify,
+// a different route with a different contract).
+async function callNoMarks(env, token, body) {
+  if (!token || !env.GATEWAY_URL) return { ok: false, error: "No-marks needs a Max Herder licence on this install." };
+  try {
+    const r = await fetch(env.GATEWAY_URL + "/no-marks", { method: "POST", headers: { "content-type": "application/json", "x-licence": token }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => null);
+    return j && typeof j === "object" ? j : { ok: false, error: "No-marks service answered " + r.status };
+  } catch (e) {
+    return { ok: false, error: "No-marks service unreachable: " + String(e && e.message || e) };
+  }
+}
 
 
 // MCP transport size ceiling - MIRROR of memory-gateway/src/index.js, added to
@@ -1120,6 +1166,24 @@ async function handleMsg(msg, sessionId, env, request, url) {
         const next = typeof args.next_step === "string" && args.next_step.length ? args.next_step : "resume open tasks";
         const block = "load memory\nProject: " + domain + ". Continue previous session. First action: " + next;
         return toolText(id, JSON.stringify({ saved, handoff_block: block, instruction: "Show handoff_block to the user in a code box." }));
+      }
+      if (name === "bouios_no_marks") {
+        const token = accessTokenFromRequest(request, url, env);
+        const row = await env.DB.prepare("SELECT content FROM context WHERE domain = ? AND key = 'no-marks:settings'").bind(domain).first();
+        let stored = {};
+        try { stored = row && row.content ? JSON.parse(row.content) : {}; } catch { stored = {}; }
+        if (args.action === "get_settings") return toolText(id, JSON.stringify({ ok: true, project: domain, settings: stored, note: "Anything not listed uses the default." }));
+        if (args.action === "set_settings") {
+          const next = mergeNoMarksSettings(stored, args.settings || {});
+          // The service validates settings; a refused set is not saved.
+          const check = await callNoMarks(env, token, { action: "scan_text", text: "", settings: next });
+          if (!check.ok) return toolText(id, JSON.stringify({ ok: false, project: domain, error: check.error, errors: check.errors }), true);
+          await env.DB.prepare("INSERT OR REPLACE INTO context (domain, key, content, updated_at) VALUES (?, 'no-marks:settings', ?, ?)")
+            .bind(domain, JSON.stringify(next), new Date().toISOString()).run();
+          return toolText(id, JSON.stringify({ ok: true, project: domain, settings: next }));
+        }
+        const out = await callNoMarks(env, token, { ...args, project: undefined, settings: mergeNoMarksSettings(stored, args.settings || {}) });
+        return toolText(id, JSON.stringify(out), out.ok === false);
       }
       if (name === "bouios_get") {
         // Fetch full bodies on demand for titles-only loads. Scope isolation
