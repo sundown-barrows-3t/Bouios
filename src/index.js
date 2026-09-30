@@ -252,39 +252,6 @@ function relevanceTerms(topic) {
   return out;
 }
 
-// Identifiers kept whole (a route, method + route, snake_case name, HTTP status)
-// and scored above plain words, matched by instr() - parity with the gateway
-// (2026-09-30, see memory-gateway/src/index.js relevanceScore for the measured
-// reason). relevanceTerms() and its other callers are unchanged.
-function exactTerms(topic) {
-  if (!topic || typeof topic !== "string") return [];
-  const t = topic.toLowerCase();
-  const out = [];
-  const add = (x) => { if (x && !out.includes(x) && out.length < 4) out.push(x); };
-  for (const m of t.matchAll(/(?:^|[\s(,'"`])(?:(get|post|put|patch|delete|head)\s+)?(\/[a-z0-9_][a-z0-9_\-\/.]*)/g)) {
-    const route = m[2].replace(/[.\/]+$/, "");
-    if (route.length < 3) continue;
-    if (m[1]) add(m[1] + " " + route);
-    add(route);
-  }
-  for (const m of t.matchAll(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g)) add(m[0]);
-  for (const m of t.matchAll(/\b[1-5][0-9]{2}\b/g)) add(m[0]);
-  return out;
-}
-
-function relevanceScore(topic) {
-  const terms = relevanceTerms(topic);
-  const exact = exactTerms(topic);
-  const all = exact.map((t) => [t, 20, 15, true]).concat(terms.map((t) => [t, 3, 1, false]));
-  const score = all
-    .map(([, tw, bw, ex]) => ex
-      ? "(CASE WHEN instr(lower(title), ?) > 0 THEN " + tw + " ELSE 0 END) + (CASE WHEN instr(lower(COALESCE(body,'')), ?) > 0 THEN " + bw + " ELSE 0 END)"
-      : "(CASE WHEN lower(title) LIKE ? THEN " + tw + " ELSE 0 END) + (CASE WHEN lower(COALESCE(body,'')) LIKE ? THEN " + bw + " ELSE 0 END)")
-    .join(" + ");
-  const pat = ([t, , , ex]) => (ex ? t : "%" + t + "%");
-  return { all, score, pat };
-}
-
 // ROWS MATCHING THIS TOPIC IN ANOTHER PROJECT. Ported from the
 // gateway 2026-09-16, same reason: relevantMemory below is scoped to this project
 // plus GLOBAL, so a row in another project cannot be returned by any load at any
@@ -294,16 +261,19 @@ function relevanceScore(topic) {
 // gateway). Mistake and pending bodies are never fetched - the split is in the
 // SQL. Errors return [] and the load stands.
 async function relatedElsewhere(db, domain, topic) {
-  const { all, score, pat } = relevanceScore(topic);
-  if (!all.length) return [];
+  const terms = relevanceTerms(topic);
+  if (!terms.length) return [];
+  const score = terms
+    .map(() => "(CASE WHEN lower(title) LIKE ? THEN 3 ELSE 0 END) + (CASE WHEN lower(COALESCE(body,'')) LIKE ? THEN 1 ELSE 0 END)")
+    .join(" + ");
   const sql =
     "SELECT id, domain, type, title, CASE WHEN type IN ('decision','pattern') THEN body END AS body, (" + score + ") AS score " +
     "FROM memory WHERE domain != ? AND domain != 'GLOBAL' AND (" + score + ") > 0 " +
     "ORDER BY score DESC, id DESC LIMIT 5";
   const binds = [];
-  for (const a of all) binds.push(pat(a), pat(a));
+  for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
   binds.push(domain);
-  for (const a of all) binds.push(pat(a), pat(a));
+  for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
   try {
     const rows = await db.prepare(sql).bind(...binds).all();
     return (rows.results || []).map((r) => {
@@ -317,8 +287,11 @@ async function relatedElsewhere(db, domain, topic) {
 }
 
 async function relevantMemory(db, domain, topic, excludeIds) {
-  const { all, score, pat } = relevanceScore(topic);
-  if (!all.length) return [];
+  const terms = relevanceTerms(topic);
+  if (!terms.length) return [];
+  const score = terms
+    .map(() => "(CASE WHEN lower(title) LIKE ? THEN 3 ELSE 0 END) + (CASE WHEN lower(COALESCE(body,'')) LIKE ? THEN 1 ELSE 0 END)")
+    .join(" + ");
   // Row 2206 residue: exclusion used to happen HERE, in JS, after the SQL
   // had already applied LIMIT 24 - see memory-gateway/src/index.js for the
   // full note. Excluding in SQL means LIMIT 24 always yields 24 CANDIDATE
@@ -338,10 +311,10 @@ async function relevantMemory(db, domain, topic, excludeIds) {
     " AND (" + score + ") > 0 " +
     "ORDER BY score DESC, id DESC LIMIT 24";
   const binds = [];
-  for (const a of all) binds.push(pat(a), pat(a));
+  for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
   binds.push(domain);
   for (const id of ids) binds.push(id);
-  for (const a of all) binds.push(pat(a), pat(a));
+  for (const t of terms) binds.push("%" + t + "%", "%" + t + "%");
   let rows;
   try {
     rows = await db.prepare(sql).bind(...binds).all();
@@ -460,13 +433,9 @@ async function sessionLoad(domain, surface, env) {
     memory_coverage: relevantRows.length
       ? "Returned " + (recent.results || []).length + " newest titles + " + relevantRows.length + " rows matched on your topic, out of " + (memTotal ? memTotal.n : 0) + " total."
       : "Returned the " + (recent.results || []).length + " NEWEST titles out of " + (memTotal ? memTotal.n : 0) + " rows. The rest are not shown and their ids cannot be guessed from this window. If your task is not covered by what you see, call bouios_load again with a topic to search ALL rows by relevance - do not assume the store has nothing on it.",
-    // Own field, not inside relevant: a load whose own project matched nothing
-    // dropped it (2026-09-30, parity with the gateway).
-    ...(relatedRows.length ? {
+    ...(relevantRows.length ? {
       related_elsewhere: relatedRows,
       related_elsewhere_note: "Rows from your other projects matched on the same topic. Decisions and patterns come with their full body so they are read, not skimmed. Mistakes and pending rows stay title only. SEEING A RULING HERE IS NOT PERMISSION TO WORK IN THAT PROJECT: obey a ruling that bears on the work you were given, and ask before any work over there.",
-    } : {}),
-    ...(relevantRows.length ? {
       relevant: relevantRows,
     } : {}),
     // The only rows here that arrive WITH a body - parity with the gateway.
@@ -887,7 +856,7 @@ const MCP_TOOLS = [
       "Editing: edit_brief (text) returns a line editor's brief and a measured style profile of the text - revise following it, then " +
       "edit_check (text + revised) verifies the revision: locked names and figures dropped, figures added, marks, stock phrases, and the style profile before and after. " +
       "Settings are saved per project and say, for each kind of mark, fix/report/off (text) or remove/keep/off (files), plus add.credit. " +
-      "Included with Max Herder.",
+      "Scanning is included on every plan; cleaning, fixing and editing with Max Herder and the free trial.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1073,8 +1042,7 @@ function clampMcpLoadSize(out) {
   const _steps = [
     () => { delete out.recent_transcripts; },
     () => { (out.log || []).forEach((r) => { if (r && r.summary) r.summary = _clip(r.summary, 400); }); },
-    // The top 3 matches stay readable until late (parity with the gateway, 2026-09-30).
-    () => { (out.relevant || []).forEach((r, i) => { if (i >= 3 && r && r.body) r.body = _clip(r.body, 150); }); },
+    () => { (out.relevant || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
     () => { (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 250); }); },
     () => { delete out.hot_archives; delete out.hot_archives_note; },
     () => { if (Array.isArray(out.log)) out.log = out.log.slice(0, 10); },
@@ -1087,7 +1055,6 @@ function clampMcpLoadSize(out) {
       });
     },
     () => { (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
-    () => { (out.relevant || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
     () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 12); },
     // Only then are they clipped, to a visible pointer, before the last resort.
     () => {
