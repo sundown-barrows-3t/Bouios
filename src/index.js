@@ -105,6 +105,63 @@ async function fetchRules(env) {
 // presence of a token IS the switch.
 const NO_ACCESS_CHECK = { ok: true, note: null };
 
+// TRANSCRIPTS IN YOUR OWN STORAGE. Session transcripts are kept in a bucket in
+// this account (binding TRANSCRIPTS) and nowhere else: nothing here sends one
+// to any other service. Nothing is ever deleted. How far back they are listed
+// and read is a number of days the gateway returns with the licence check; this
+// file holds no plan logic, only obeys the number. With no licence set, or if
+// the gateway cannot be reached, the window is open - the same fail-open rule
+// as checkAccess above, so a network problem never hides a customer's own data.
+const TRANSCRIPT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+async function historyWindowDays(request, url, env) {
+  const token = accessTokenFromRequest(request, url, env);
+  if (!token || !env.GATEWAY_URL) return null;
+  try {
+    const r = await fetch(env.GATEWAY_URL + "/licence/verify?licence=" + encodeURIComponent(token), { headers: { "x-licence": token } });
+    if (!r.ok) return null;
+    const v = await r.json();
+    return v && Number.isFinite(v.history_days) && v.history_days >= 0 ? v.history_days : null;
+  } catch {
+    return null;
+  }
+}
+async function transcriptRoute(request, env, url, path) {
+  if (!env.TRANSCRIPTS) return json({ error: "transcript storage is not set up on this install" }, 501);
+  let id = "";
+  try { id = path === "/transcript" ? "" : decodeURIComponent(path.slice("/transcript/".length)); } catch { return json({ error: "invalid transcript id" }, 400); }
+  if (id && !TRANSCRIPT_ID.test(id)) return json({ error: "invalid transcript id" }, 400);
+  if (request.method === "PUT") {
+    if (!id) return json({ error: "a transcript id is required" }, 400);
+    // A session transcript only grows, so a re-upload replaces it with a longer
+    // copy. A SHORTER upload under an existing id is refused: it would wipe part
+    // of what is stored, and nothing here ever loses data.
+    const bytes = await request.arrayBuffer();
+    const existing = await env.TRANSCRIPTS.head(id);
+    if (existing && bytes.byteLength < existing.size) return json({ error: "a transcript with this id is already stored and is longer; upload under a new id" }, 409);
+    const put = await env.TRANSCRIPTS.put(id, bytes, { httpMetadata: { contentType: request.headers.get("content-type") || "application/x-ndjson" } });
+    return json({ ok: true, id, size: put ? put.size : bytes.byteLength });
+  }
+  if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
+  const days = await historyWindowDays(request, url, env);
+  const since = days === null ? 0 : Date.now() - days * 86400000;
+  const inWindow = (o) => days === null || (o.uploaded && new Date(o.uploaded).getTime() >= since);
+  if (!id) {
+    const items = [];
+    let cursor;
+    do {
+      const page = await env.TRANSCRIPTS.list({ cursor, limit: 1000 });
+      for (const o of page.objects) if (inWindow(o)) items.push({ id: o.key, size: o.size, uploaded: o.uploaded });
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    items.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded));
+    return json({ ok: true, history_days: days, transcripts: items });
+  }
+  const obj = await env.TRANSCRIPTS.get(id);
+  if (!obj) return json({ error: "not found" }, 404);
+  if (!inWindow(obj)) return json({ error: "this transcript is older than your plan's history period; it is still in your storage" }, 403);
+  return new Response(obj.body, { headers: { "content-type": (obj.httpMetadata && obj.httpMetadata.contentType) || "application/x-ndjson" } });
+}
+
 function accessTokenFromRequest(request, url, env) {
   return request.headers.get("x-licence") || url.searchParams.get("licence") || env.LICENCE || null;
 }
@@ -1310,6 +1367,7 @@ export default {
     const h = request.headers.get("authorization") || "";
     const m = h.match(/^Bearer\s+(.+)$/i);
     if (!m || !env.BEARER_TOKEN || !timingSafeEqual(m[1], env.BEARER_TOKEN)) return json({ error: "unauthorised" }, 401);
-    return json({ error: "not found", routes: ["GET /health", "POST /mcp/{token}", "POST /mcp (after sign-in)"] }, 404);
+    if (path === "/transcript" || path.startsWith("/transcript/")) return transcriptRoute(request, env, url, path);
+    return json({ error: "not found", routes: ["GET /health", "POST /mcp/{token}", "POST /mcp (after sign-in)", "PUT /transcript/{id}", "GET /transcript", "GET /transcript/{id}"] }, 404);
   },
 };
