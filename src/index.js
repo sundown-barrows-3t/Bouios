@@ -856,7 +856,7 @@ const MCP_TOOLS = [
       "Editing: edit_brief (text) returns a line editor's brief and a measured style profile of the text - revise following it, then " +
       "edit_check (text + revised) verifies the revision: locked names and figures dropped, figures added, marks, stock phrases, and the style profile before and after. " +
       "Settings are saved per project and say, for each kind of mark, fix/report/off (text) or remove/keep/off (files), plus add.credit. " +
-      "Included with Max Herder.",
+      "Scanning is included on every plan; cleaning, fixing and editing with Max Herder and the free trial.",
     inputSchema: {
       type: "object",
       properties: {
