@@ -853,13 +853,16 @@ const MCP_TOOLS = [
       "long dashes and curly quotes, look-alike letters, AI tool leftovers, generator tags, provenance links, private details " +
       "(reported, never edited), and file metadata such as GPS, credit, software and document properties. " +
       "Actions: scan_text, clean_text (text), scan_file, clean_file (file_base64 + name), get_settings, set_settings. " +
+      "Editing: edit_brief (text) returns a line editor's brief and a measured style profile of the text - revise following it, then " +
+      "edit_check (text + revised) verifies the revision: locked names and figures dropped, figures added, marks, stock phrases, and the style profile before and after. " +
       "Settings are saved per project and say, for each kind of mark, fix/report/off (text) or remove/keep/off (files), plus add.credit. " +
       "Included with Max Herder.",
     inputSchema: {
       type: "object",
       properties: {
         project: { type: "string", description: "Project the settings belong to, uppercase." },
-        action: { type: "string", enum: ["scan_text", "clean_text", "scan_file", "clean_file", "get_settings", "set_settings"] },
+        action: { type: "string", enum: ["scan_text", "clean_text", "scan_file", "clean_file", "edit_brief", "edit_check", "get_settings", "set_settings"] },
+        revised: { type: "string", description: "edit_check: your revision of text, checked against the original." },
         text: { type: "string", description: "The text to scan or clean (scan_text, clean_text)." },
         file_base64: { type: "string", description: "The file, base64 encoded (scan_file, clean_file)." },
         name: { type: "string", description: "The file name, used to report where a finding is." },
