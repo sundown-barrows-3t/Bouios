@@ -931,6 +931,61 @@ const MCP_TOOLS = [
       required: ["project", "ids"],
     },
   },
+  // EDIT AND DELETE, ONLY WITH THE OWNER'S EXPLICIT YES (owner, 2026-09-30:
+  // "Bouios needs to be able to delete edit d1/r2 but only with explicit
+  // approval"). Until now a session that had to correct a stale row used the
+  // raw store tool, which writes with no approval at all. These two tools are
+  // the approved way: marked destructive so Chat/Cowork clients ask, and listed
+  // in permissions.ask in the owner's settings so Code asks on every call. The gateway cannot see the approval itself, so it keeps
+  // what it can: every change needs a stated reason, and the old value is
+  // written to the log first, so an edit or a row delete can be undone.
+  // Parity with the gateway (2026-09-30); this worker stores no transcripts,
+  // so a transcript or bundle delete answers that storage is not configured.
+  // edit-delete.test.mjs.
+  {
+    name: "bouios_edit",
+    annotations: { destructiveHint: true },
+    description:
+      "Change an existing memory row (title, body or type) or context row (content) in this project. " +
+      "ONLY after the user has explicitly approved this exact change - the client asks them; never call it to " +
+      "tidy up on your own initiative. The old value is archived to the log first (undoable). reason is required.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Project name, uppercase. The row must belong to it (or be GLOBAL, for a memory row)." },
+        memory_id: { type: "integer", description: "Memory row to change." },
+        title: { type: "string" },
+        body: { type: "string" },
+        type: { type: "string", enum: ["pattern", "mistake", "decision", "pending"] },
+        context_key: { type: "string", description: "Context row to change (instead of memory_id)." },
+        content: { type: "string", description: "New content for the context row." },
+        reason: { type: "string", description: "Why, in a sentence, including the user's approval." },
+        load_token: { type: "string" },
+      },
+      required: ["project", "reason"],
+    },
+  },
+  {
+    name: "bouios_delete",
+    annotations: { destructiveHint: true },
+    description:
+      "Delete memory rows, context rows, or a stored transcript/bundle object in this project. " +
+      "ONLY after the user has explicitly approved this exact deletion - the client asks them. Memory and context " +
+      "rows are archived to the log first (undoable); a transcript or bundle object cannot be restored. reason is required.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Project name, uppercase." },
+        memory_ids: { type: "array", items: { type: "integer" } },
+        context_keys: { type: "array", items: { type: "string" } },
+        transcript: { type: "string", description: "Transcript object name: UUID.jsonl or UUID.jsonl.gz." },
+        bundle: { type: "string", description: "Bundle object: <session-uuid>/<repo>." },
+        reason: { type: "string", description: "Why, in a sentence, including the user's approval." },
+        load_token: { type: "string" },
+      },
+      required: ["project", "reason"],
+    },
+  },
   {
     // No-marks, a Max Herder feature. Your settings stay in YOUR database; each
     // call sends the text or file, with your settings and licence, to the Bouios
@@ -1278,6 +1333,20 @@ async function handleMsg(msg, sessionId, env, request, url) {
         const out = await callNoMarks(env, token, { ...args, project: undefined, settings: mergeNoMarksSettings(stored, args.settings || {}) });
         return toolText(id, JSON.stringify(out), out.ok === false);
       }
+      if (name === "bouios_edit" || name === "bouios_delete") {
+        // Same checks as bouios_save: a recent load for this project, and access.
+        if (!(await domainLoadedRecently(env.DB, domain))
+            && !(await verifyLoadToken(env, domain, args.load_token))) {
+          await logRefusal(env, domain, name + ": memory not loaded for this project recently");
+          return toolText(id, "Refused: load memory for this project first (bouios_load), then retry with its load_token.", true);
+        }
+        const access = await checkAccess(env.DB, domain, request, url, env);
+        if (!access.ok) { await logRefusal(env, domain, name + ": " + (access.note || "access check refused")); return toolText(id, access.note || "Refused.", true); }
+        const reason = typeof args.reason === "string" ? args.reason.trim() : "";
+        if (reason.length < 10) return toolText(id, "Refused: reason is required - say why, and that the user approved this change.", true);
+        const out = name === "bouios_edit" ? await editRecord(env, domain, args, reason) : await deleteRecords(env, domain, args, reason);
+        return toolText(id, JSON.stringify(out), out.ok === false);
+      }
       if (name === "bouios_get") {
         // Fetch full bodies on demand for titles-only loads. Scope isolation
         // preserved: only rows in the caller's own domain or GLOBAL. Mirrors the
@@ -1328,6 +1397,90 @@ async function handleMcp(request, env) {
 // save was refused looked in this log like one that never tried. One row per
 // refusal, starting "REFUSED". It never matches the "Session loaded" rows the
 // load check reads, and a failed insert never turns the refusal into an error.
+// bouios_edit / bouios_delete (2026-09-30) - see the tool definitions.
+const TRANSCRIPT_NAME_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl(\.gz)?$/;
+const BUNDLE_NAME_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/([A-Za-z0-9._-]{1,64})$/;
+
+async function archiveOld(env, domain, what, old, reason) {
+  await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)")
+    .bind(domain, what + " ARCHIVE (" + reason.slice(0, 200) + "): " + JSON.stringify(old)).run();
+}
+
+// One memory row or one context row; the old value is archived first.
+async function editRecord(env, domain, args, reason) {
+  const db = env.DB;
+  if (Number.isInteger(args.memory_id)) {
+    const old = await db.prepare("SELECT id, domain, type, title, body FROM memory WHERE id = ? AND (domain = ? OR domain = 'GLOBAL')").bind(args.memory_id, domain).first();
+    if (!old) return { ok: false, error: "memory row " + args.memory_id + " not found in " + domain + " or GLOBAL" };
+    const next = { title: old.title, body: old.body, type: old.type };
+    if (typeof args.title === "string" && args.title.trim()) next.title = args.title;
+    if (typeof args.body === "string" && args.body.trim()) next.body = args.body;
+    if (typeof args.type === "string") {
+      if (!MEMORY_TYPES.includes(args.type)) return { ok: false, error: "type must be one of " + MEMORY_TYPES.join(", ") };
+      next.type = args.type;
+    }
+    if (next.title === old.title && next.body === old.body && next.type === old.type) return { ok: false, error: "nothing to change: give title, body or type" };
+    await archiveOld(env, domain, "EDIT memory " + old.id, old, reason);
+    await db.prepare("UPDATE memory SET title = ?, body = ?, type = ? WHERE id = ?").bind(next.title, next.body, next.type, old.id).run();
+    return { ok: true, edited: { memory_id: old.id }, archived_to_log: true };
+  }
+  if (typeof args.context_key === "string" && args.context_key) {
+    if (typeof args.content !== "string" || !args.content.trim()) return { ok: false, error: "content is required for a context row" };
+    const old = await db.prepare("SELECT domain, key, content, updated_at FROM context WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(domain, args.context_key).first();
+    if (!old) return { ok: false, error: "context key not found in " + domain };
+    await archiveOld(env, domain, "EDIT context " + old.key, old, reason);
+    await db.prepare("UPDATE context SET content = ?, updated_at = ? WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(args.content, new Date().toISOString(), domain, old.key).run();
+    return { ok: true, edited: { context_key: old.key }, archived_to_log: true };
+  }
+  return { ok: false, error: "give memory_id (with title, body or type) or context_key (with content)" };
+}
+
+// Rows are archived then deleted; stored objects are logged then deleted.
+async function deleteRecords(env, domain, args, reason) {
+  const db = env.DB;
+  const done = { memory_ids: [], context_keys: [], objects: [] };
+  const missing = [];
+  const objs = [];
+  if (typeof args.transcript === "string" && args.transcript) {
+    if (!TRANSCRIPT_NAME_RE.test(args.transcript)) return { ok: false, error: "transcript must be UUID.jsonl or UUID.jsonl.gz" };
+    objs.push("transcript:" + args.transcript);
+  }
+  if (typeof args.bundle === "string" && args.bundle) {
+    const m = args.bundle.match(BUNDLE_NAME_RE);
+    if (!m || m[2].startsWith(".")) return { ok: false, error: "bundle must be <session-uuid>/<repo>" };
+    objs.push("bundle:" + m[1] + ":" + m[2]);
+  }
+  if (objs.length && !env.TRANSCRIPTS) return { ok: false, error: "object storage not configured" };
+  const ids = (Array.isArray(args.memory_ids) ? args.memory_ids : []).filter((x) => Number.isInteger(x) && x > 0).slice(0, 50);
+  for (const mid of ids) {
+    const old = await db.prepare("SELECT id, domain, type, title, body, created_at FROM memory WHERE id = ? AND (domain = ? OR domain = 'GLOBAL')").bind(mid, domain).first();
+    if (!old) { missing.push("memory " + mid); continue; }
+    await archiveOld(env, domain, "DELETE memory " + mid, old, reason);
+    await db.prepare("DELETE FROM memory WHERE id = ?").bind(mid).run();
+    done.memory_ids.push(mid);
+  }
+  const keys = (Array.isArray(args.context_keys) ? args.context_keys : []).filter((k) => typeof k === "string" && k).slice(0, 50);
+  for (const k of keys) {
+    const old = await db.prepare("SELECT domain, key, content, updated_at FROM context WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(domain, k).first();
+    if (!old) { missing.push("context " + k); continue; }
+    await archiveOld(env, domain, "DELETE context " + k, old, reason);
+    await db.prepare("DELETE FROM context WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(domain, k).run();
+    done.context_keys.push(k);
+  }
+  for (const key of objs) {
+    const head = await env.TRANSCRIPTS.head(key);
+    if (!head) { missing.push(key); continue; }
+    await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)")
+      .bind(domain, "DELETE object " + key + " (" + head.size + " bytes) - not restorable (" + reason.slice(0, 200) + ")").run();
+    await env.TRANSCRIPTS.delete(key);
+    done.objects.push(key);
+  }
+  if (!done.memory_ids.length && !done.context_keys.length && !done.objects.length) {
+    return { ok: false, error: missing.length ? "nothing deleted - not found: " + missing.join(", ") : "give memory_ids, context_keys, transcript or bundle" };
+  }
+  return { ok: true, deleted: done, not_found: missing, archived_to_log: true };
+}
+
 async function logRefusal(env, domain, what) {
   if (!env || !env.DB) return;
   try {
