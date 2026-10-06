@@ -342,6 +342,71 @@ function relevanceScore(topic) {
   return { all, score, pat };
 }
 
+// SUPERSEDED ROWS ARE NEVER SERVED AS CURRENT (2026-10-06, rebuild A7).
+// findSupersededIds() below marks a replaced row's title, but nothing ever
+// filtered on the mark, so a superseded row kept its place in every load. On
+// the live store, asked "how should GET /rules be authenticated?", superseded
+// row 658 (which says the opposite) tied with the owner's /rules decision and
+// outranked it (memory 3175). This predicate drops a row from memory,
+// relevant, lessons, pending, owner_rulings, related_elsewhere and /search.
+// bouios_get still returns it by id, so the history stays reachable.
+// The shapes are the ones the store actually holds (survey 2026-10-06): the
+// title mark, a body opening "SUPERSEDED", "RESOLVED <date>: superseded",
+// "COMPLETED (superseded" or "[STALE". Anchored, so a row that merely mentions
+// supersession (memory 3175's own title) stays. One shape is NOT whole-row:
+// "SUPERSEDED <date> (owner ruling N): ..." is a dated note correcting one
+// clause (11 rows, the deploy-by-Actions clause after ruling 2542); the rest
+// of those rows is still true, so they stay. Identical in memory-gateway/src/index.js
+// (retrieval-authority.test.mjs, worker-gateway-parity.test.mjs).
+const NOT_SUPERSEDED =
+  "title NOT LIKE '[SUPERSEDED]%' AND COALESCE(body,'') NOT LIKE '[STALE%' " +
+  "AND COALESCE(body,'') NOT LIKE 'RESOLVED ____-__-__: superseded%' AND COALESCE(body,'') NOT LIKE 'COMPLETED (superseded%' " +
+  "AND (COALESCE(body,'') NOT LIKE 'SUPERSEDED%' OR COALESCE(body,'') LIKE 'SUPERSEDED ____-__-__ (owner ruling%')";
+
+// TIES BREAK BY AUTHORITY BEFORE AGE (2026-10-06, rebuild A7). The scorer
+// counts matches only, so equal scores are common, and ties broke by id alone:
+// the newest row won and the oldest - often the decision itself - lost. Row
+// 138 tied at 31 with seven rows and ranked 9th. Now an owner ruling (title
+// OWNER-RULING / OWNER-SAID / STANDING, or a body opening OWNER-SAID or
+// PROVENANCE: OWNER-SAID, on a decision or pattern) comes first, then
+// decision, pattern, mistake; id breaks what is left. Scores are unchanged
+// (no keyword-weight tuning, owner ruling) - this only orders equal scores.
+const AUTHORITY =
+  "(CASE WHEN type IN ('decision','pattern') AND (title LIKE 'OWNER-RULING%' OR title LIKE 'OWNER-SAID%' OR title LIKE 'STANDING%' " +
+  "OR COALESCE(body,'') LIKE 'PROVENANCE: OWNER-SAID%' OR COALESCE(body,'') LIKE 'OWNER-SAID%') THEN 0 " +
+  "WHEN type = 'decision' THEN 1 WHEN type = 'pattern' THEN 2 WHEN type = 'mistake' THEN 3 ELSE 4 END)";
+
+// LESSONS BY THE TOPIC, NOT BY AGE (2026-10-06, rebuild A7; plan item 8,
+// memory 3177 gap 8). The 12 lessons were the newest 12 whatever the session
+// was about, so the lesson that matched the work was usually not among them.
+// Same 12 rows, same 8 in-project + 4 cross-project behaviour slots, same
+// 700-character clip: rows matching the topic come first (score, then
+// authority), the newest fill the rest. With no topic every score is 0 and
+// the order is exactly the old one (newest first). The owner's latest words
+// reach lessons through the per-message lookup (/search scores every row
+// type, lessons included) on the gateway. Superseded rows are excluded.
+function lessonsQuery(topic) {
+  const { all, score, pat } = relevanceScore(topic);
+  const rel = all.length ? "(" + score + ")" : "0";
+  const part = (rank, where, limit) =>
+    "SELECT id, type, title, body, rank, lscore, CASE WHEN lscore > 0 THEN auth ELSE 0 END AS tie FROM (" +
+      "SELECT id, type, title, substr(body,1,700) AS body, " + rank + " AS rank, " + rel + " AS lscore, " + AUTHORITY + " AS auth FROM memory " +
+        "WHERE " + where + " AND type IN ('mistake','pattern') AND " + NOT_SUPERSEDED + " " +
+        "ORDER BY lscore DESC, CASE WHEN lscore > 0 THEN auth ELSE 0 END, id DESC LIMIT " + limit +
+    ")";
+  const sql =
+    part(0, "(domain = ? OR domain = 'GLOBAL')", 8) +
+    " UNION ALL " +
+    part(1, "domain != ? AND domain != 'GLOBAL' AND (title LIKE '%verif%' OR title LIKE '%claim%' OR title LIKE '%stale%' " +
+      "OR title LIKE '%record%' OR title LIKE '%duplicat%' OR title LIKE '%already%' " +
+      "OR title LIKE '%regress%' OR title LIKE '%broke%')", 4) +
+    " ORDER BY rank, lscore DESC, tie, id DESC";
+  const termBinds = [];
+  for (const a of all) termBinds.push(pat(a), pat(a));
+  return { sql, binds: (domain) => [...termBinds, domain, ...termBinds, domain] };
+}
+const lessonRow = ({ id, type, title, body, rank }) => ({ id, type, title, body, rank });
+
 // ROWS MATCHING THIS TOPIC IN ANOTHER PROJECT. Ported from the
 // gateway 2026-09-16, same reason: relevantMemory below is scoped to this project
 // plus GLOBAL, so a row in another project cannot be returned by any load at any
@@ -355,8 +420,8 @@ async function relatedElsewhere(db, domain, topic) {
   if (!all.length) return [];
   const sql =
     "SELECT id, domain, type, title, CASE WHEN type IN ('decision','pattern') THEN body END AS body, (" + score + ") AS score " +
-    "FROM memory WHERE domain != ? AND domain != 'GLOBAL' AND (" + score + ") > 0 " +
-    "ORDER BY score DESC, id DESC LIMIT 5";
+    "FROM memory WHERE domain != ? AND domain != 'GLOBAL' AND " + NOT_SUPERSEDED + " AND (" + score + ") > 0 " +
+    "ORDER BY score DESC, " + AUTHORITY + ", id DESC LIMIT 5";
   const binds = [];
   for (const a of all) binds.push(pat(a), pat(a));
   binds.push(domain);
@@ -391,9 +456,9 @@ async function relevantMemory(db, domain, topic, excludeIds) {
     // and the lessons query above already carries the cross-project slots he
     // has sanctioned, so widening HERE also double-counted that decision.
     "SELECT id, domain, type, title, substr(body, 1, 400) AS body, (" + score + ") AS score " +
-    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending'" + excludeClause +
+    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND " + NOT_SUPERSEDED + excludeClause +
     " AND (" + score + ") > 0 " +
-    "ORDER BY score DESC, id DESC LIMIT 24";
+    "ORDER BY score DESC, " + AUTHORITY + ", id DESC LIMIT 24";
   const binds = [];
   for (const a of all) binds.push(pat(a), pat(a));
   binds.push(domain);
@@ -412,6 +477,12 @@ async function relevantMemory(db, domain, topic, excludeIds) {
 async function sessionLoad(domain, surface, env) {
   const db = env.DB;
   await ensureSchema(db);
+  let loadTopic = "";
+  {
+    const tm = / topic=(\S+)/.exec(String(surface || ""));
+    if (tm) { try { loadTopic = decodeURIComponent(tm[1]); } catch (e) { loadTopic = tm[1]; } }
+  }
+  const lq = lessonsQuery(loadTopic);
   const [rules, hot, context, pending, recent, lessons, memTotal] = await Promise.all([
     fetchRules(env),
     db.prepare("SELECT state, updated_at FROM hot WHERE domain = ?").bind(domain).all(),
@@ -420,10 +491,11 @@ async function sessionLoad(domain, surface, env) {
     // load small; bouios_get fetches the full body of a specific row on demand.
     // Must match the gateway (memory-gateway/src/index.js) - locked by the
     // gateway<->worker tool-parity test.
-    db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type = 'pending' ORDER BY id").bind(domain).all(),
-    db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' ORDER BY id DESC LIMIT 40").bind(domain).all(),
-    // LESSONS - parity with the gateway (2026-09-05). The newest mistake and
-    // pattern rows arrive WITH their bodies, because those rows exist for one
+    db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type = 'pending' AND " + NOT_SUPERSEDED + " ORDER BY id").bind(domain).all(),
+    db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND " + NOT_SUPERSEDED + " ORDER BY id DESC LIMIT 40").bind(domain).all(),
+    // LESSONS - parity with the gateway (2026-09-05). 12 mistake and pattern
+    // rows (the ones matching the topic first, then the newest) arrive WITH
+    // their bodies, because those rows exist for one
     // purpose - to stop the same failure happening again - and a title cannot
     // do that. Everything else stays titles-only: this is a separate bounded
     // field BESIDE the query above, never a widening of it, so the size
@@ -442,32 +514,17 @@ async function sessionLoad(domain, surface, env) {
       // The four classes that recur every single month (unverified claim, did not
       // read the record, rebuilt what existed, regression) are NOT project
       // specific: trusting a stale note in TRAVEL is the same failure as trusting
-      // one in AI. So 4 of the 12 slots are given to the newest cross-project rows
-      // whose titles carry that vocabulary, and the other 8 stay in-project.
+      // one in AI. So 4 of the 12 slots are given to cross-project rows whose
+      // titles carry that vocabulary, and the other 8 stay in-project.
       //
       // TWELVE EITHER WAY - this REPLACES, it does not add. The load is already
       // 31% behaviour instruction and the owner's stated aim is fewer tokens, so a
       // retrieval fix that grows the payload would trade one complaint for another.
-      "SELECT id, type, title, body, rank FROM (" +
-        "SELECT id, type, title, substr(body,1,700) AS body, 0 AS rank FROM memory " +
-          "WHERE (domain = ? OR domain = 'GLOBAL') AND type IN ('mistake','pattern') " +
-          "ORDER BY id DESC LIMIT 8" +
-      ") UNION ALL SELECT id, type, title, body, rank FROM (" +
-        "SELECT id, type, title, substr(body,1,700) AS body, 1 AS rank FROM memory " +
-          "WHERE domain != ? AND domain != 'GLOBAL' AND type IN ('mistake','pattern') " +
-          "AND (title LIKE '%verif%' OR title LIKE '%claim%' OR title LIKE '%stale%' " +
-               "OR title LIKE '%record%' OR title LIKE '%duplicat%' OR title LIKE '%already%' " +
-               "OR title LIKE '%regress%' OR title LIKE '%broke%') " +
-          "ORDER BY id DESC LIMIT 4" +
-      ") ORDER BY rank, id DESC"
-    ).bind(domain, domain).all(),
+      // Which 12: lessonsQuery() above - by the topic first, then newest.
+      lq.sql
+    ).bind(...lq.binds(domain)).all(),
     db.prepare("SELECT COUNT(*) AS n FROM memory WHERE domain = ? OR domain = 'GLOBAL'").bind(domain).first(),
   ]);
-  let loadTopic = "";
-  {
-    const tm = / topic=(\S+)/.exec(String(surface || ""));
-    if (tm) { try { loadTopic = decodeURIComponent(tm[1]); } catch (e) { loadTopic = tm[1]; } }
-  }
   // NO TOPIC GIVEN IS THE COMMON CASE, and an opt-in search that nobody opts
   // into is the same blindness it was built to fix (cb3c070 shipped the search;
   // nothing forces a caller to use it). The gateway already holds the one thing
@@ -527,8 +584,8 @@ async function sessionLoad(domain, surface, env) {
       relevant: relevantRows,
     } : {}),
     // The only rows here that arrive WITH a body - parity with the gateway.
-    lessons: lessons.results || [],
-    lessons_note: "lessons carries the newest mistake and pattern rows WITH their bodies, clipped to 700 characters, because these are the rows whose purpose is to stop a repeat and a title alone cannot do that. Read them before diagnosing or building - if one describes what you are about to do, you are about to repeat it. Everything in memory above is titles only by design; use bouios_get for any of those bodies.",
+    lessons: (lessons.results || []).map(lessonRow),
+    lessons_note: "lessons carries 12 mistake and pattern rows WITH their bodies, clipped to 700 characters - the ones matching your topic first, then the newest; superseded rows are never included - because these are the rows whose purpose is to stop a repeat and a title alone cannot do that. Read them before diagnosing or building - if one describes what you are about to do, you are about to repeat it. Everything in memory above is titles only by design; use bouios_get for any of those bodies.",
   };
   const _lt = await mintLoadToken(env, domain);
   if (_lt) {
@@ -867,6 +924,7 @@ const MCP_TOOLS = [
       properties: {
         project: { type: "string", description: "Project name (uppercase, 2-20 chars)." },
         surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch, chatgpt (ChatGPT, any surface), codex (OpenAI Codex)." },
+        topic: { type: "string", description: "Optional but strongly recommended: what this conversation is about, in a few words. With it, ALL rows are searched by relevance and the matches come back with a body excerpt in `relevant`, and lessons are chosen by it." },
       },
       required: ["project"],
     },
@@ -1337,7 +1395,10 @@ async function handleMsg(msg, sessionId, env, request, url) {
     if (!domain) return toolText(id, "Invalid project name. Use 2-20 chars, start with a letter.", true);
     try {
       if (name === "bouios_load") {
-        const surface = (args.surface || "mcp") + " session=" + (sessionId || "none");
+        // The topic rides on `surface` URI-encoded, as on the gateway. Until
+        // 2026-10-06 the worker never read args.topic and its schema had no
+        // topic, so a customer load could not search by one at all.
+        const surface = (args.surface || "mcp") + " session=" + (sessionId || "none") + (typeof args.topic === "string" && args.topic.trim() ? " topic=" + encodeURIComponent(args.topic.trim().slice(0, 160)) : "");
         const loaded = await sessionLoad(domain, surface, env);
         // A skill that cannot be read never takes the load down with it.
         try {
