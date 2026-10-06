@@ -702,6 +702,11 @@ async function sessionWrite(domain, body, db, tz) {
       // as a server fault when this is a refused client request.
       return { ok: false, domain, applied: [], error: "refused: a log line may not impersonate the load record that the write gate depends on" };
     }
+    // Same for the memory-use measure (logFetch): a caller-written FETCH or
+    // LOOKUP row would falsify the count. Case-sensitive, like the counter.
+    if (typeof s === "string" && /^(FETCH|LOOKUP) /.test(s.trim())) {
+      return { ok: false, domain, applied: [], error: "refused: a log line may not impersonate a FETCH or LOOKUP measurement row that /status counts" };
+    }
   }
   if (typeof body.hot === "string" && body.hot.length) {
     await db.prepare("INSERT INTO log (ts, domain, summary) SELECT datetime('now'), ?, 'HOT ARCHIVE: ' || state FROM hot WHERE domain = ?").bind(domain, domain).run();
@@ -1033,6 +1038,9 @@ const MCP_TOOLS = [
     // Read-only (only SELECTs). ChatGPT treats a tool without this hint as a
     // write and asks the user to confirm every call. The other tools write
     // (a load logs itself), so they stay unmarked. chatgpt-ready.test.mjs.
+    // The FETCH log row it writes (logFetch) is an audit record, not a write of
+    // the user's data, so the hint stays: without it ChatGPT asks before every
+    // fetch, and fetching is the thing that already happens too rarely.
     annotations: { readOnlyHint: true },
     description:
       "Fetch the FULL body of one or more specific memory rows by id. bouios_load returns titles only " +
@@ -1044,6 +1052,7 @@ const MCP_TOOLS = [
       properties: {
         project: { type: "string", description: "Project name, uppercase. Must match the row's domain or GLOBAL." },
         ids: { type: "array", items: { type: "integer" }, description: "One or more memory row ids to fetch in full." },
+        surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch, chatgpt (ChatGPT, any surface), codex (OpenAI Codex). Recorded with the fetch so memory use can be measured per surface." },
       },
       required: ["project", "ids"],
     },
@@ -1252,6 +1261,29 @@ function clipLogLine(s) {
     text: s.slice(0, LOG_LINE_MAX) + "...(clipped - a log line is one line; put the detail in a memory row)",
     clipped: true,
   };
+}
+
+// MEMORY USE IS MEASURED (rebuild A3, 2026-10-06) - same as the gateway's
+// logFetch, same row shape, so one counter reads both. Each bouios_get writes
+// one FETCH row: ids and counts only, never a title, body or content. A lost
+// write never costs the caller the rows. memory-use-logging.test.mjs.
+function measureIds(ids) {
+  const shown = ids.slice(0, 40).join(",");
+  return ids.length > 40 ? shown + " +" + (ids.length - 40) + " more" : shown;
+}
+async function logFetch(db, domain, sessionId, args, ids, keyCount, found) {
+  try {
+    let surface = typeof args.surface === "string" && /^[A-Za-z0-9_.-]{1,20}$/.test(args.surface) ? args.surface : "";
+    if (!surface && sessionId) {
+      const ld = await db.prepare("SELECT summary FROM log WHERE domain = ? AND summary LIKE 'Session loaded%' AND summary LIKE ? ORDER BY id DESC LIMIT 1")
+        .bind(domain, "%session=" + sessionId + "%").first();
+      const m = ld && /surface=([A-Za-z0-9_.-]+)/.exec(ld.summary);
+      if (m) surface = m[1].replace(/\.$/, "");
+    }
+    const line = "FETCH " + domain + " ids=" + measureIds(ids) + " found=" + found + " keys=" + keyCount +
+      " surface=" + (surface || "undeclared") + (sessionId ? " mcp-session=" + sessionId : "");
+    await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, line.slice(0, LOG_LINE_MAX)).run();
+  } catch (_) { /* a lost measurement must never cost the caller the rows */ }
 }
 
 const MCP_LOAD_SIZE_CEILING = 60000;
@@ -1545,6 +1577,7 @@ async function handleMsg(msg, sessionId, env, request, url) {
         const rows = await env.DB.prepare(
           `SELECT id, type, title, body FROM memory WHERE id IN (${placeholders}) AND (domain = ? OR domain = 'GLOBAL')`
         ).bind(...ids, domain).all();
+        await logFetch(env.DB, domain, sessionId, args, ids, 0, (rows.results || []).length);
         return toolText(id, JSON.stringify({ rows: rows.results || [] }));
       }
     } catch (e) {
