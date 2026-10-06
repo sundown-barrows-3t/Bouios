@@ -62,6 +62,29 @@ paste into a new chat so nothing is lost.
 
 ---
 
+## Step 4 — Add your licence key
+
+Your licence key comes by email when you finish the checkout (free with the
+alpha code during the alpha). Memory works without it; the key switches on
+what your level includes.
+
+In the Cloudflare dashboard open **Workers & Pages**, your `memory-vault`
+worker, **Settings → Variables and Secrets → Add**, choose type **Secret**,
+name it **`LICENCE`**, paste the key and deploy.
+
+---
+
+## What is kept in your storage
+
+- **Chat and Cowork:** your worker keeps a record of each Bouios call made in
+  a chat (load, save and the rest, with a short copy of each answer) in your
+  own bucket. It is not the whole conversation: your worker only sees the
+  Bouios calls. If you have a terminal you can list them with
+  `curl -H "Authorization: Bearer YOUR_BEARER_TOKEN" https://memory-vault.yourname.workers.dev/chat`.
+- **Claude Code:** the whole chat, with the optional step below.
+
+---
+
 ## Optional: back up your Claude Code chats
 
 In a terminal on the machine where you use Claude Code, run:
