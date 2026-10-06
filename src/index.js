@@ -78,12 +78,13 @@ function json(body, status = 200) {
   });
 }
 
-async function fetchRules(env) {
+// The licence goes in a header, never in the URL, so it stays out of logs. With
+// no licence the service answers with its small free set (no switch), which
+// still works.
+async function fetchRules(env, token) {
   if (!env.GATEWAY_URL) return [];
   try {
-    // The gateway serves the full rules only to a valid licence (6 Oct 2026); with
-    // none it serves a short neutral set, so this still returns an array.
-    const r = await fetch(env.GATEWAY_URL + "/rules", env.LICENCE ? { headers: { "x-licence": env.LICENCE } } : undefined);
+    const r = await fetch(env.GATEWAY_URL + "/rules", { headers: token ? { "x-licence": token } : {} });
     if (!r.ok) return [];
     const data = await r.json();
     return Array.isArray(data.rules) ? data.rules : [];
@@ -480,7 +481,7 @@ function relevanceScore(topic) {
 // the live store, asked "how should GET /rules be authenticated?", superseded
 // row 658 (which says the opposite) tied with the owner's /rules decision and
 // outranked it (memory 3175). This predicate drops a row from memory,
-// relevant, lessons, pending and /search.
+// relevant, lessons, pending, owner_rulings, related_elsewhere and /search.
 // bouios_get still returns it by id, so the history stays reachable.
 // The shapes are the ones the store actually holds (survey 2026-10-06): the
 // title mark, a body opening "SUPERSEDED", "RESOLVED <date>: superseded",
@@ -511,36 +512,65 @@ const AUTHORITY =
 // LESSONS BY THE TOPIC, NOT BY AGE (2026-10-06, rebuild A7; plan item 8,
 // memory 3177 gap 8). The 12 lessons were the newest 12 whatever the session
 // was about, so the lesson that matched the work was usually not among them.
-// Now 12 rows, THIS PROJECT AND GLOBAL ONLY (owner ruling 2938, 2026-09-29),
+// Same 12 rows, same 8 in-project + 4 cross-project behaviour slots, same
 // 700-character clip: rows matching the topic come first (score, then
-// authority), the newest fill the rest. With no topic every score is 0 and the
-// order is exactly the old one (newest first). The 2026-09-17 split of 8
-// in-project + 4 cross-project slots is gone (parity with the gateway): the
-// owner ruled that a load must not carry other projects' rows, and a lesson for
-// every project is saved as GLOBAL. rank stays in the projection (always 0) so
-// the row shape the client reads is unchanged. The owner's latest words reach
-// lessons through the per-message lookup (/search scores every row type,
-// lessons included) on the gateway. Superseded rows are excluded.
+// authority), the newest fill the rest. With no topic every score is 0 and
+// the order is exactly the old one (newest first). The owner's latest words
+// reach lessons through the per-message lookup (/search scores every row
+// type, lessons included) on the gateway. Superseded rows are excluded.
 function lessonsQuery(topic) {
   const { all, score, pat } = relevanceScore(topic);
   const rel = all.length ? "(" + score + ")" : "0";
-  const sql =
-    "SELECT id, type, title, body, rank, lscore FROM (" +
-      "SELECT id, type, title, substr(body,1,700) AS body, 0 AS rank, " + rel + " AS lscore, " + AUTHORITY + " AS auth FROM memory " +
-        "WHERE (domain = ? OR domain = 'GLOBAL') AND type IN ('mistake','pattern') AND " + NOT_SUPERSEDED + " " +
-        "ORDER BY lscore DESC, CASE WHEN lscore > 0 THEN auth ELSE 0 END, id DESC LIMIT 12" +
+  const part = (rank, where, limit) =>
+    "SELECT id, type, title, body, rank, lscore, CASE WHEN lscore > 0 THEN auth ELSE 0 END AS tie FROM (" +
+      "SELECT id, type, title, substr(body,1,700) AS body, " + rank + " AS rank, " + rel + " AS lscore, " + AUTHORITY + " AS auth FROM memory " +
+        "WHERE " + where + " AND type IN ('mistake','pattern') AND " + NOT_SUPERSEDED + " " +
+        "ORDER BY lscore DESC, CASE WHEN lscore > 0 THEN auth ELSE 0 END, id DESC LIMIT " + limit +
     ")";
+  const sql =
+    part(0, "(domain = ? OR domain = 'GLOBAL')", 8) +
+    " UNION ALL " +
+    part(1, "domain != ? AND domain != 'GLOBAL' AND (title LIKE '%verif%' OR title LIKE '%claim%' OR title LIKE '%stale%' " +
+      "OR title LIKE '%record%' OR title LIKE '%duplicat%' OR title LIKE '%already%' " +
+      "OR title LIKE '%regress%' OR title LIKE '%broke%')", 4) +
+    " ORDER BY rank, lscore DESC, tie, id DESC";
   const termBinds = [];
   for (const a of all) termBinds.push(pat(a), pat(a));
-  return { sql, binds: (domain) => [...termBinds, domain] };
+  return { sql, binds: (domain) => [...termBinds, domain, ...termBinds, domain] };
 }
 const lessonRow = ({ id, type, title, body, rank, lscore }) =>
   (lscore > 0 ? { id, type, title, body, rank, matched: true } : { id, type, title, body, rank });
 
-// No function reads another project's rows for a load (owner ruling 2938,
-// 2026-09-29, parity with the gateway). relatedElsewhere, ported here
-// 2026-09-16 and widened to decision/pattern bodies 2026-09-25, is gone: the
-// ruling supersedes both. A load is this project and GLOBAL.
+// ROWS MATCHING THIS TOPIC IN ANOTHER PROJECT. Ported from the
+// gateway 2026-09-16, same reason: relevantMemory below is scoped to this project
+// plus GLOBAL, so a row in another project cannot be returned by any load at any
+// topic, and the only way to reach it is for someone to name its id. Decision
+// and pattern rows (rulings and lessons) carry their full body, because a ruling
+// seen only as a title was ignored and contradicted (2026-09-25, parity with the
+// gateway). Mistake and pending bodies are never fetched - the split is in the
+// SQL. Errors return [] and the load stands.
+async function relatedElsewhere(db, domain, topic) {
+  const { all, score, pat } = relevanceScore(topic);
+  if (!all.length) return [];
+  const sql =
+    "SELECT id, domain, type, title, CASE WHEN type IN ('decision','pattern') THEN body END AS body, (" + score + ") AS score " +
+    "FROM memory WHERE domain != ? AND domain != 'GLOBAL' AND " + NOT_SUPERSEDED + " AND (" + score + ") > 0 " +
+    "ORDER BY score DESC, " + AUTHORITY + ", id DESC LIMIT 5";
+  const binds = [];
+  for (const a of all) binds.push(pat(a), pat(a));
+  binds.push(domain);
+  for (const a of all) binds.push(pat(a), pat(a));
+  try {
+    const rows = await db.prepare(sql).bind(...binds).all();
+    return (rows.results || []).map((r) => {
+      const o = { id: r.id, project: r.domain, type: r.type, title: r.title };
+      if (typeof r.body === "string") o.body = r.body;
+      return o;
+    });
+  } catch (e) {
+    return [];
+  }
+}
 
 async function relevantMemory(db, domain, topic, excludeIds) {
   const { all, score, pat } = relevanceScore(topic);
@@ -556,9 +586,9 @@ async function relevantMemory(db, domain, topic, excludeIds) {
     // briefly widened to reach mistake/pattern rows in every project and the
     // owner rejected it the same evening: "Chats are not supposed to read each
     // others chats! It creates context issues". Cross-project reach in the
-    // load is his call, not a retrieval optimisation to make on inference. He
-    // later ruled out every cross-project path in the load (2938, 2026-09-29),
-    // so this is not a slot that was left open for another query to fill.
+    // load is his call, not a retrieval optimisation to make on inference -
+    // and the lessons query above already carries the cross-project slots he
+    // has sanctioned, so widening HERE also double-counted that decision.
     "SELECT id, domain, type, title, substr(body, 1, 400) AS body, (" + score + ") AS score " +
     "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND " + NOT_SUPERSEDED + excludeClause +
     " AND (" + score + ") > 0 " +
@@ -578,7 +608,7 @@ async function relevantMemory(db, domain, topic, excludeIds) {
   return (rows.results || []).slice(0, 8);
 }
 
-async function sessionLoad(domain, surface, env) {
+async function sessionLoad(domain, surface, env, token) {
   const db = env.DB;
   await ensureSchema(db);
   let loadTopic = "";
@@ -588,7 +618,7 @@ async function sessionLoad(domain, surface, env) {
   }
   const lq = lessonsQuery(loadTopic);
   const [rules, hot, context, pending, recent, lessons, memTotal] = await Promise.all([
-    fetchRules(env),
+    fetchRules(env, token),
     db.prepare("SELECT state, updated_at FROM hot WHERE domain = ?").bind(domain).all(),
     db.prepare("SELECT key, content FROM context WHERE domain = ?").bind(domain).all(),
     // Memory rows load as TITLES ONLY (id, type, title - no body) to keep the
@@ -615,10 +645,15 @@ async function sessionLoad(domain, surface, env) {
       // The owner's complaint - "over and over again in every area we repeat the
       // same errors" - is that shape exactly.
       //
-      // THIS PROJECT AND GLOBAL ONLY, TWELVE ROWS (owner ruling 2938,
-      // 2026-09-29, parity with the gateway). The 2026-09-17 slots given to other
-      // projects' newest mistake/pattern rows are gone; a lesson that applies to
-      // every project belongs in GLOBAL, which this still reads.
+      // The four classes that recur every single month (unverified claim, did not
+      // read the record, rebuilt what existed, regression) are NOT project
+      // specific: trusting a stale note in TRAVEL is the same failure as trusting
+      // one in AI. So 4 of the 12 slots are given to cross-project rows whose
+      // titles carry that vocabulary, and the other 8 stay in-project.
+      //
+      // TWELVE EITHER WAY - this REPLACES, it does not add. The load is already
+      // 31% behaviour instruction and the owner's stated aim is fewer tokens, so a
+      // retrieval fix that grows the payload would trade one complaint for another.
       // Which 12: lessonsQuery() above - by the topic first, then newest.
       lq.sql
     ).bind(...lq.binds(domain)).all(),
@@ -647,6 +682,7 @@ async function sessionLoad(domain, surface, env) {
     db, domain, loadTopic || String(hotState || "").slice(0, 600),
     [...(recent.results || []).map((r) => r.id), ...(lessons.results || []).map((r) => r.id)]
   );
+  const relatedRows = await relatedElsewhere(db, domain, loadTopic || String(hotState || "").slice(0, 600));
   const openN = countOpenTasks(hotState);
   const openItemList = openItems(hotState, (pending.results || []));
   await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, "Session loaded, surface=" + (surface || "mcp")).run();
@@ -687,9 +723,12 @@ async function sessionLoad(domain, surface, env) {
     memory_coverage: relevantRows.length
       ? "Returned " + (recent.results || []).length + " newest titles + " + relevantRows.length + " rows matched on your topic, out of " + (memTotal ? memTotal.n : 0) + " total."
       : "Returned the " + (recent.results || []).length + " NEWEST titles out of " + (memTotal ? memTotal.n : 0) + " rows. The rest are not shown and their ids cannot be guessed from this window. If your task is not covered by what you see, call bouios_load again with a topic to search ALL rows by relevance - do not assume the store has nothing on it.",
-    // No other project's rows ride along (owner ruling 2938, 2026-09-29, parity
-    // with the gateway): the related_elsewhere block is gone. A load is this
-    // project and GLOBAL.
+    // Own field, not inside relevant: a load whose own project matched nothing
+    // dropped it (2026-09-30, parity with the gateway).
+    ...(relatedRows.length ? {
+      related_elsewhere: relatedRows,
+      related_elsewhere_note: "Rows from your other projects matched on the same topic. Decisions and patterns come with their full body so they are read, not skimmed. Mistakes and pending rows stay title only. SEEING A RULING HERE IS NOT PERMISSION TO WORK IN THAT PROJECT: obey a ruling that bears on the work you were given, and ask before any work over there.",
+    } : {}),
     ...(relevantRows.length ? {
       relevant: relevantRows,
     } : {}),
@@ -1071,7 +1110,7 @@ async function mcpLoad(domain, args, sessionId, env, request, url) {
   // 2026-10-06 the worker never read args.topic and its schema had no
   // topic, so a customer load could not search by one at all.
   const surface = (args.surface || "mcp") + " session=" + (sessionId || "none") + (typeof args.topic === "string" && args.topic.trim() ? " topic=" + encodeURIComponent(args.topic.trim().slice(0, 160)) : "");
-  const loaded = await sessionLoad(domain, surface, env);
+  const loaded = await sessionLoad(domain, surface, env, accessTokenFromRequest(request, url, env));
   // A skill that cannot be read never takes the load down with it.
   try {
     const cap = await skillsCapFor(request, url, env);
@@ -1373,19 +1412,12 @@ async function callNoMarks(env, token, body) {
 // BINDS BEHAVIOUR. profile-preferences and layer2-instructions-for-claude are
 // the instruction layer on surfaces where no hook can run - excerpting those
 // would silently drop enforcement text, which is worse than any payload size.
-// The one exception: a row that opens SUPERSEDED binds nothing and is excerpted
-// like any reference row (2026-10-06, see contextWindow below). Small rows are not worth excerpting either, and a row that matches the topic
+// Small rows are not worth excerpting either, and a row that matches the topic
 // the session actually named comes back whole, exactly like `relevant`.
 //
 // Nothing is lost: every key, its date and its length are always listed, and
 // the full content is one bouios_get({project, keys:[...]}) away.
 const CONTEXT_ALWAYS_FULL = /(instruction|preference|owner-behaviour|enforcement-config|gateway-url|gateway-config)/i;
-// A row that declares itself superseded is not behaviour any more (2026-10-06,
-// live AI load on the gateway, parity): profile-preferences (6755 characters)
-// opens "SUPERSEDED 2026-06-15" yet its key matched the pattern above. So
-// contextWindow and the size guard also test /^\s*\[?SUPERSEDED\b/i on the
-// content, inline (the tests extract these functions one by one), and such a
-// row falls through to the ordinary excerpt rule.
 // A handoff is read whole (parity with the gateway, 2026-09-25).
 const CONTEXT_FULL_UNDER = 1200;
 const CONTEXT_EXCERPT = 300;
@@ -1395,7 +1427,7 @@ function contextWindow(rows, topic) {
   let promoted = 0;
   return (rows || []).map((c) => {
     if (!c || typeof c.content !== "string") return c;
-    if (CONTEXT_ALWAYS_FULL.test(c.key || "") && !/^\s*\[?SUPERSEDED\b/i.test(c.content)) return c;
+    if (CONTEXT_ALWAYS_FULL.test(c.key || "")) return c;
     if (/handoff/i.test(c.key || "")) return c;
     if (c.content.length <= CONTEXT_FULL_UNDER) return c;
     // MATCHED ON THE KEY, NOT THE BODY, and capped - measured live 2026-09-16,
@@ -1470,11 +1502,7 @@ function clampMcpLoadSize(out) {
   if (size <= MCP_LOAD_SIZE_CEILING) return out;
   if (Array.isArray(out.context)) {
     out.context = out.context.map((c) => {
-      // Never cut a row that binds behaviour (2026-10-06, live AI load, parity
-      // with the gateway: layer2-instructions-for-claude, 4085 characters, was
-      // cut to 221 here after contextWindow had kept it whole). A superseded row
-      // is not protected: contextWindow has already excerpted it.
-      if (!c.content || c.content.length <= 300 || /handoff/i.test(c.key || "") || (CONTEXT_ALWAYS_FULL.test(c.key || "") && !/^\s*\[?SUPERSEDED\b/i.test(c.content))) return c;
+      if (!c.content || c.content.length <= 300 || /handoff/i.test(c.key || "")) return c;
       return { ...c, content: c.content.slice(0, 300) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)", truncated: true };
     });
   }
@@ -1513,8 +1541,8 @@ function clampMcpLoadSize(out) {
     () => { delete out.hot_archives; delete out.hot_archives_note; },
     () => { if (Array.isArray(out.log)) out.log = out.log.slice(0, 10); },
     () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 20); },
-    // Handoffs are read whole, so everything else pays first (parity with the
-    // gateway, 2026-09-25).
+    // Handoffs and other projects' rulings are read whole, so everything else
+    // pays first (parity with the gateway, 2026-09-25).
     () => {
       (out.context || []).forEach((c) => {
         if (c && c.truncated && typeof c.content === "string" && c.content.length > 200) c.content = c.content.slice(0, 120) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)";
@@ -1522,7 +1550,12 @@ function clampMcpLoadSize(out) {
     },
     () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (r && r.body) r.body = _clip(r.body, 150); }); },
     () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 12); },
-    // Only then is the handoff clipped, to a visible pointer, before the last resort.
+    // Only then are they clipped, to a visible pointer, before the last resort.
+    () => {
+      (out.related_elsewhere || []).forEach((r) => {
+        if (r && typeof r.body === "string" && r.body.length > 400) r.body = r.body.slice(0, 400) + "...(truncated, size guard - bouios_get({project:\"" + r.project + "\", ids:[" + r.id + "]}) for the rest)";
+      });
+    },
     () => {
       (out.context || []).forEach((c) => {
         if (c && /handoff/i.test(c.key || "") && typeof c.content === "string" && c.content.length > 1500) {
