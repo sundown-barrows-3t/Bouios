@@ -1257,17 +1257,18 @@ const MCP_TOOLS = [
   // in permissions.ask in the owner's settings so Code asks on every call. The gateway cannot see the approval itself, so it keeps
   // what it can: every change needs a stated reason, and the old value is
   // written to the log first, so an edit or a row delete can be undone.
-  // Parity with the gateway (2026-09-30); a transcript or bundle delete needs
-  // the optional transcript bucket, and answers that storage is not configured
-  // on an install without one.
-  // edit-delete.test.mjs.
+  // Parity with the gateway (2026-09-30); transcripts and bundles live in this
+  // install's own bucket (binding TRANSCRIPTS); without that binding a
+  // transcript or bundle delete answers that storage is not configured.
+  // edit-delete.test.mjs and worker/test/edit-delete.test.mjs.
   {
     name: "bouios_edit",
     annotations: { destructiveHint: true },
     description:
       "Change an existing memory row (title, body or type) or context row (content) in this project. " +
-      "ONLY after the user has explicitly approved this exact change - the client asks them; never call it to " +
-      "tidy up on your own initiative. The old value is archived to the log first (undoable). reason is required.",
+      "Before calling, ask the user in plain words for this exact change and wait for their explicit yes; the client also asks them. " +
+      "Never call it to tidy up on your own initiative. The old value is archived to the log first (undoable). " +
+      "reason is required and must say the user approved.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1289,8 +1290,9 @@ const MCP_TOOLS = [
     annotations: { destructiveHint: true },
     description:
       "Delete memory rows, context rows, or a stored transcript/bundle object in this project. " +
-      "ONLY after the user has explicitly approved this exact deletion - the client asks them. Memory and context " +
-      "rows are archived to the log first (undoable); a transcript or bundle object cannot be restored. reason is required.",
+      "Before calling, ask the user in plain words for this exact deletion and wait for their explicit yes; the client also asks them. " +
+      "Memory and context rows are archived to the log first (undoable); a transcript or bundle object cannot be restored. " +
+      "reason is required and must say the user approved.",
     inputSchema: {
       type: "object",
       properties: {
