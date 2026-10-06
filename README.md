@@ -9,6 +9,8 @@ terminal.
 
 ## Step 1 — Deploy to your Cloudflare account
 
+Before you start: open Cloudflare's dashboard, go to Storage & databases > R2 and turn R2 on (it is free to start). Without it the deploy cannot create your chat-backup bucket.
+
 Click the button. If you do not have a Cloudflare account yet, you can create
 a free one during this step.
 
@@ -17,11 +19,12 @@ a free one during this step.
 Cloudflare will:
 1. Copy this project into your own GitHub account.
 2. Create a database (named `memory-vault`) on your Cloudflare account.
-3. Ask you to set one secret called **`BEARER_TOKEN`** — this is a password
+3. Create a storage bucket (named `memory-vault-transcripts`) for your chat backups.
+4. Ask you to set one secret called **`BEARER_TOKEN`** — this is a password
    that protects your memory. Paste a long random value. If you have a terminal
    you can run `openssl rand -hex 32`; otherwise use any long random string of
    letters and numbers and **keep a copy**.
-4. Deploy. When it finishes you get a web address ending in `.workers.dev` —
+5. Deploy. When it finishes you get a web address ending in `.workers.dev` —
    for example `https://memory-vault.yourname.workers.dev`. **Copy it.**
 
 The database tables are created automatically on first use. There is nothing
@@ -56,6 +59,16 @@ load memory
 Claude loads your saved context, decisions, and open tasks. As you work it
 saves back automatically and, when a chat gets long, hands you a short block to
 paste into a new chat so nothing is lost.
+
+---
+
+## Optional: back up your Claude Code chats
+
+In a terminal on the machine where you use Claude Code, run:
+
+    bash hooks/install-transcript-hook.sh https://<your-address>.workers.dev <your BEARER_TOKEN>
+
+Each Claude Code chat is then saved to your own storage when it ends or compacts. Nothing is sent anywhere else.
 
 ---
 

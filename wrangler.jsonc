@@ -1,8 +1,9 @@
 {
   // Customer template for the Deploy to Cloudflare button.
   // The button clones this to the customer's own GitHub, provisions the D1
-  // database below on THEIR account and binds it, prompts for the BEARER_TOKEN
-  // secret, then deploys.
+  // database and the R2 transcript bucket below on THEIR account and binds
+  // them, prompts for the BEARER_TOKEN secret, then deploys. Chat transcripts
+  // go only to this bucket (PUT/GET /transcript, bearer-gated).
   // Deploy trigger: keep Cloudflare native Git deployment on main authoritative.
   "name": "memory-vault",
   "main": "src/index.js",
@@ -12,6 +13,12 @@
       "binding": "DB",
       "database_name": "memory-vault",
       "database_id": "PLACEHOLDER_PROVISIONED_ON_DEPLOY"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "TRANSCRIPTS",
+      "bucket_name": "memory-vault-transcripts"
     }
   ],
   "vars": {
