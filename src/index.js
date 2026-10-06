@@ -11,9 +11,11 @@
 // 10021. Keep this block's logic identical to text-generator.js by hand;
 // memory-gateway/test/worker-gateway-parity.test.mjs checks the MEMORY_NOTE
 // text stays present here regardless of source.
-// One format on every surface (A2, 2026-10-06) - see text-generator.js.
 function confirmationText(domain, rulesN, hotDate, openN, branded = false) {
-  return `Bouios loaded - working set ${domain}, ${rulesN} rules loaded, ${openN} items flagged for follow-up.`;
+  if (branded) {
+    return `Bouios loaded - working set ${domain}, ${rulesN} rules loaded, ${openN} items flagged for follow-up.`;
+  }
+  return `Memory loaded: ${domain}, ${rulesN} rules, hot from ${hotDate}, ${openN} open tasks.`;
 }
 const MEMORY_NOTE = "titles only - call bouios_get({project, ids:[...]}) for full body of any row you need";
 
@@ -879,51 +881,6 @@ async function domainLoadedRecently(db, domain) {
   return !!row;
 }
 
-// AUTO-LOAD (A2, 2026-10-06). Decides only whether to load before another
-// tool runs; the write refusals below still use domainLoadedRecently, so no
-// refusal changes. It mirrors the gateway's loadedBeforeWrite: with a real
-// session id only THIS session's load counts (domainLoadedRecently would let
-// any other chat's load stand in, which is exactly the iOS chat that never
-// loaded). The id must match SESSION_ID_RE, so the "session=none" a sessionless
-// load writes can never be matched; with no id, a recent load of the project
-// stands in, as on the gateway.
-const SESSION_ID_RE = /^[A-Za-z0-9.:-]{8,128}$/;
-async function loadedThisSession(db, domain, sessionId) {
-  if (!domain) return false;
-  if (typeof sessionId === "string" && SESSION_ID_RE.test(sessionId)) {
-    const row = await db.prepare("SELECT 1 AS ok FROM log WHERE domain = ? AND summary LIKE 'Session loaded%' AND summary LIKE ? AND ts > datetime('now', '-1 day') LIMIT 1").bind(domain, "%session=" + sessionId + "%").first();
-    return !!row;
-  }
-  return domainLoadedRecently(db, domain);
-}
-
-const AUTO_LOAD_TOOLS = new Set(["bouios_save", "bouios_handoff", "bouios_get", "bouios_edit", "bouios_delete", "bouios_no_marks"]);
-const AUTO_LOAD_PREFACE = "Memory was not loaded in this chat; loaded it now.";
-
-// The one MCP load path: bouios_load and the auto-load both come through here.
-async function mcpLoad(domain, args, sessionId, env, request, url) {
-  // The topic rides on `surface` URI-encoded, as on the gateway. Until
-  // 2026-10-06 the worker never read args.topic and its schema had no
-  // topic, so a customer load could not search by one at all.
-  const surface = (args.surface || "mcp") + " session=" + (sessionId || "none") + (typeof args.topic === "string" && args.topic.trim() ? " topic=" + encodeURIComponent(args.topic.trim().slice(0, 160)) : "");
-  const loaded = await sessionLoad(domain, surface, env);
-  // A skill that cannot be read never takes the load down with it.
-  try {
-    const cap = await skillsCapFor(request, url, env);
-    if (cap !== null) loaded.skills = await ownSkills(env.DB, domain, cap, await defaultSkills(request, url, env));
-  } catch (_) { /* no skills field, load unchanged */ }
-  return loaded;
-}
-
-// Puts the preface, the load's confirmation line and its payload ahead of the
-// tool's own result, in the same text block the model reads.
-function prefaceAutoLoad(res, loaded) {
-  const block = res && res.result && Array.isArray(res.result.content) ? res.result.content[0] : null;
-  if (!block || typeof block.text !== "string") return res;
-  block.text = AUTO_LOAD_PREFACE + "\n" + (loaded.confirmation || "") + "\n" + JSON.stringify(loaded) + "\n\n" + block.text;
-  return res;
-}
-
 // ---- MCP (JSON-RPC 2.0, Streamable HTTP) ----
 
 const MCP_PROTOCOL = "2025-03-26";
@@ -933,7 +890,7 @@ const MCP_PROTOCOL = "2025-03-26";
 // identically to every customer's connector. Mirrors memory-gateway/src.
 const MCP_INSTRUCTIONS =
   // CORE FIRST (2026-09-28): Claude Code keeps only the first 2,048 characters
-  // of these, and the canonical block below is 3,733 (measured 2026-10-06). A copy of
+  // of these, and the canonical block below is 3,544. A copy of
   // CORE_INSTRUCTIONS in memory-gateway/src/text-generator.js - edit it there
   // and paste it here; instructions-core.test.mjs fails if the served text does
   // not start with it byte for byte.
@@ -959,7 +916,6 @@ const MCP_TOOLS = [
   {
     name: "bouios_load",
     description:
-      "CALL THIS FIRST, before your first reply in every chat - even a greeting or a one-line question. " +
       "Load memory for a project (rules, working state, context, patterns). " +
       "Must be called first in every conversation before any other work. " +
       "Triggers on user messages: 'load memory', 'load rules', 'load Bouios'.",
@@ -1437,21 +1393,19 @@ async function handleMsg(msg, sessionId, env, request, url) {
     const args = (msg.params && msg.params.arguments) || {};
     const domain = normaliseProject(args.project || args.domain);
     if (!domain) return toolText(id, "Invalid project name. Use 2-20 chars, start with a letter.", true);
-    // AUTO-LOAD (A2, 2026-10-06) - mirrors memory-gateway/src/index.js. A
-    // Bouios tool called in a session that has not loaded this project loads
-    // first and says so; a loaded session, or one carrying a valid load_token,
-    // is unchanged; a failed load leaves today's refusals in place. The
-    // try-block below is the unchanged dispatch, wrapped (not re-indented).
-    let autoLoaded = null;
-    if (AUTO_LOAD_TOOLS.has(name)
-        && !(await loadedThisSession(env.DB, domain, sessionId))
-        && !(await verifyLoadToken(env, domain, args.load_token))) {
-      try { autoLoaded = clampMcpLoadSize(await mcpLoad(domain, { surface: args.surface }, sessionId, env, request, url)); } catch (_) { autoLoaded = null; }
-    }
-    const res = await (async () => {
     try {
       if (name === "bouios_load") {
-        return toolText(id, JSON.stringify(clampMcpLoadSize(await mcpLoad(domain, args, sessionId, env, request, url))));
+        // The topic rides on `surface` URI-encoded, as on the gateway. Until
+        // 2026-10-06 the worker never read args.topic and its schema had no
+        // topic, so a customer load could not search by one at all.
+        const surface = (args.surface || "mcp") + " session=" + (sessionId || "none") + (typeof args.topic === "string" && args.topic.trim() ? " topic=" + encodeURIComponent(args.topic.trim().slice(0, 160)) : "");
+        const loaded = await sessionLoad(domain, surface, env);
+        // A skill that cannot be read never takes the load down with it.
+        try {
+          const cap = await skillsCapFor(request, url, env);
+          if (cap !== null) loaded.skills = await ownSkills(env.DB, domain, cap, await defaultSkills(request, url, env));
+        } catch (_) { /* no skills field, load unchanged */ }
+        return toolText(id, JSON.stringify(clampMcpLoadSize(loaded)));
       }
       if (name === "bouios_save") {
         // Bearer auth (the /mcp/{token} gate this call already passed) proves
@@ -1536,8 +1490,6 @@ async function handleMsg(msg, sessionId, env, request, url) {
       return toolText(id, "tool failed: " + String(e), true);
     }
     return toolText(id, "unknown tool: " + String(name), true);
-    })();
-    return autoLoaded ? prefaceAutoLoad(res, autoLoaded) : res;
   }
   if (msg.id === undefined || msg.id === null) return null;
   return rpcError(id, -32601, "method not found");
