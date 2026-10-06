@@ -1356,7 +1356,6 @@ function clampMcpLoadSize(out) {
       });
     },
     () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (r && r.body) r.body = _clip(r.body, 150); }); },
-    () => { (out.relevant || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
     () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 12); },
     // Only then are they clipped, to a visible pointer, before the last resort.
     () => {
@@ -1372,6 +1371,12 @@ function clampMcpLoadSize(out) {
         }
       });
     },
+    // THE ANSWERS ARE CUT LAST (2026-10-06). Measured on the live store after
+    // 6141f58: this step ran before the memory, related and handoff steps, so
+    // the top 3 relevant rows and the matched lessons arrived as 176-character
+    // stubs while the finished load sat 3.7KB under the ceiling. They are what
+    // the session asked for; everything above pays first.
+    () => { (out.relevant || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
   ];
   for (const step of _steps) {
     if (_fits()) return out;
