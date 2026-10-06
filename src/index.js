@@ -1277,12 +1277,37 @@ async function skillsCapFor(request, url, env) {
     return null;
   }
 }
-async function ownSkills(db, domain, cap) {
+// The default skills are the service's content, not stored here: they come from
+// the gateway behind the licence, count toward the cap, and any failure just
+// means this account's own skills load alone.
+async function defaultSkills(request, url, env) {
+  const token = accessTokenFromRequest(request, url, env);
+  if (!token || !env.GATEWAY_URL) return [];
+  try {
+    const r = await fetch(env.GATEWAY_URL + "/skills", { headers: { "x-licence": token } });
+    if (!r.ok) return [];
+    const j = await r.json();
+    return Array.isArray(j.skills) ? j.skills.filter((s) => s && typeof s.name === "string" && typeof s.body === "string") : [];
+  } catch {
+    return [];
+  }
+}
+async function ownSkills(db, domain, cap, defaults = []) {
   const rows = await db.prepare("SELECT title, body FROM memory WHERE type = 'pattern' AND title LIKE 'skill-%' AND (domain = ? OR domain = 'GLOBAL') ORDER BY id").bind(domain).all();
   const skills = [];
   let tokens = 0;
+  const have = new Set();
+  for (const d of defaults) {
+    if (skills.length >= cap || have.has(d.name)) continue;
+    const est = Math.ceil(d.body.length / 4);
+    if (tokens + est > SKILL_TOKEN_BUDGET && skills.length > 0) break;
+    skills.push({ name: d.name, est_tokens: est, body: d.body });
+    have.add(d.name);
+    tokens += est;
+  }
   for (const r of rows.results || []) {
     if (skills.length >= cap) break;
+    if (have.has(String(r.title).slice(6))) continue;
     const est = Math.ceil(String(r.body || "").length / 4);
     if (tokens + est > SKILL_TOKEN_BUDGET && skills.length > 0) break;
     skills.push({ name: String(r.title).slice(6), est_tokens: est, body: r.body });
@@ -1317,7 +1342,7 @@ async function handleMsg(msg, sessionId, env, request, url) {
         // A skill that cannot be read never takes the load down with it.
         try {
           const cap = await skillsCapFor(request, url, env);
-          if (cap !== null) loaded.skills = await ownSkills(env.DB, domain, cap);
+          if (cap !== null) loaded.skills = await ownSkills(env.DB, domain, cap, await defaultSkills(request, url, env));
         } catch (_) { /* no skills field, load unchanged */ }
         return toolText(id, JSON.stringify(clampMcpLoadSize(loaded)));
       }
