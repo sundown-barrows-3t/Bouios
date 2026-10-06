@@ -950,34 +950,42 @@ function prefaceAutoLoad(res, loaded) {
 // ---- MCP (JSON-RPC 2.0, Streamable HTTP) ----
 
 const MCP_PROTOCOL = "2025-03-26";
+// Instruction text lives on our service behind the licence (decisions 173/863):
+// this file keeps only a short neutral fallback, byte-identical to
+// text-generator.js FREE_INSTRUCTIONS (rules-lock.test.mjs checks it).
+const FALLBACK_INSTRUCTIONS = "This connector is Bouios, the user's own memory system. Bouios is loaded at the start of every conversation: before replying, call bouios_load with the one project the topic implies, and show the user only the confirmation line it returns. 'load memory', 'load rules' and 'load Bouios' each mean load now. Memory loads return titles only; call bouios_get for the full body of a row you need. Save with bouios_save, passing the load_token from the load, every few steps and before any long step. Near the end of the conversation call bouios_handoff and show its block to paste into a new chat. Never ask the user for a token, key or credential. If memory cannot be reached, say so once and carry on without it - do not stall; it reconnects.";
+
+// Served from the gateway per licence and kept for ten minutes per token, so a
+// reconnect loop costs one fetch. Any failure serves the fallback and is never
+// cached, so the next initialize tries again.
+const INSTRUCTIONS_TTL_MS = 10 * 60 * 1000;
+const instructionsCache = new Map();
+async function instructionsFor(env, token) {
+  if (!env.GATEWAY_URL) return FALLBACK_INSTRUCTIONS;
+  const key = token || "";
+  const hit = instructionsCache.get(key);
+  if (hit && Date.now() - hit.at < INSTRUCTIONS_TTL_MS) return hit.text;
+  try {
+    const r = await fetch(env.GATEWAY_URL + "/instructions", {
+      headers: token ? { "x-licence": token } : {},
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!r.ok) return FALLBACK_INSTRUCTIONS;
+    const data = await r.json();
+    if (data && typeof data.instructions === "string" && data.instructions.length > 0) {
+      instructionsCache.set(key, { text: data.instructions, at: Date.now() });
+      return data.instructions;
+    }
+  } catch {
+    // fall through to the fallback
+  }
+  return FALLBACK_INSTRUCTIONS;
+}
+
 // Tool identifiers are Bouios-branded (2026-07-02): the platform's own
 // permission dialogs render the raw technical tool name with zero branding -
 // confirmed by owner screenshot on the owner's own connector, applies
 // identically to every customer's connector. Mirrors memory-gateway/src.
-const MCP_INSTRUCTIONS =
-  // CORE FIRST (2026-09-28): Claude Code keeps only the first 2,048 characters
-  // of these, and the canonical block below is 3,733 (measured 2026-10-06). A copy of
-  // CORE_INSTRUCTIONS in memory-gateway/src/text-generator.js - edit it there
-  // and paste it here; instructions-core.test.mjs fails if the served text does
-  // not start with it byte for byte.
-  "This connector is Bouios, the user's own memory system, expected in every conversation. Some apps keep only the first 2,048 characters of these instructions, so the rules that matter most come first. 1. Before replying, call bouios_load with the ONE project the topic implies (ask which if unclear; never load all). A short task is not exempt. Show the user only the confirmation line it returns, verbatim. Read pending, the log and rules before acting; never re-propose what the log shows is built. List open tasks before new work. 2. Verify, never guess. Done, fixed or working needs evidence in the same reply - a file, a live check, a saved record, a test result or a link - or say plainly it is unverified. Absence is known only by looking this turn. Nothing is live until it answers. 3. Do the task in full: never defer, narrow the scope or ask what you can check yourself; ask only a genuine decision, once, plainly. Answer a yes/no question in the first line. 4. Save with bouios_save (pass the load_token) every few substantive steps and before any long step, and show its returned line verbatim. A load or save with no line in the reply is a failure. 5. Near the context limit call bouios_handoff and show its block in a code box; after a compaction or resume, call bouios_load again before any write. 6. Do not write, edit, send or publish until memory is loaded and the user approves that action. Never ask the user for a token, key or credential. 7. Never show accounts, ids, urls, queries or backend detail. Be terse: action, evidence, next. Named failures, each has happened: reporting an inference as a finding; naming a cause from a count without opening it; concluding something does not exist from searching a name you invented; reporting silence from the only way in you checked; quoting a stale note as the user's rule. The full rules follow; the rules bouios_load returns also bind and take precedence." +
-  " " +
-  // CANONICAL BLOCK - byte-identical to .session/canonical-load-block.txt and
-  // memory-gateway/src/text-generator.js CANONICAL_LOAD_BLOCK. Inlined, not
-  // imported, because this worker deploys as a single self-contained module
-  // (a cross-directory import fails Cloudflare upload with error 10021 - proven
-  // live 2026-07-24). DO NOT EDIT HERE: edit text-generator.js and run
-  // .session/sync-canonical-block.mjs, which rewrites the line between the
-  // markers below. The byte-identity test fails the build on any difference.
-  // BOUIOS-CANONICAL-BLOCK-START
-  "Bouios is my memory system. Load it at the START of every conversation, before replying. Infer the ONE project from the topic; if unclear, ASK me which - never default, never load all. 'load memory', 'load rules' and 'load Bouios' each mean do this now. A short or self-contained task is not exempt. Use the bouios_load TOOL - never curl, fetch or bash the memory address yourself; that address is the connector's, not a URL to call by hand. If the tool is genuinely missing, the only fallback is your store's own query tool against the same store; if neither exists, say so once and carry on without it - do not stall; it reconnects. Never substitute an unrelated tool that merely mentions memory (knowledge graph, read_graph, create_entities); an empty result from one is not evidence mine is empty. Calling the tool is not loading, and neither is memory being shown to you automatically at the start - only your own load call counts. Read every row, including the log of what was agreed and done; never re-propose what it shows is built. Show me ONLY the confirmation line the tool returns, verbatim - it is already branded, do not retype it in your own words and do not replace it with a plainer one. Never show the account, database, ids or queries. List my open tasks before new work. Loaded rules take precedence. Never ask me for a token, key or credential - the tools already carry what they need. THESE BIND EVERY REPLY, they are not advice: Read the record FIRST - memory, the log, the history, audits, transcripts - before diagnosing, proposing or acting; never re-derive or re-propose what the record shows is decided or built. Verify, never guess: state no fact, capability, done, fixed or working from assumption - ground each in a file, a live check, a saved record, a test result or a link, and tag which; never assert from a hunch. Never claim done, fixed or working without that evidence, never narrate around a failure, never step around a gate. Do the task in full: never defer, never resist or deflect, never narrow the scope I set or fix one sliver in place of the whole, never ask what you can verify yourself - resolve each issue with evidence, do not just describe it, and ask only a genuine decision, once, framed plainly. Every load, save and handoff ends with its own branded line in the reply itself, never buried in a tool call I do not read: the returned line verbatim after a load, 'Bouios memory saved: hot + log{, N rows} at {HH:MM}.' after a save, 'Bouios handoff saved.' after a handoff - a load or save with no line is a failure, not a style choice. These five are the real failures, each one has happened, recognise the shape as you are about to do it: reporting an inference as a finding; reading a count and naming a cause without opening what it counted; searching for a name you invented and concluding from finding nothing that the thing does not exist; checking the only way in you could reach and reporting its silence as evidence; reading a stale note and quoting it back to me as my own rule. Answer a yes/no question in the first line. Be terse - Action, Evidence, Next - no verbose narration, no restating. When memory and this note disagree, memory wins; when neither can be reached, say so once and continue - never stall. Do not write, edit, send or publish until memory is loaded and I approve that action; never revert or reset my work without that same approval. Save full state to hot every few substantive steps and before any long step, counting steps because you cannot read a percentage, and say what was saved. After a compaction or resume, load again before any write. When context or usage nears the limit, output a handoff block in a code box to paste into a new chat. Choose the model per task from the current routing table: today that means opusplan to plan and write, and a cheaper sub-agent model to read, build from a fully written spec, check and deploy." +
-  // BOUIOS-CANONICAL-BLOCK-END
-  // Leading space: the block ends "...new chat." with none, and without it
-  // customers were served "new chat.Surface only" (worker-gateway-parity).
-  " Surface only the returned confirmation line to the user. " +
-  "Memory loads return TITLES ONLY (id, type, title - no body); call bouios_get({project, ids:[...]}) for the full body of any specific row you actually need, never all of them. " +
-  "Save via bouios_save; call bouios_handoff when the conversation nears its limit and show the user the returned block to paste into a new chat.";
-
 const MCP_TOOLS = [
   {
     name: "bouios_load",
@@ -1487,7 +1495,7 @@ async function handleMsg(msg, sessionId, env, request, url) {
       protocolVersion: MCP_PROTOCOL,
       capabilities: { tools: {} },
       serverInfo: { name: "memory", version: "2.0.0" },
-      instructions: MCP_INSTRUCTIONS,
+      instructions: await instructionsFor(env, accessTokenFromRequest(request, url, env)),
     });
   }
   if (method === "ping") return rpcResult(id, {});
