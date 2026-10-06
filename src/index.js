@@ -2,6 +2,9 @@
 // Personal memory D1 (hot/context/memory/log) + auth + MCP.
 // Rules are served by our gateway; never stored in the customer D1.
 // Secrets required: BEARER_TOKEN
+// Optional secret: LICENCE (the key from your licence email; without it memory
+// still works). Optional bucket binding: TRANSCRIPTS (session transcripts and
+// chat session records kept in your own storage).
 // Env vars: GATEWAY_URL (set in wrangler.toml)
 
 // Inlined from memory-gateway/src/text-generator.js (not imported: this file is
@@ -41,6 +44,10 @@ const SCHEMA = [
   // a customer on chat gets a bare 401 with no way in - the same defect the
   // gateway had. The customer's own BEARER_TOKEN is the key the authorize step
   // checks; the access token IS that token, which /mcp then accepts.
+  // Where each chat/Cowork session's record has got to (2026-10-06):
+  // which part object is being filled and how many bytes it holds, so adding a
+  // line does not have to list the bucket. See recordChatTurn.
+  "CREATE TABLE IF NOT EXISTS chat_record_parts (session_id TEXT PRIMARY KEY, part INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, updated_at TEXT)",
 ];
 let schemaReady = false;
 async function ensureSchema(db) {
@@ -165,7 +172,10 @@ async function transcriptRoute(request, env, url, path) {
     let cursor;
     do {
       const page = await env.TRANSCRIPTS.list({ cursor, limit: 1000 });
-      for (const o of page.objects) if (inWindow(o)) items.push({ id: o.key, size: o.size, uploaded: o.uploaded });
+      // Chat/Cowork session records live under chat/ in the same bucket but are
+      // not transcripts (a trail mixed into this listing could not
+      // be told apart); they are listed at GET /chat only.
+      for (const o of page.objects) if (!o.key.startsWith("chat/") && inWindow(o)) items.push({ id: o.key, size: o.size, uploaded: o.uploaded });
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
     items.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded));
@@ -174,6 +184,113 @@ async function transcriptRoute(request, env, url, path) {
   const obj = await env.TRANSCRIPTS.get(id);
   if (!obj) return json({ error: "not found" }, 404);
   if (!inWindow(obj)) return json({ error: "this transcript is older than your plan's history period; it is still in your storage" }, 403);
+  return new Response(obj.body, { headers: { "content-type": (obj.httpMetadata && obj.httpMetadata.contentType) || "application/x-ndjson" } });
+}
+
+// CHAT AND COWORK SESSION RECORD IN YOUR OWN BUCKET (2026-10-06).
+// Chat and Cowork have no hooks, so the Code transcript uploader never runs
+// there (owner, 30 Sep: customer data saves to their own Cloudflare on every
+// surface). This worker already sees every Bouios tool call of a
+// chat session and its session id, so it records what it saw.
+// This is a SESSION RECORD, NOT THE CONVERSATION: the Bouios tool calls (load,
+// save, get, ...) with their arguments and a clipped answer. The worker never
+// sees the rest of the chat. It is kept apart from real transcripts (key prefix
+// chat/, its own route) because an event trail mixed into the transcript listing
+// could not be told apart from a transcript.
+// COST, on the customer's own bill: each recorded request is one bucket read
+// (Class B) plus one write (Class A) and two small database statements. The storage free
+// tier is 1,000,000 Class A and 10,000,000 Class B operations a month, then
+// $4.50 / $0.36 per million (developers.cloudflare.com/r2/pricing, read 2026-10-06).
+const CHAT_SESSION_ID = /^[A-Za-z0-9-]{8,100}$/;
+const CHAT_PART_CAP = 1048576; // bytes per part object; past it a new part starts, nothing is dropped
+const CHAT_ANSWER_CLIP = 4000; // characters of each tool answer kept
+const CHAT_ARG_CLIP = 20000; // characters kept per string argument
+const clipStr = (v, n) => (typeof v === "string" && v.length > n ? v.slice(0, n) : v);
+// One JSON line (ending "\n") for a message, or null for what is not recorded
+// (tools/list, ping, notifications). The load_token is never written: it is a
+// credential and the bucket is read back through /chat.
+function chatLine(msg, response, sessionId) {
+  if (!msg || typeof msg !== "object") return null;
+  const ts = new Date().toISOString();
+  if (msg.method === "initialize") {
+    const ci = (msg.params && msg.params.clientInfo) || {};
+    const client = { name: clipStr(typeof ci.name === "string" ? ci.name : null, 100), version: clipStr(typeof ci.version === "string" ? ci.version : null, 100) };
+    return JSON.stringify({ ts, session: sessionId, event: "start", client }) + "\n";
+  }
+  if (msg.method === "tools/call") {
+    const params = msg.params || {};
+    const raw = params.arguments && typeof params.arguments === "object" ? params.arguments : {};
+    const args = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (k === "load_token") continue;
+      args[k] = clipStr(v, CHAT_ARG_CLIP);
+    }
+    const result = response && response.result;
+    const rpcErr = response && response.error;
+    let answer = "";
+    if (rpcErr) answer = String(rpcErr.message || "");
+    else if (result && Array.isArray(result.content)) answer = result.content.filter((c) => c && typeof c.text === "string").map((c) => c.text).join("\n");
+    // A load's answer carries the load_token it minted (JSON escaped inside the text).
+    answer = answer.replace(/(\\?"load_token\\?"\s*:\s*\\?")[^"\\]*/g, "$1[not kept]");
+    return JSON.stringify({
+      ts, session: sessionId, event: "tool", tool: params.name || null,
+      project: args.project || args.domain || null, surface: args.surface || null,
+      args, answer: clipStr(answer, CHAT_ANSWER_CLIP), error: !!((result && result.isError) || rpcErr),
+    }) + "\n";
+  }
+  return null;
+}
+// The bucket has no append, so a line is read, added and written back. Two
+// requests of the same session landing at the same instant can lose one of them
+// (accepted: clients send a session's calls one at a time). A failure here
+// is swallowed: recording never touches the tool answer.
+async function recordChatTurn(env, sessionId, text) {
+  if (!text || !env.TRANSCRIPTS || !env.DB || !sessionId || !CHAT_SESSION_ID.test(sessionId)) return;
+  try {
+    await ensureSchema(env.DB);
+    const row = await env.DB.prepare("SELECT part, size FROM chat_record_parts WHERE session_id = ?").bind(sessionId).first();
+    let part = (row && Number(row.part)) || 0;
+    let size = (row && Number(row.size)) || 0;
+    const add = new TextEncoder().encode(text).byteLength;
+    if (size > 0 && size + add > CHAT_PART_CAP) { part += 1; size = 0; }
+    const key = "chat/" + sessionId + "/" + String(part).padStart(4, "0") + ".jsonl";
+    let prior = "";
+    if (size > 0) {
+      const obj = await env.TRANSCRIPTS.get(key);
+      prior = obj ? await obj.text() : "";
+    }
+    await env.TRANSCRIPTS.put(key, prior + text, { httpMetadata: { contentType: "application/x-ndjson" } });
+    const newSize = new TextEncoder().encode(prior).byteLength + add;
+    await env.DB.prepare("INSERT INTO chat_record_parts (session_id, part, size, updated_at) VALUES (?, ?, ?, datetime('now')) ON CONFLICT(session_id) DO UPDATE SET part = excluded.part, size = excluded.size, updated_at = excluded.updated_at")
+      .bind(sessionId, part, newSize).run();
+  } catch (_) {}
+}
+// GET /chat lists the records, GET /chat/<session>/<nnnn>.jsonl reads one. Read
+// only: nothing outside the worker writes or deletes a record.
+const CHAT_RECORD_ID = /^[A-Za-z0-9-]{8,100}\/\d{4}\.jsonl$/;
+async function chatRoute(request, env, url, path) {
+  if (!env.TRANSCRIPTS) return json({ error: "transcript storage is not set up on this install" }, 501);
+  if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
+  const days = await historyWindowDays(request, url, env);
+  const since = days === null ? 0 : Date.now() - days * 86400000;
+  const inWindow = (o) => days === null || (o.uploaded && new Date(o.uploaded).getTime() >= since);
+  if (path === "/chat") {
+    const items = [];
+    let cursor;
+    do {
+      const page = await env.TRANSCRIPTS.list({ prefix: "chat/", cursor, limit: 1000 });
+      for (const o of page.objects) if (o.key.startsWith("chat/") && inWindow(o)) items.push({ id: o.key.slice(5), size: o.size, uploaded: o.uploaded });
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    items.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded));
+    return json({ ok: true, history_days: days, note: "Session records: the Bouios tool calls the worker saw in chat and Cowork sessions, not the conversation itself.", records: items });
+  }
+  let id = "";
+  try { id = decodeURIComponent(path.slice("/chat/".length)); } catch { return json({ error: "invalid record id" }, 400); }
+  if (!CHAT_RECORD_ID.test(id)) return json({ error: "invalid record id" }, 400);
+  const obj = await env.TRANSCRIPTS.get("chat/" + id);
+  if (!obj) return json({ error: "not found" }, 404);
+  if (!inWindow(obj)) return json({ error: "this record is older than your plan's history period; it is still in your storage" }, 403);
   return new Response(obj.body, { headers: { "content-type": (obj.httpMetadata && obj.httpMetadata.contentType) || "application/x-ndjson" } });
 }
 
@@ -1140,8 +1257,9 @@ const MCP_TOOLS = [
   // in permissions.ask in the owner's settings so Code asks on every call. The gateway cannot see the approval itself, so it keeps
   // what it can: every change needs a stated reason, and the old value is
   // written to the log first, so an edit or a row delete can be undone.
-  // Parity with the gateway (2026-09-30); this worker stores no transcripts,
-  // so a transcript or bundle delete answers that storage is not configured.
+  // Parity with the gateway (2026-09-30); a transcript or bundle delete needs
+  // the optional transcript bucket, and answers that storage is not configured
+  // on an install without one.
   // edit-delete.test.mjs.
   {
     name: "bouios_edit",
@@ -1676,7 +1794,7 @@ async function handleMsg(msg, sessionId, env, request, url) {
   return rpcError(id, -32601, "method not found");
 }
 
-async function handleMcp(request, env) {
+async function handleMcp(request, env, ctx) {
   if (request.method === "DELETE") return new Response(null, { status: 204 });
   if (request.method !== "POST") return new Response(null, { status: 405, headers: { allow: "POST, DELETE" } });
   let body;
@@ -1689,10 +1807,17 @@ async function handleMcp(request, env) {
   // configured, so this costs nothing for the vast majority of deployments.
   const url = new URL(request.url);
   const responses = [];
+  let text = "";
   for (const m of msgs) {
     const r = await handleMsg(m, sessionId, env, request, url);
     if (r) responses.push(r);
+    // Session record (A11): paired with its response; notifications have none.
+    text += chatLine(m, r, sessionId) || "";
   }
+  // After the answer is built, and never part of it: waitUntil when the runtime
+  // gives one, otherwise awaited. Either way the Response below is the same.
+  const job = recordChatTurn(env, sessionId, text);
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(job); else await job;
   const headers = { "content-type": "application/json; charset=utf-8" };
   if (sessionId) headers["Mcp-Session-Id"] = sessionId;
   if (!responses.length) return new Response(null, { status: 202, headers });
@@ -1796,7 +1921,7 @@ async function logRefusal(env, domain, what) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
     // Build identity, mirroring the gateway (2026-09-03). A self-hoster has the
@@ -1808,7 +1933,7 @@ export default {
     if (path.startsWith("/mcp/")) {
       const token = path.slice(5);
       if (!env.BEARER_TOKEN || !token || !timingSafeEqual(token, env.BEARER_TOKEN)) return json({ error: "unauthorised" }, 401);
-      return handleMcp(request, env);
+      return handleMcp(request, env, ctx);
     }
     // NO OAUTH - answer the discovery probes truthfully, same fix as the
     // gateway (b5c76ac). These paths fell through to the bearer check below
@@ -1828,6 +1953,7 @@ export default {
     const m = h.match(/^Bearer\s+(.+)$/i);
     if (!m || !env.BEARER_TOKEN || !timingSafeEqual(m[1], env.BEARER_TOKEN)) return json({ error: "unauthorised" }, 401);
     if (path === "/transcript" || path.startsWith("/transcript/")) return transcriptRoute(request, env, url, path);
-    return json({ error: "not found", routes: ["GET /health", "POST /mcp/{token}", "POST /mcp (after sign-in)", "PUT /transcript/{id}", "GET /transcript", "GET /transcript/{id}"] }, 404);
+    if (path === "/chat" || path.startsWith("/chat/")) return chatRoute(request, env, url, path);
+    return json({ error: "not found", routes: ["GET /health", "POST /mcp/{token}", "POST /mcp (after sign-in)", "PUT /transcript/{id}", "GET /transcript", "GET /transcript/{id}", "GET /chat", "GET /chat/{session}/{part}.jsonl"] }, 404);
   },
 };
