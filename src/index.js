@@ -420,7 +420,8 @@ function lessonsQuery(topic) {
   for (const a of all) termBinds.push(pat(a), pat(a));
   return { sql, binds: (domain) => [...termBinds, domain, ...termBinds, domain] };
 }
-const lessonRow = ({ id, type, title, body, rank }) => ({ id, type, title, body, rank });
+const lessonRow = ({ id, type, title, body, rank, lscore }) =>
+  (lscore > 0 ? { id, type, title, body, rank, matched: true } : { id, type, title, body, rank });
 
 // ROWS MATCHING THIS TOPIC IN ANOTHER PROJECT. Ported from the
 // gateway 2026-09-16, same reason: relevantMemory below is scoped to this project
@@ -600,7 +601,7 @@ async function sessionLoad(domain, surface, env) {
     } : {}),
     // The only rows here that arrive WITH a body - parity with the gateway.
     lessons: (lessons.results || []).map(lessonRow),
-    lessons_note: "lessons carries 12 mistake and pattern rows WITH their bodies, clipped to 700 characters - the ones matching your topic first, then the newest; superseded rows are never included - because these are the rows whose purpose is to stop a repeat and a title alone cannot do that. Read them before diagnosing or building - if one describes what you are about to do, you are about to repeat it. Everything in memory above is titles only by design; use bouios_get for any of those bodies.",
+    lessons_note: "lessons carries 12 mistake and pattern rows WITH their bodies, clipped to 700 characters - the ones matching your topic first (marked matched - read those before anything else; they are the recorded answer to what you named), then the newest; superseded rows are never included - because these are the rows whose purpose is to stop a repeat and a title alone cannot do that. Read them before diagnosing or building - if one describes what you are about to do, you are about to repeat it. Everything in memory above is titles only by design; use bouios_get for any of those bodies.",
   };
   const _lt = await mintLoadToken(env, domain);
   if (_lt) {
@@ -1338,7 +1339,12 @@ function clampMcpLoadSize(out) {
     () => { (out.log || []).forEach((r) => { if (r && r.summary) r.summary = _clip(r.summary, 400); }); },
     // The top 3 matches stay readable until late (parity with the gateway, 2026-09-30).
     () => { (out.relevant || []).forEach((r, i) => { if (i >= 3 && r && r.body) r.body = _clip(r.body, 150); }); },
-    () => { (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 250); }); },
+    // A LESSON MATCHED BY THE TOPIC STAYS READABLE (2026-10-06), same as the
+    // top 3 relevant rows: the first 3 marked `matched` are skipped here and at
+    // the 150 step, and cut only with the relevant top 3 below. Measured live:
+    // the matched answer (row 99) arrived as 176 characters, without the half
+    // naming the symptom, and 3 of 3 runs answered wrong. retrieval-authority LES7.
+    () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (r && r.body) r.body = _clip(r.body, 250); }); },
     () => { delete out.hot_archives; delete out.hot_archives_note; },
     () => { if (Array.isArray(out.log)) out.log = out.log.slice(0, 10); },
     () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 20); },
@@ -1349,8 +1355,8 @@ function clampMcpLoadSize(out) {
         if (c && c.truncated && typeof c.content === "string" && c.content.length > 200) c.content = c.content.slice(0, 120) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)";
       });
     },
-    () => { (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
-    () => { (out.relevant || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
+    () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (r && r.body) r.body = _clip(r.body, 150); }); },
+    () => { (out.relevant || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
     () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 12); },
     // Only then are they clipped, to a visible pointer, before the last resort.
     () => {
