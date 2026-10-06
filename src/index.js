@@ -74,7 +74,9 @@ function json(body, status = 200) {
 async function fetchRules(env) {
   if (!env.GATEWAY_URL) return [];
   try {
-    const r = await fetch(env.GATEWAY_URL + "/rules");
+    // The gateway serves the full rules only to a valid licence (6 Oct 2026); with
+    // none it serves a short neutral set, so this still returns an array.
+    const r = await fetch(env.GATEWAY_URL + "/rules", env.LICENCE ? { headers: { "x-licence": env.LICENCE } } : undefined);
     if (!r.ok) return [];
     const data = await r.json();
     return Array.isArray(data.rules) ? data.rules : [];
