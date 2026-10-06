@@ -568,10 +568,25 @@ async function sessionLoad(domain, surface, env) {
   const openN = countOpenTasks(hotState);
   const openItemList = openItems(hotState, (pending.results || []));
   await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, "Session loaded, surface=" + (surface || "mcp")).run();
+  // THE OWNER'S LATEST INSTRUCTION LEADS THE LOAD (2026-10-06, step 3-4 item 2;
+  // parity with the gateway). Parsed from the context row current-task
+  // ("<ISO ts> | <surface> | <text>"); both fields are omitted when no row
+  // exists, and the row is kept out of the context array so it is not sent twice.
+  const _ctRow = (context.results || []).find((r) => r && r.key === "current-task" && typeof r.content === "string");
+  const _ctParts = _ctRow ? _ctRow.content.split(" | ") : null;
+  const currentTask = _ctParts && _ctParts.length >= 3
+    ? { text: _ctParts.slice(2).join(" | "), saved_at: _ctParts[0], surface: _ctParts[1] }
+    : null;
   const out = {
     // Parity with the gateway: the number in the line a customer reads is the
     // real count of what the record says is unfinished, not a heading match.
     confirmation: confirmationText(domain, rules.length, hotDate, openItemList.length, false),
+    // Immediately after confirmation and never clamped (clampMcpLoadSize's
+    // protected set): the task in hand is read before anything else.
+    ...(currentTask ? {
+      current_task: currentTask,
+      current_task_note: "The owner's latest instruction, verbatim, saved per message. This is the task in hand: answer every part of it before anything else, and re-read it after any compaction or resume.",
+    } : {}),
     domain,
     rules,
     hot: hotState,
@@ -581,7 +596,7 @@ async function sessionLoad(domain, surface, env) {
     // what is outstanding as the owner's is.
     open_items: openItemList,
     open_items_note: "open_items lists what the record itself says is unfinished: real pending rows, bullets under a STILL OPEN heading, a NEXT block, and lines carrying an explicit unfinished marker. It exists because open_tasks counted only one heading format that no working state had used in months, so every load reported 0 while a dozen things were outstanding - and a session told nothing is open leaves things open. Read it before starting new work, and close what you finish.",
-    context: contextWindow(context.results || [], loadTopic),
+    context: contextWindow((context.results || []).filter((r) => !(r && r.key === "current-task")), loadTopic),
     context_note: "context carries the reference material for this project. Rows that bind behaviour (preferences, instructions), rows under 1200 characters, and rows matching the topic you named come back IN FULL. The rest are an excerpt plus their real length, marked excerpt_only - because after the log was capped, context became the largest block in the payload and the size guard's last resort would otherwise have started cutting it. Nothing is hidden: every key is listed with its date, and the full content is one bouios_get({project, keys:[...]}) call away. Fetch the ones your task actually needs, never all of them.",
     memory: [...(pending.results || []), ...(recent.results || [])],
     memory_note: MEMORY_NOTE,
@@ -675,7 +690,10 @@ async function sessionWrite(domain, body, db, tz) {
   // phrasings is a real commitment about what finished means, and a matcher
   // that demanded one exact spelling would just teach sessions the password.
   const DONE_RE = /\bdone when\b|\bclosed when\b|\bcomplete when\b|\bresolved when\b|\bsuccess (is|looks like)\b|\bacceptance\b/i;
-  const CLAIM_RE = /\b(done|fixed|resolved|deployed|shipped|completed?|verified)\b/i;
+  // CLAIM_RE feeds TWO paths (mirrors the gateway): the decision refusal AND the
+  // log "[unevidenced claim]" tag, so widening it widens both. 2026-10-06 (step
+  // 3-4 item 7): "is live" and "does not exist" are claims like "done".
+  const CLAIM_RE = /\b(done|fixed|resolved|deployed|shipped|completed?|verified)\b|\b(?:is|are|now|went)\s+live\b|\b(?:does|do)\s*(?:not|n't)\s+exist\b/i;
   // THE LOWERCASE-"pass" HOLE, closed 2026-09-15 (memory row 2026). \bPASS\b
   // sat inside a case-INSENSITIVE regex, so any body containing the ordinary
   // word "pass" - "the second pass never ran" - counted as evidence and walked
@@ -684,11 +702,26 @@ async function sessionWrite(domain, body, db, tz) {
   // stays case-insensitive, so honest evidence is untouched and only the bare
   // word loses its free ride. hasEvidence() is the single call site for both
   // halves so they cannot drift apart.
-  const EVIDENCE_RE = /\b[0-9a-f]{7,40}\b|https?:\/\/\S+|\btests?\s+(pass|green|passing)\b|\blive[- ]?(verified|checked|tested|confirmed|reproduced)\b|\b(verified|checked|tested|confirmed|reproduced)[- ]?live\b/i;
+  // A commit sha, not any hex-looking word (2026-10-06, step 3-4 item 7). A run of
+  // 7-40 hex characters counts only if it has a digit (rules out "defaced",
+  // "deadbeef", "accede") and either a letter a-f or exactly 7 characters (rules
+  // out dates like 20261006 and epoch numbers; a real 7-char sha is all digits
+  // about 3.7% of the time, so the 7-char all-digit case stays accepted). Shape
+  // only: this worker has no repo access and cannot resolve a sha against git;
+  // that resolution happens in the Code hook layer (the reasoning gate).
+  const SHA_TOKEN_RE = /\b[0-9a-f]{7,40}\b/gi;
+  const hasShaToken = (t) => (String(t).match(SHA_TOKEN_RE) || []).some((x) => /\d/.test(x) && (/[a-f]/i.test(x) || x.length === 7));
+  const EVIDENCE_RE = /https?:\/\/\S+|\btests?\s+(pass|green|passing)\b|\blive[- ]?(verified|checked|tested|confirmed|reproduced)\b|\b(verified|checked|tested|confirmed|reproduced)[- ]?live\b/i;
   const EVIDENCE_PASS_RE = /\bPASS\b/;   // case-SENSITIVE on purpose
-  const hasEvidence = (t) => EVIDENCE_RE.test(t) || EVIDENCE_PASS_RE.test(t);
+  const hasEvidence = (t) => EVIDENCE_RE.test(t) || EVIDENCE_PASS_RE.test(t) || hasShaToken(t);
 
   const applied = [];
+  // Refusals are told to the caller, as the gateway does (2026-10-06, step 3-4
+  // item 7): they used to be a silent `continue`. Reason strings are the
+  // gateway's, verbatim, so parity tests can compare them.
+  const rejected = [];
+  // Rows saved but flagged (chat/cowork claims, step 3-4 item 13).
+  const marked = [];
   // The load-before-write gate's ONLY evidence is a log row matching
   // 'Session loaded%' (domainLoadedRecently). Log summaries are caller-supplied,
   // so without this a caller could write its own precondition and arm the gate
@@ -730,8 +763,12 @@ async function sessionWrite(domain, body, db, tz) {
     for (const m of body.memory) {
       if (!m || !MEMORY_TYPES.includes(m.type) || !m.title || !m.body) continue;
       // Constraint-row gate - mirrors memory-gateway/src/index.js (parity).
-      if (constraintRowError(m)) continue;
-      if (m.type === "decision" && CLAIM_RE.test(m.body) && !hasEvidence(m.body)) continue;
+      const cErr = constraintRowError(m);
+      if (cErr) { rejected.push({ title: m.title, reason: cErr }); continue; }
+      if (m.type === "decision" && CLAIM_RE.test(m.body) && !hasEvidence(m.body)) {
+        rejected.push({ title: m.title, reason: "decision refused (Hard Rule 8): a done/fixed/deployed claim needs a commit sha, url, or test-pass token in the body" });
+        continue;
+      }
       // ONE-READ ABSENCE WRITTEN INTO THE PERMANENT RECORD (2026-09-13, memory
       // row 2019). A session read a KV key once, saw nothing for the depth it
       // was chasing, and stated "no row at all, not even a start row" as fact -
@@ -744,7 +781,10 @@ async function sessionWrite(domain, body, db, tz) {
       // saving. The hook layer catches it in the reply; this catches it on the
       // one path every surface goes through, which is where the damage lasts.
       const STALE_ABSENCE_RE = /(?:\bkv\b|\br2\b|the cache|the store|the bucket)[^.!?]{0,90}?\b(?:no|zero|not a single)\s+(?:rows?|entr(?:y|ies)|records?|values?|keys?)\b|\b(?:no|zero|not a single)\s+(?:rows?|entr(?:y|ies)|records?|values?|keys?)\b[^.!?]{0,90}?(?:\bkv\b|\br2\b|the cache|the store|the bucket)/i;
-      if (m.type === "decision" && STALE_ABSENCE_RE.test(m.body) && !hasEvidence(m.body)) continue;
+      if (m.type === "decision" && STALE_ABSENCE_RE.test(m.body) && !hasEvidence(m.body)) {
+        rejected.push({ title: m.title, reason: "decision refused: an absence in KV/R2 stated from what reads as a single read. Those stores are eventually consistent - re-read before recording it, and cite both reads, or file it as a pattern/mistake row" });
+        continue;
+      }
       // AN OPEN ITEM WITH NO STATED DONE-CONDITION IS MARKED (2026-09-23).
       // Measured that day: 105 open items in the store and not one of them says
       // what finished would look like. That is why they sit - the oldest since
@@ -766,9 +806,22 @@ async function sessionWrite(domain, body, db, tz) {
       // reassigning it - the first cut assigned to m and threw
       // "Assignment to constant variable", turning every memory write into a
       // 500. The negative-space case caught it before it left this machine.
-      const openTitle = m.type === "pending" && !DONE_RE.test(m.body)
+      let openTitle = m.type === "pending" && !DONE_RE.test(m.body)
         ? m.title + " [no done-condition]"
         : m.title;
+      // CHAT/COWORK CLAIMS ARE MARKED, NEVER REFUSED (2026-10-06, step 3-4 item
+      // 13; mirrors the gateway, whose comment carries the measurements). A
+      // refused save is the worst failure on record, so the title carries the
+      // mark and the caller is told in `marked`. An owner quote is the proof of
+      // a decision. The done/fixed decision REFUSAL above is unchanged; pending
+      // and pattern rows and the code surface are untouched.
+      const surf = typeof body.surface === "string" ? body.surface.trim().toLowerCase() : "";
+      if (surf === "chat" || surf === "cowork") {
+        let why = "";
+        if (m.type === "mistake" && CLAIM_RE.test(m.body) && !hasEvidence(m.body)) why = "a mistake row uses a done/fixed/live claim word with no commit sha, url or test-pass token in the body";
+        else if (m.type === "decision" && /\b(decided|agreed|approved)\b/i.test(m.body) && !hasEvidence(m.body) && !/\bOWNER[- ](SAID|RULING|APPROVED|AGREED)\b|\bverbatim\b/i.test(m.body)) why = "a decision row says decided/agreed/approved with no proof and no owner quote in the body";
+        if (why) { openTitle += " [unevidenced claim]"; marked.push({ title: m.title, reason: why }); }
+      }
       batched.push(db.prepare("INSERT INTO memory (domain, type, title, body, created_at) VALUES (?, ?, ?, ?, date('now'))").bind(domain, m.type, openTitle, m.body));
       applied.push("memory:" + m.title);
       for (const supId of findSupersededIds(m.body)) {
@@ -784,6 +837,16 @@ async function sessionWrite(domain, body, db, tz) {
       batched.push(db.prepare("INSERT OR REPLACE INTO context (domain, key, content, updated_at) VALUES (?, ?, ?, date('now'))").bind(domain, c.key, c.content));
       applied.push("context:" + c.key);
     }
+  }
+  // The owner's latest instruction is the current task (2026-10-06, step 3-4
+  // item 2; mirrors the gateway): a context row, key current-task, content
+  // "<ISO ts> | <surface> | <text>", text verbatim capped at 4000. NOT hot, and
+  // no log line. The load serves it first and keeps it out of the context array.
+  if (typeof body.current_task === "string" && body.current_task.trim()) {
+    const ctSurface = (typeof body.surface === "string" ? body.surface.trim().slice(0, 24).replace(/[^A-Za-z0-9_.-]/g, "") : "") || "undeclared";
+    const ctContent = new Date().toISOString() + " | " + ctSurface + " | " + body.current_task.trim().slice(0, 4000);
+    batched.push(db.prepare("INSERT OR REPLACE INTO context (domain, key, content, updated_at) VALUES (?, ?, ?, date('now'))").bind(domain, "current-task", ctContent));
+    applied.push("current_task");
   }
   const logs = Array.isArray(body.log) ? body.log : typeof body.log === "string" ? [body.log] : [];
   for (const s of logs) {
@@ -805,7 +868,7 @@ async function sessionWrite(domain, body, db, tz) {
   // the gateway's compare-and-swap needs its own result.
   if (batched.length) await db.batch(batched);
   const savedAt = new Date();
-  return { ok: true, domain, applied, saved_at: savedAt.toISOString(), confirmation: saveConfirmation(applied, savedAt, tz) };
+  return { ok: true, domain, applied, ...(rejected.length ? { rejected } : {}), ...(marked.length ? { marked } : {}), saved_at: savedAt.toISOString(), confirmation: saveConfirmation(applied, savedAt, tz) };
 }
 
 // SAVE TIME (2026-09-24). A save hands back the moment it was written and a
@@ -1014,6 +1077,7 @@ const MCP_TOOLS = [
         surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch, chatgpt (ChatGPT, any surface), codex (OpenAI Codex). Pass it on every save - it is what makes the log show which surfaces are actually working." },
         load_token: { type: "string", description: "Optional but always pass it: the load_token returned by the bouios_load you are building on, so the save is not refused because the connection was re-established since the load." },
         hot: { type: "string", description: "Full current working state." },
+        current_task: { type: "string", description: "The owner's latest message, verbatim, saved as the current task. Pass it on every save from chat or cowork (Code saves it by hook). It is shown first on every load and after every compaction or resume." },
         memory: {
           type: "array",
           items: {
@@ -1399,7 +1463,7 @@ function clampMcpLoadSize(out) {
   // payload whose core alone exceeds the ceiling still goes out whole rather than
   // gutted - an oversized load is bad, a load missing its pending rows is worse.
   const _PROTECTED = new Set([
-    "confirmation", "domain", "read_order", "pending", "pending_suspect",
+    "confirmation", "current_task", "current_task_note", "domain", "read_order", "pending", "pending_suspect",
     "open_items", "hot", "hot_updated", "load_token", "load_token_note",
   ]);
   let _guard = 0;
