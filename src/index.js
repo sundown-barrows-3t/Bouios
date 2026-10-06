@@ -1257,6 +1257,40 @@ function toolText(id, text, isError) {
   return rpcResult(id, result);
 }
 
+// SKILLS IN YOUR OWN STORE. How many skills a plan loads is a number the gateway
+// returns with the licence check (skills_cap); this file holds no plan logic and
+// only obeys it, like historyWindowDays above. With no licence set, or when the
+// gateway cannot be reached or answers nonsense, no skills field is added and the
+// load is byte-for-byte what it was. Only skill rows already in THIS account's
+// own database are read; nothing is fetched or sent anywhere.
+const SKILL_TOKEN_BUDGET = 8000;
+async function skillsCapFor(request, url, env) {
+  const token = accessTokenFromRequest(request, url, env);
+  if (!token || !env.GATEWAY_URL) return null;
+  try {
+    const r = await fetch(env.GATEWAY_URL + "/licence/verify?licence=" + encodeURIComponent(token), { headers: { "x-licence": token } });
+    if (!r.ok) return null;
+    const v = await r.json();
+    if (v && v.skills_cap === "unlimited") return Infinity;
+    return v && Number.isInteger(v.skills_cap) && v.skills_cap > 0 ? v.skills_cap : null;
+  } catch {
+    return null;
+  }
+}
+async function ownSkills(db, domain, cap) {
+  const rows = await db.prepare("SELECT title, body FROM memory WHERE type = 'pattern' AND title LIKE 'skill-%' AND (domain = ? OR domain = 'GLOBAL') ORDER BY id").bind(domain).all();
+  const skills = [];
+  let tokens = 0;
+  for (const r of rows.results || []) {
+    if (skills.length >= cap) break;
+    const est = Math.ceil(String(r.body || "").length / 4);
+    if (tokens + est > SKILL_TOKEN_BUDGET && skills.length > 0) break;
+    skills.push({ name: String(r.title).slice(6), est_tokens: est, body: r.body });
+    tokens += est;
+  }
+  return { cap: cap === Infinity ? "unlimited" : cap, token_budget: SKILL_TOKEN_BUDGET, est_tokens: tokens, count: skills.length, skills };
+}
+
 async function handleMsg(msg, sessionId, env, request, url) {
   const id = msg && msg.id !== undefined ? msg.id : null;
   const method = msg && msg.method;
@@ -1279,7 +1313,13 @@ async function handleMsg(msg, sessionId, env, request, url) {
     try {
       if (name === "bouios_load") {
         const surface = (args.surface || "mcp") + " session=" + (sessionId || "none");
-        return toolText(id, JSON.stringify(clampMcpLoadSize(await sessionLoad(domain, surface, env))));
+        const loaded = await sessionLoad(domain, surface, env);
+        // A skill that cannot be read never takes the load down with it.
+        try {
+          const cap = await skillsCapFor(request, url, env);
+          if (cap !== null) loaded.skills = await ownSkills(env.DB, domain, cap);
+        } catch (_) { /* no skills field, load unchanged */ }
+        return toolText(id, JSON.stringify(clampMcpLoadSize(loaded)));
       }
       if (name === "bouios_save") {
         // Bearer auth (the /mcp/{token} gate this call already passed) proves
