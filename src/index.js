@@ -1206,6 +1206,10 @@ async function instructionsFor(env, token) {
 const MCP_TOOLS = [
   {
     name: "bouios_load",
+    // A load can pass Claude Code's 50,000-character MCP result cap; declaring
+    // a limit (max 500,000) stops the client reporting it as an error.
+    // Mirrors memory-gateway/src. 2026-10-07; mcp-result-limit.test.mjs.
+    _meta: { "anthropic/maxResultSizeChars": 200000 },
     description:
       "CALL THIS FIRST, before your first reply in every chat - even a greeting or a one-line question. " +
       "Load memory for a project (rules, working state, context, patterns). " +
@@ -1271,6 +1275,7 @@ const MCP_TOOLS = [
     // the user's data, so the hint stays: without it ChatGPT asks before every
     // fetch, and fetching is the thing that already happens too rarely.
     annotations: { readOnlyHint: true },
+    _meta: { "anthropic/maxResultSizeChars": 200000 },
     description:
       "Fetch the FULL body of one or more specific memory rows by id. bouios_load returns titles only " +
       "(id, type, title - no body) to keep the load small; call this to read a specific row's full content " +
