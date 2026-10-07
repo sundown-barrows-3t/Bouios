@@ -864,6 +864,7 @@ async function sessionWrite(domain, body, db, tz) {
   const rejected = [];
   // Rows saved but flagged (chat/cowork claims, step 3-4 item 13).
   const marked = [];
+  const wasteMissing = [];
   // The load-before-write gate's ONLY evidence is a log row matching
   // 'Session loaded%' (domainLoadedRecently). Log summaries are caller-supplied,
   // so without this a caller could write its own precondition and arm the gate
@@ -964,6 +965,12 @@ async function sessionWrite(domain, body, db, tz) {
         else if (m.type === "decision" && /\b(decided|agreed|approved)\b/i.test(m.body) && !hasEvidence(m.body) && !/\bOWNER[- ](SAID|RULING|APPROVED|AGREED)\b|\bverbatim\b/i.test(m.body)) why = "a decision row says decided/agreed/approved with no proof and no owner quote in the body";
         if (why) { openTitle += " [unevidenced claim]"; marked.push({ title: m.title, reason: why }); }
       }
+      // EVERY MISTAKE RECORDS ITS WASTE (owner ruling 2026-10-07: "log the error
+      // and from now on log the waste as well"). A mistake row with no WASTE
+      // line is saved unchanged and the answer names it in waste_missing, on
+      // every surface - a note, never a refusal (gate freeze 2571; a refused
+      // save is the worst failure on record). step34-claims.test.mjs S9.
+      if (m.type === "mistake" && !/\bWASTE\b/.test(m.body)) wasteMissing.push(m.title);
       batched.push(db.prepare("INSERT INTO memory (domain, type, title, body, created_at) VALUES (?, ?, ?, ?, date('now'))").bind(domain, m.type, openTitle, m.body));
       applied.push("memory:" + m.title);
       for (const supId of findSupersededIds(m.body)) {
@@ -1010,7 +1017,7 @@ async function sessionWrite(domain, body, db, tz) {
   // the gateway's compare-and-swap needs its own result.
   if (batched.length) await db.batch(batched);
   const savedAt = new Date();
-  return { ok: true, domain, applied, ...(rejected.length ? { rejected } : {}), ...(marked.length ? { marked } : {}), saved_at: savedAt.toISOString(), confirmation: saveConfirmation(applied, savedAt, tz) };
+  return { ok: true, domain, applied, ...(rejected.length ? { rejected } : {}), ...(marked.length ? { marked } : {}), ...(wasteMissing.length ? { waste_missing: wasteMissing, waste_note: "Each mistake row needs a WASTE line: time, tokens or cost, cycles repeated and owner turns lost, each with its source (owner ruling 2026-10-07). Add it with bouios_edit." } : {}), saved_at: savedAt.toISOString(), confirmation: saveConfirmation(applied, savedAt, tz) };
 }
 
 // SAVE TIME (2026-09-24). A save hands back the moment it was written and a
