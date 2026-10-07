@@ -78,12 +78,13 @@ function json(body, status = 200) {
   });
 }
 
-async function fetchRules(env) {
+// The licence goes in a header, never in the URL, so it stays out of logs. With
+// no licence the service answers with its small free set (no switch), which
+// still works.
+async function fetchRules(env, token) {
   if (!env.GATEWAY_URL) return [];
   try {
-    // The gateway serves the full rules only to a valid licence (6 Oct 2026); with
-    // none it serves a short neutral set, so this still returns an array.
-    const r = await fetch(env.GATEWAY_URL + "/rules", env.LICENCE ? { headers: { "x-licence": env.LICENCE } } : undefined);
+    const r = await fetch(env.GATEWAY_URL + "/rules", { headers: token ? { "x-licence": token } : {} });
     if (!r.ok) return [];
     const data = await r.json();
     return Array.isArray(data.rules) ? data.rules : [];
@@ -578,7 +579,7 @@ async function relevantMemory(db, domain, topic, excludeIds) {
   return (rows.results || []).slice(0, 8);
 }
 
-async function sessionLoad(domain, surface, env) {
+async function sessionLoad(domain, surface, env, token) {
   const db = env.DB;
   await ensureSchema(db);
   let loadTopic = "";
@@ -588,7 +589,7 @@ async function sessionLoad(domain, surface, env) {
   }
   const lq = lessonsQuery(loadTopic);
   const [rules, hot, context, pending, recent, lessons, memTotal] = await Promise.all([
-    fetchRules(env),
+    fetchRules(env, token),
     db.prepare("SELECT state, updated_at FROM hot WHERE domain = ?").bind(domain).all(),
     db.prepare("SELECT key, content FROM context WHERE domain = ?").bind(domain).all(),
     // Memory rows load as TITLES ONLY (id, type, title - no body) to keep the
@@ -1071,7 +1072,7 @@ async function mcpLoad(domain, args, sessionId, env, request, url) {
   // 2026-10-06 the worker never read args.topic and its schema had no
   // topic, so a customer load could not search by one at all.
   const surface = (args.surface || "mcp") + " session=" + (sessionId || "none") + (typeof args.topic === "string" && args.topic.trim() ? " topic=" + encodeURIComponent(args.topic.trim().slice(0, 160)) : "");
-  const loaded = await sessionLoad(domain, surface, env);
+  const loaded = await sessionLoad(domain, surface, env, accessTokenFromRequest(request, url, env));
   // A skill that cannot be read never takes the load down with it.
   try {
     const cap = await skillsCapFor(request, url, env);
