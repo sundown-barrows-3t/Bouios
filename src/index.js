@@ -48,6 +48,9 @@ const SCHEMA = [
   // which part object is being filled and how many bytes it holds, so adding a
   // line does not have to list the bucket. See recordChatTurn.
   "CREATE TABLE IF NOT EXISTS chat_record_parts (session_id TEXT PRIMARY KEY, part INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, updated_at TEXT)",
+  // The last rules and instructions our service sent this licensed install
+  // (2026-10-07), so our service being unreachable cannot strip it. See rememberLicensed.
+  "CREATE TABLE IF NOT EXISTS licensed_text_cache (kind TEXT PRIMARY KEY, body TEXT NOT NULL, at INTEGER NOT NULL)",
 ];
 let schemaReady = false;
 async function ensureSchema(db) {
@@ -78,19 +81,78 @@ function json(body, status = 200) {
   });
 }
 
+// LAST KNOWN GOOD (owner, 2026-10-07: "If you lock make sure we don't get locked
+// out on error"). The paid rules and instructions come from our service, so an
+// outage there would drop a paying install to nothing or to the short fallback.
+// Each time our service answers this install as licensed, the text is kept in
+// this install's own database (table licensed_text_cache); when a later fetch
+// FAILS, that same text is served again for up to 30 days. The store holds only
+// text this licensed install was already sent, never anything newly fetched for
+// someone else. An answer that says "not licensed" is a real answer, not a
+// failure: it is served as sent and the stored text is not used.
+const LAST_GOOD_MAX_AGE_MS = 30 * 86400000;
+const LAST_GOOD_REWRITE_MS = 24 * 3600000;
+// What was last stored, read once per database per isolate so a load does not
+// cost a read: Map(kind -> { body, at }).
+const licensedSeen = new WeakMap();
+async function rememberLicensed(env, kind, body) {
+  if (!env.DB) return;
+  try {
+    await ensureSchema(env.DB);
+    let seen = licensedSeen.get(env.DB);
+    if (!seen) { seen = new Map(); licensedSeen.set(env.DB, seen); }
+    let last = seen.get(kind);
+    if (!last) {
+      const row = await env.DB.prepare("SELECT body, at FROM licensed_text_cache WHERE kind = ?").bind(kind).first();
+      last = row ? { body: row.body, at: Number(row.at) } : { body: null, at: 0 };
+      seen.set(kind, last);
+    }
+    const now = Date.now();
+    if (last.body === body && now - last.at < LAST_GOOD_REWRITE_MS) return;
+    await env.DB.prepare("INSERT INTO licensed_text_cache (kind, body, at) VALUES (?, ?, ?) ON CONFLICT(kind) DO UPDATE SET body = excluded.body, at = excluded.at").bind(kind, body, now).run();
+    seen.set(kind, { body, at: now });
+  } catch {
+    // keeping a copy must never break a load
+  }
+}
+async function lastLicensed(env, kind) {
+  if (!env.DB) return null;
+  try {
+    await ensureSchema(env.DB);
+    const row = await env.DB.prepare("SELECT body, at FROM licensed_text_cache WHERE kind = ?").bind(kind).first();
+    if (row && typeof row.body === "string" && Date.now() - Number(row.at) < LAST_GOOD_MAX_AGE_MS) return row.body;
+  } catch {
+    // no stored copy
+  }
+  return null;
+}
+
 // The licence goes in a header, never in the URL, so it stays out of logs. With
 // no licence the service answers with its small free set (no switch), which
-// still works.
+// still works. If the service cannot be reached or answers badly, an install
+// with a licence is served the last text it was sent as licensed (see above);
+// with no licence, or nothing stored, the answer is no rules as before.
 async function fetchRules(env, token) {
   if (!env.GATEWAY_URL) return [];
   try {
     const r = await fetch(env.GATEWAY_URL + "/rules", { headers: token ? { "x-licence": token } : {} });
-    if (!r.ok) return [];
-    const data = await r.json();
-    return Array.isArray(data.rules) ? data.rules : [];
+    if (r.ok) {
+      const data = await r.json();
+      if (data && Array.isArray(data.rules)) {
+        if (data.licensed === true) await rememberLicensed(env, "rules", JSON.stringify(data.rules));
+        return data.rules;
+      }
+    }
   } catch {
-    return [];
+    // fall through to the last known good
   }
+  if (token) {
+    const stored = await lastLicensed(env, "rules");
+    if (stored) {
+      try { const rules = JSON.parse(stored); if (Array.isArray(rules)) return rules; } catch { /* unusable copy */ }
+    }
+  }
+  return [];
 }
 
 // ---- Self-host access check (2026-08-30) -----------------------------------
@@ -1099,28 +1161,40 @@ const MCP_PROTOCOL = "2025-03-26";
 const FALLBACK_INSTRUCTIONS = "This connector is Bouios, the user's own memory system. Bouios is loaded at the start of every conversation: before replying, call bouios_load with the one project the topic implies, and show the user only the confirmation line it returns. 'load memory', 'load rules' and 'load Bouios' each mean load now. Memory loads return titles only; call bouios_get for the full body of a row you need. Save with bouios_save, passing the load_token from the load, every few steps and before any long step. Near the end of the conversation call bouios_handoff and show its block to paste into a new chat. Never ask the user for a token, key or credential. If memory cannot be reached, say so once and carry on without it - do not stall; it reconnects.";
 
 // Served from the gateway per licence and kept for ten minutes per token, so a
-// reconnect loop costs one fetch. Any failure serves the fallback and is never
-// cached, so the next initialize tries again.
+// reconnect loop costs one fetch. A failed fetch is never cached for the full
+// ten minutes: it serves the last text this licensed install was sent (see
+// LAST_GOOD_MAX_AGE_MS), held for 60 seconds so recovery is quick, or else the
+// fallback, which is not cached, so the next initialize tries again.
 const INSTRUCTIONS_TTL_MS = 10 * 60 * 1000;
+const INSTRUCTIONS_STALE_TTL_MS = 60 * 1000;
 const instructionsCache = new Map();
 async function instructionsFor(env, token) {
   if (!env.GATEWAY_URL) return FALLBACK_INSTRUCTIONS;
   const key = token || "";
   const hit = instructionsCache.get(key);
-  if (hit && Date.now() - hit.at < INSTRUCTIONS_TTL_MS) return hit.text;
+  if (hit && Date.now() - hit.at < (hit.ttl || INSTRUCTIONS_TTL_MS)) return hit.text;
   try {
     const r = await fetch(env.GATEWAY_URL + "/instructions", {
       headers: token ? { "x-licence": token } : {},
       signal: AbortSignal.timeout(3000),
     });
-    if (!r.ok) return FALLBACK_INSTRUCTIONS;
-    const data = await r.json();
-    if (data && typeof data.instructions === "string" && data.instructions.length > 0) {
-      instructionsCache.set(key, { text: data.instructions, at: Date.now() });
-      return data.instructions;
+    if (r.ok) {
+      const data = await r.json();
+      if (data && typeof data.instructions === "string" && data.instructions.length > 0) {
+        if (data.licensed === true) await rememberLicensed(env, "instructions", data.instructions);
+        instructionsCache.set(key, { text: data.instructions, at: Date.now() });
+        return data.instructions;
+      }
     }
   } catch {
-    // fall through to the fallback
+    // fall through to the last known good
+  }
+  if (token) {
+    const stored = await lastLicensed(env, "instructions");
+    if (stored) {
+      instructionsCache.set(key, { text: stored, at: Date.now(), ttl: INSTRUCTIONS_STALE_TTL_MS });
+      return stored;
+    }
   }
   return FALLBACK_INSTRUCTIONS;
 }
