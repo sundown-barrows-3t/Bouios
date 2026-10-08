@@ -1598,17 +1598,30 @@ function clampMcpLoadSize(out) {
   // above.
   const _clip = (s, n) => (typeof s === "string" && s.length > n ? s.slice(0, n) + "...(truncated, size guard)" : s);
   const _fits = () => JSON.stringify(out).length <= MCP_LOAD_SIZE_CEILING;
+  // A ROW THAT HOLDS THE OWNER'S OWN WORDS IS NEVER CUT (2026-10-08, owner: "stop
+  // changing what i say"). Rule 2673 arrived as a 150-character stub, a session
+  // read its title as the owner's ban, and told him he had a rule he never made.
+  // The search already caps a body (lessons 700, relevant 400); this keeps the
+  // guard from cutting it again. The generic halving loop below is the backstop
+  // if such rows alone exceed the ceiling.
+  const _own = (r) => !!r && (/OWNER-SAID/.test(String(r.body || "").slice(0, 300)) || /^(OWNER|RULE-|STANDING)/i.test(String(r.title || "")));
+  // A ROW IS NEVER SENT AS PARTIAL TEXT (owner 2026-10-08: "why is it truncating
+  // rows - that's not ok"). A cut body reads as complete and carries no way back:
+  // the old marker named no id, so a session could not even ask for the rest.
+  // Over the ceiling a row keeps its id, type and title and its body becomes a
+  // pointer to bouios_get, the same titles-and-ids discipline as the memory list.
+  const _ptr = (r) => { if (r && typeof r.body === "string" && r.body.length) { r.body_omitted = true; r.body = r.id != null ? "(body not sent, size guard: bouios_get ids [" + r.id + "] returns it whole)" : "(body not sent, size guard)"; } };
   const _steps = [
     () => { delete out.recent_transcripts; },
     () => { (out.log || []).forEach((r) => { if (r && r.summary) r.summary = _clip(r.summary, 400); }); },
     // The top 3 matches stay readable until late (parity with the gateway, 2026-09-30).
-    () => { (out.relevant || []).forEach((r, i) => { if (i >= 3 && r && r.body) r.body = _clip(r.body, 150); }); },
+    () => { (out.relevant || []).forEach((r, i) => { if (i >= 3 && !_own(r)) _ptr(r); }); },
     // A LESSON MATCHED BY THE TOPIC STAYS READABLE (2026-10-06), same as the
     // top 3 relevant rows: the first 3 marked `matched` are skipped here and at
     // the 150 step, and cut only with the relevant top 3 below. Measured live:
     // the matched answer (row 99) arrived as 176 characters, without the half
     // naming the symptom, and 3 of 3 runs answered wrong. retrieval-authority LES7.
-    () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (r && r.body) r.body = _clip(r.body, 250); }); },
+    () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (_own(r)) return; _ptr(r); }); },
     () => { delete out.hot_archives; delete out.hot_archives_note; },
     () => { if (Array.isArray(out.log)) out.log = out.log.slice(0, 10); },
     () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 20); },
@@ -1619,7 +1632,7 @@ function clampMcpLoadSize(out) {
         if (c && c.truncated && typeof c.content === "string" && c.content.length > 200) c.content = c.content.slice(0, 120) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)";
       });
     },
-    () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (r && r.body) r.body = _clip(r.body, 150); }); },
+    () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (_own(r)) return; _ptr(r); }); },
     () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 12); },
     // Only then is the handoff clipped, to a visible pointer, before the last resort.
     () => {
@@ -1635,7 +1648,7 @@ function clampMcpLoadSize(out) {
     // the top 3 relevant rows and the matched lessons arrived as 176-character
     // stubs while the finished load sat 3.7KB under the ceiling. They are what
     // the session asked for; everything above pays first.
-    () => { (out.relevant || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); (out.lessons || []).forEach((r) => { if (r && r.body) r.body = _clip(r.body, 150); }); },
+    () => { (out.relevant || []).forEach((r) => { _ptr(r); }); (out.lessons || []).forEach((r) => { _ptr(r); }); },
   ];
   for (const step of _steps) {
     if (_fits()) return out;
