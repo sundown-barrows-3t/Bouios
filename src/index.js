@@ -1152,10 +1152,22 @@ async function mcpLoad(domain, args, sessionId, env, request, url) {
 
 // Puts the preface, the load's confirmation line and its payload ahead of the
 // tool's own result, in the same text block the model reads.
+//
+// SMALL BY DESIGN (2026-10-08, defect 3504): the load still runs here, because
+// it writes the record the write gate reads, but only the arming fields ride
+// back, about 1K. The model calls bouios_load with a topic for the full set.
+function slimAutoLoad(loaded) {
+  const slim = { confirmation: loaded.confirmation, load_token: loaded.load_token };
+  if (loaded.current_task) slim.current_task = loaded.current_task;
+  slim.pending_count = Array.isArray(loaded.pending) ? loaded.pending.length : 0;
+  slim.note = "Session armed only. Call bouios_load with a topic for rules, pending, log and context.";
+  return slim;
+}
+
 function prefaceAutoLoad(res, loaded) {
   const block = res && res.result && Array.isArray(res.result.content) ? res.result.content[0] : null;
   if (!block || typeof block.text !== "string") return res;
-  block.text = AUTO_LOAD_PREFACE + "\n" + (loaded.confirmation || "") + "\n" + JSON.stringify(loaded) + "\n\n" + block.text;
+  block.text = AUTO_LOAD_PREFACE + "\n" + (loaded.confirmation || "") + "\n" + JSON.stringify(slimAutoLoad(loaded)) + "\n\n" + block.text;
   return res;
 }
 
