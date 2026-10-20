@@ -589,9 +589,9 @@ function lessonsQuery(topic) {
   const rel = all.length ? "(" + score + ")" : "0";
   const sql =
     "SELECT id, type, title, body, rank, lscore FROM (" +
-      "SELECT id, type, title, substr(body,1,700) AS body, 0 AS rank, " + rel + " AS lscore, " + AUTHORITY + " AS auth FROM memory " +
+      "SELECT id, type, title, substr(body,1,500) AS body, 0 AS rank, " + rel + " AS lscore, " + AUTHORITY + " AS auth FROM memory " +
         "WHERE (domain = ? OR domain = 'GLOBAL') AND type IN ('mistake','pattern') AND " + NOT_SUPERSEDED + " " +
-        "ORDER BY lscore DESC, CASE WHEN lscore > 0 THEN auth ELSE 0 END, id DESC LIMIT 12" +
+        "ORDER BY lscore DESC, CASE WHEN lscore > 0 THEN auth ELSE 0 END, id DESC LIMIT 8" +
     ")";
   const termBinds = [];
   for (const a of all) termBinds.push(pat(a), pat(a));
@@ -659,7 +659,9 @@ async function sessionLoad(domain, surface, env, token) {
     // Must match the gateway (memory-gateway/src/index.js) - locked by the
     // gateway<->worker tool-parity test.
     db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type = 'pending' AND " + NOT_SUPERSEDED + " ORDER BY id").bind(domain).all(),
-    db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND " + NOT_SUPERSEDED + " ORDER BY id DESC LIMIT 40").bind(domain).all(),
+    // 15 newest non-pending titles, was 40 (2026-10-20, owner 3498/3512: titles first,
+    // expand on demand). Same cut as the gateway; worker-gateway-parity pins both.
+    db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND " + NOT_SUPERSEDED + " ORDER BY id DESC LIMIT 15").bind(domain).all(),
     // LESSONS - parity with the gateway (2026-09-05). 12 mistake and pattern
     // rows (the ones matching the topic first, then the newest) arrive WITH
     // their bodies, because those rows exist for one
@@ -758,7 +760,7 @@ async function sessionLoad(domain, surface, env, token) {
     } : {}),
     // The only rows here that arrive WITH a body - parity with the gateway.
     lessons: (lessons.results || []).map(lessonRow),
-    lessons_note: "lessons carries 12 mistake and pattern rows WITH their bodies, clipped to 700 characters - the ones matching your topic first (marked matched - read those before anything else; they are the recorded answer to what you named), then the newest; superseded rows are never included - because these are the rows whose purpose is to stop a repeat and a title alone cannot do that. Read them before diagnosing or building - if one describes what you are about to do, you are about to repeat it. Everything in memory above is titles only by design; use bouios_get for any of those bodies.",
+    lessons_note: "lessons carries 8 mistake and pattern rows WITH their bodies, clipped to 500 characters - the ones matching your topic first (marked matched - read those before anything else; they are the recorded answer to what you named), then the newest; superseded rows are never included - because these are the rows whose purpose is to stop a repeat and a title alone cannot do that. Read them before diagnosing or building - if one describes what you are about to do, you are about to repeat it. Everything in memory above is titles only by design; use bouios_get for any of those bodies.",
   };
   const _lt = await mintLoadToken(env, domain);
   if (_lt) {
