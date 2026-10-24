@@ -1402,6 +1402,984 @@ const MCP_TOOLS = [
 ];
 
 // Layer settings: b over a, one level deep for text/file/add (same rule as the service).
+// >>> NO-MARKS-LOCAL BEGIN: generated from memory-gateway/src/no-marks-core.js by memory-gateway/generate-worker-nomarks.mjs - do not edit by hand <<<
+const NM = (() => {
+// no-marks.js - the no-marks scanner and cleaner (pending 3043, owner checklist v4).
+//
+// WHY. Owner ruling 3037 (30 Sep): no labels, watermarks or text marks in code
+// or text. That covers tool attribution lines in commits, invisible characters,
+// look-alike letters, trailing-whitespace encodings, generator tags, provenance
+// references, and internal identifiers leaking into anything published. This
+// module is the ONE scanner the gateway, the hooks and the repo check share, so
+// every layer judges text by the same rules (v4 decision (1): one JS module).
+//
+// CONSTRAINTS. Pure ESM with no node: imports, so the Worker bundle and plain
+// `node` both import it. scanText and scanFile REPORT; cleanText returns fixed text
+// and never edits homoglyphs or leaks (those stay for review / block). Every finding
+// carries the rule id, 1-based line and column (in code points) and the code
+// point where one applies, so a caller can show exactly where the mark sits.
+//
+// NEGATIVE SPACE. The same code points have ordinary uses: ZWJ inside emoji,
+// VS16 after emoji, tag characters inside subdivision flags, ZWNJ in Persian
+// and Indic text, a BOM at the start of a file, a single ideographic variation
+// selector after a Han character, whole Greek or Cyrillic words, markdown's
+// two-space line break. Each is allowed in context and locked by
+// memory-gateway/test/no-marks-scanner.test.mjs. A scanner that flags ordinary
+// writing gets switched off and then protects nothing.
+//
+// Visible marks count too (owner, 30 Sep): dashes, curly quotes, ellipses,
+// box-drawing rules, and leftovers from AI tools. Images are not read here.
+//
+// CEILING, stated plainly: this reads characters and patterns. A statistical
+// watermark carried by word choice is invisible to it and is out of scope.
+
+// Who the feature is for (owner, 30 Sep: "only include in owner and highest
+// tier"). The owner's own licence object in the gateway is tier "free" with
+// sub "owner" (memory-gateway/src/index.js, ownerLicence), so a bare tier test
+// would lock the owner out; customer licences with sub "owner" are refused at
+// issue and verify, so sub cannot be forged into this. Trial licences are tier
+// "max" and so are included - an open owner question, see the pending row.
+function isEntitled(l) {
+  if (!l || typeof l !== "object") return false;
+  if (l.sub === "owner") return true;
+  return l.valid === true && l.tier === "max";
+}
+
+// What the feature does, in the words a user sees. Plain ASCII, no internal
+// names (CLAUDE.md Public/Private boundary), and no promise it cannot keep: it
+// finds characters and patterns, it does not touch statistical watermarks.
+const VALUE =
+  "Clean publishing. Before anything you write with an AI assistant goes out - " +
+  "a commit, a web page, a document - Bouios checks it for what you did not mean " +
+  "to publish: tool attribution lines, invisible characters that can hide or " +
+  "reorder text, look-alike letters, typographic marks such as long dashes and " +
+  "curly quotes, leftovers from AI tools such as tracking links and citation " +
+  "tokens, provenance links, and private details such " +
+  "as keys, internal addresses and file paths. Each one is reported by line and " +
+  "column, so what you publish says only what you wrote. Included with Max Herder.";
+
+// One entry per rule. Ids are what findings carry and what tests assert on.
+const RULES = [
+  { id: "attribution-line", what: "a tool attribution line (co-author trailer, session trailer, generated-with footer)" },
+  { id: "tool-author", what: "a commit author or email that names an AI tool" },
+  { id: "hidden-char", what: "an invisible or format character outside its legitimate context" },
+  { id: "c2pa-text", what: "a C2PA text manifest carried in variation selectors" },
+  { id: "homoglyph", what: "a Latin word containing a look-alike Cyrillic or Greek letter" },
+  { id: "trailing-whitespace", what: "trailing whitespace that can encode data (tabs, or more than two spaces)" },
+  { id: "generator-tag", what: "an HTML generator tag naming an AI tool" },
+  { id: "provenance-ref", what: "a provenance reference (c2pa-manifest link, .c2pa file, dcterms:provenance)" },
+  { id: "leak", what: "a secret, internal host, internal path or denylisted identifier" },
+  { id: "unusual-space", what: "a non-breaking, thin, wide or ideographic space, or a Unicode line/paragraph separator (checklist B: converted)" },
+  { id: "typography", what: "a visible typographic mark: em or en dash, curly quote, ellipsis, box-drawing rule (off with typography:false)" },
+  { id: "ai-artefact", what: "a leftover from an AI tool: tracking parameter, citation token, assistant phrase, markdown bold inside HTML" },
+  { id: "jsonld-tool", what: "an AI tool named as author, creator, publisher or similar in JSON-LD structured data" },
+  { id: "style-word", what: "a word typical of machine-written prose (opt-in with styleWords:true, never on by default)" },
+];
+
+// ---------------------------------------------------------------- helpers
+// A tool's own name as the WHOLE name (optionally with a model or product word
+// and a version), so a human called Claude Monet or Devin Smith is not a tool.
+const TOOL_NAME = /^\s*(?:claude|anthropic|codex|openai|chatgpt|gpt-?[\d.o]+|github copilot|copilot|cursor|gemini|devin|aider|windsurf|grok|llama|opus|sonnet|haiku|fable)(?:\s+(?:opus|sonnet|haiku|fable|code|agent|assistant|pro|max|mini|turbo|[\d][\w.-]*))*\s*$/i;
+// A tool's name standing alone at the end of a "generated with" phrase or in a
+// generator tag: followed by end, a bracket, a paren or punctuation - so
+// "generated with cursor position tracking" and "Gemini CMS" are ordinary.
+const TOOL_TAIL = /^\s*\[?\s*(?:claude(?: code)?|chatgpt|codex|github copilot|copilot|cursor|gemini|grok|v0(?:\.dev)?|openai|anthropic)\s*[\d.]*\s*(?:\]|\(|[.!,;:]|$)/i;
+const TOOL_EMAIL = /@(?:anthropic\.com|openai\.com|cursor\.com|cursor\.sh)\s*>?\s*$|copilot@users\.noreply\.github\.com/i;
+const TOOL_AUTHOR_NAME = /^(?:claude|codex|copilot|cursor(?:\s?agent)?|chatgpt|devin|gemini|aider)\b|copilot[\w-]*\[bot\]/i;
+
+const isEmojiBase = (ch) => /\p{Emoji}/u.test(ch) && !/[0-9#*]/.test(ch) || /\p{Extended_Pictographic}/u.test(ch);
+const isKeycapBase = (ch) => /^[0-9#*]$/.test(ch);
+const isPictographic = (ch) => /\p{Extended_Pictographic}/u.test(ch);
+const isSkinTone = (cp) => cp >= 0x1F3FB && cp <= 0x1F3FF;
+const isVS = (cp) => (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xE0100 && cp <= 0xE01EF);
+const isTag = (cp) => cp >= 0xE0020 && cp <= 0xE007F;
+// Letters of scripts that use ZWJ/ZWNJ as part of ordinary spelling (Arabic,
+// Persian, Indic, Sinhala ...): any letter or mark that is not Latin, Greek or
+// Cyrillic, which do not.
+const isJoiningScriptChar = (ch) => ch !== undefined && /[\p{L}\p{M}]/u.test(ch) && !/[\p{Script=Latin}\p{Script=Greek}\p{Script=Cyrillic}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(ch);
+// After a virama or other combining mark in a joining script, ZWJ/ZWNJ may end
+// the word (Devanagari half forms, Malayalam chillu): no letter need follow.
+const isJoiningMark = (ch) => ch !== undefined && /\p{M}/u.test(ch) && isJoiningScriptChar(ch);
+const RTL = /[\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Syriac}\p{Script=Thaana}]/u;
+// Controls other than tab, LF, CR; C1 controls; private use; unassigned tag block.
+const isControlOrPrivate = (cp) => (cp < 0x20 && cp !== 9 && cp !== 10 && cp !== 13) || (cp >= 0x7F && cp <= 0x9F) || (cp >= 0xE000 && cp <= 0xF8FF) || (cp >= 0xF0000 && cp <= 0x10FFFF) || (cp >= 0xE0000 && cp <= 0xE001F) || (cp >= 0xE0080 && cp <= 0xE00FF) || (cp >= 0xE01F0 && cp <= 0xE0FFF);
+// The only subdivision flags in the emoji standard: England, Scotland, Wales.
+const RGI_FLAG_TAGS = new Set(["gbeng", "gbsct", "gbwls"]);
+const isHan = (ch) => ch !== undefined && /\p{Script=Han}/u.test(ch);
+
+// Always-invisible format characters with no ordinary use in published text.
+const ALWAYS_HIDDEN = new Set([
+  0x00AD, 0x034F, 0x115F, 0x1160, 0x180E, 0x200B, 0x2800,
+  0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064,
+  0x2066, 0x2067, 0x2068, 0x2069, 0x206A, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F,
+  0x3164, 0xFFA0, 0xFFF9, 0xFFFA, 0xFFFB, 0xE0001,
+]);
+
+const hex = (cp) => "U+" + cp.toString(16).toUpperCase().padStart(4, "0");
+
+// Map a UTF-16 index to 1-based line and code-point column. Linear setup and
+// O(log n) per lookup: line starts and high-surrogate positions are indexed once.
+// (It counted code points from the line start per finding, which made one long
+// line of marks quadratic - 80k em dashes took 67 s; checker round 5, 30 Sep.)
+function locator(text) {
+  const starts = [0], astral = [];
+  for (let i = 0; i < text.length; i++) { const c = text.charCodeAt(i); if (c === 10) starts.push(i + 1); else if (c >= 0xD800 && c <= 0xDBFF) astral.push(i); }
+  const below = (arr, x) => { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] < x) lo = m + 1; else hi = m; } return lo; };
+  return (idx) => {
+    let lo = 0, hi = starts.length - 1;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (starts[mid] <= idx) lo = mid; else hi = mid - 1; }
+    const a = starts[lo];
+    return { line: lo + 1, col: idx - a - (below(astral, idx) - below(astral, a)) + 1 };
+  };
+}
+
+// ---------------------------------------------------------------- character pass
+// Checklist B: these become a normal space (or a newline for U+2028/2029).
+const UNUSUAL_SPACE = /[\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/g;
+
+function scanChars(text, add) {
+  for (const m of text.matchAll(UNUSUAL_SPACE)) add("unusual-space", m.index, { codepoint: hex(m[0].codePointAt(0)) });
+  const cps = [];
+  for (let i = 0; i < text.length;) {
+    const cp = text.codePointAt(i);
+    cps.push({ cp, ch: String.fromCodePoint(cp), idx: i });
+    i += cp > 0xFFFF ? 2 : 1;
+  }
+  // Tag characters are legitimate only inside a subdivision flag:
+  // U+1F3F4, one or more tags, then CANCEL TAG U+E007F.
+  const flagTag = new Set();
+  for (let k = 0; k < cps.length; k++) {
+    if (cps[k].cp !== 0x1F3F4) continue;
+    let j = k + 1;
+    let name = "";
+    while (j < cps.length && isTag(cps[j].cp) && cps[j].cp !== 0xE007F) name += String.fromCharCode(cps[j++].cp - 0xE0000);
+    if (RGI_FLAG_TAGS.has(name) && j < cps.length && cps[j].cp === 0xE007F) for (let t = k + 1; t <= j; t++) flagTag.add(t);
+  }
+  // C2PA text manifest: U+FEFF then variation selectors carrying bytes
+  // (b < 16 -> U+FE00+b, else U+E0100+b-16) that begin with "C2PATXT".
+  for (let k = 0; k < cps.length; k++) {
+    if (cps[k].cp !== 0xFEFF) continue;
+    let bytes = "";
+    for (let j = k + 1; j < cps.length && isVS(cps[j].cp) && bytes.length < 7; j++) {
+      const cp = cps[j].cp;
+      bytes += String.fromCharCode(cp <= 0xFE0F ? cp - 0xFE00 : cp - 0xE0100 + 16);
+    }
+    if (bytes === "C2PATXT") add("c2pa-text", cps[k].idx, { codepoint: hex(0xFEFF), detail: "C2PA text manifest wrapper" });
+  }
+  const hasRtl = RTL.test(text);
+  for (let k = 0; k < cps.length; k++) {
+    const { cp, idx } = cps[k];
+    const prev = cps[k - 1], next = cps[k + 1];
+    let hidden = false;
+    if (cp === 0xFEFF) hidden = k !== 0;
+    else if (ALWAYS_HIDDEN.has(cp) || isControlOrPrivate(cp)) hidden = true;
+    else if (cp === 0x200E || cp === 0x200F || cp === 0x061C) hidden = !hasRtl; // direction marks belong in right-to-left text
+    else if (cp === 0x200D) {
+      // ZWJ: joins emoji into one glyph, or letters in joining scripts.
+      const emojiJoin = prev && next && (isPictographic(prev.ch) || prev.cp === 0xFE0F || isSkinTone(prev.cp)) && isPictographic(next.ch);
+      const scriptJoin = prev && (isJoiningMark(prev.ch) || (next && isJoiningScriptChar(prev.ch) && isJoiningScriptChar(next.ch)));
+      hidden = !(emojiJoin || scriptJoin);
+    } else if (cp === 0x200C) {
+      hidden = !(prev && (isJoiningMark(prev.ch) || (next && isJoiningScriptChar(prev.ch) && isJoiningScriptChar(next.ch))));
+    } else if (cp === 0xFE0E || cp === 0xFE0F) {
+      hidden = !(prev && (isEmojiBase(prev.ch) || isKeycapBase(prev.ch)));
+    } else if (cp >= 0xFE00 && cp <= 0xFE0D) {
+      // Standardized variation sequences follow Han or maths symbols, one at a time.
+      hidden = !(prev && (isHan(prev.ch) || /\p{Sm}/u.test(prev.ch)));
+    } else if (cp >= 0xE0100 && cp <= 0xE01EF) {
+      // Ideographic variation sequence: exactly one selector after a Han character.
+      hidden = !(prev && isHan(prev.ch));
+    } else if (isTag(cp)) {
+      hidden = !flagTag.has(k);
+    } else if (/\p{Cf}/u.test(cps[k].ch)) {
+      hidden = true; // checklist A: any other Unicode format character
+    }
+    if (hidden) add("hidden-char", idx, { codepoint: hex(cp) });
+  }
+}
+
+// ---------------------------------------------------------------- line pass
+const CONFUSABLE = /[\u0430\u0435\u043E\u0440\u0441\u0443\u0445\u0456\u0458\u0455\u0501\u051B\u051D\u04CF\u0410\u0412\u0415\u041A\u041C\u041D\u041E\u0420\u0421\u0422\u0425\u0406\u0408\u0405\u03BF\u03BD\u03C1\u03B9\u03BA\u03C5\u0391\u0392\u0395\u0396\u0397\u0399\u039A\u039C\u039D\u039F\u03A1\u03A4\u03A5\u03A7\u0585\u0555\u13A0-\u13F4\uFF21-\uFF3A\uFF41-\uFF5A]/u;
+
+function scanLines(text, add, opts = {}) {
+  let offset = 0;
+  for (const raw of text.split("\n")) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    // attribution lines
+    const trailer = line.match(/^\s*co-authored-by\s*:\s*([^<]*)(<[^>]*>)?/i);
+    if (trailer && (TOOL_NAME.test(trailer[1]) || TOOL_EMAIL.test(trailer[2] || ""))) add("attribution-line", offset, { detail: "tool co-author trailer" });
+    if (/^\s*(?:claude|codex|cursor|copilot|chatgpt)-session:/i.test(line)) add("attribution-line", offset, { detail: "tool session trailer" });
+    // "Made-with: Cursor" (Cursor IDE and CLI commit trailer, rows 3638/3637). The key plus a tool's
+    // own name as the value, so prose such as "Made with care" or "made-with: love" is untouched.
+    if (/^\s*made-with\s*:\s*(?:claude(?: code)?|cursor|codex|github copilot|copilot|windsurf|gemini|chatgpt|aider|devin)\b/i.test(line)) add("attribution-line", offset, { detail: "tool made-with trailer" });
+    for (const g of line.matchAll(/\b(?:generated|made|created|written|built) (?:with|by|using)\b/gi)) {
+      if (TOOL_TAIL.test(line.slice(g.index + g[0].length))) add("attribution-line", offset + g.index, { detail: "generated-with footer" });
+    }
+    if (/claude\.ai\/code\/session_/i.test(line)) add("attribution-line", offset, { detail: "tool session link" });
+    if (/claude\.com\/claude-code/i.test(line)) add("attribution-line", offset, { detail: "tool product link" });
+    // trailing whitespace that can carry data; markdown's two-space break is allowed
+    // Checklist A: any trailing whitespace, blank lines included (grep '[ \t]+$').
+    // markdownBreaks:true keeps markdown's two-space line break for .md files.
+    const tw = line.match(/[ \t\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]+$/);
+    if (tw && !(opts.markdownBreaks === true && tw[0] === "  " && tw.index > 0)) add("trailing-whitespace", offset + tw.index, { detail: JSON.stringify(tw[0]) });
+    // homoglyphs: a word with at least two Latin letters and a look-alike letter
+    for (const w of line.matchAll(/[\p{L}\p{M}]+/gu)) {
+      const letters = [...w[0]].filter((c) => /\p{L}/u.test(c));
+      const latin = letters.filter((c) => /\p{Script=Latin}/u.test(c) && !CONFUSABLE.test(c)).length;
+      const looks = letters.filter((c) => CONFUSABLE.test(c)).length;
+      // Greek look-alikes beside one Latin letter are ordinary units and symbols
+      // (rho-v, nu-s, kappa-g): Greek needs two Latin letters in the word.
+      const greek = letters.some((c) => /\p{Script=Greek}/u.test(c));
+      if (latin >= (greek ? 2 : 1) && looks >= 1 && latin + looks === letters.length) add("homoglyph", offset + w.index, { detail: w[0] });
+    }
+    offset += raw.length + 1;
+  }
+}
+
+// ---------------------------------------------------------------- pattern pass
+const LEAKS = [
+  [/\b(?:ghp|gho|ghs|ghu|ghr)_[A-Za-z0-9]{30,}/g, "GitHub token"],
+  [/\bgithub_pat_[A-Za-z0-9_]{30,}/g, "GitHub token"],
+  [/\bsk-ant-[A-Za-z0-9_-]{20,}/g, "Anthropic key"],
+  [/\bsk-(?:proj-)?(?=[A-Za-z0-9]*[A-Z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{32,}/g, "OpenAI key"],
+  [/\bAKIA(?![0-9A-Z]{9}EXAMPLE\b)[0-9A-Z]{16}\b/g, "AWS key"],
+  [/\bxox[abprs]-[A-Za-z0-9-]{10,}/g, "Slack token"],
+  // Key material, not the bare header: code that strips or names the header is ordinary.
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----(?:\\n|\s)+[A-Za-z0-9+\/=]{40,}/g, "private key"],
+  [/\/root\/\.claude\b/g, "internal path"],
+];
+
+const JSONLD_FIELDS = new Set(["author", "creator", "contributor", "publisher", "sdPublisher", "editor", "funder", "sponsor", "producer", "accountablePerson", "copyrightHolder", "provider", "maintainer", "translator", "illustrator"]);
+
+function scanPatterns(text, add, opts) {
+  for (const m of text.matchAll(/<meta\b[^>]*>/gi)) {
+    const tag = m[0];
+    const cm = tag.match(/\bcontent\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+(?:\s+[^\s>=]+(?=\s*\/?>))*))/i) || [];
+    const content = cm[1] ?? cm[2] ?? cm[3] ?? "";
+    if (/\bname\s*=\s*["']?generator\b/i.test(tag) && TOOL_TAIL.test(content)) add("generator-tag", m.index, { detail: content });
+  }
+  for (const m of text.matchAll(/<xmp:CreatorTool>([^<]*)</gi)) if (TOOL_TAIL.test(m[1])) add("generator-tag", m.index, { detail: m[1] });
+  for (const m of text.matchAll(/digitalsourcetype\/(?:trainedAlgorithmicMedia|compositeWithTrainedAlgorithmicMedia|algorithmicMedia)\b/gi)) add("provenance-ref", m.index, { detail: "IPTC digital source type" });
+  for (const m of text.matchAll(/rel\s*=\s*["']?c2pa-manifest\b/gi)) add("provenance-ref", m.index, { detail: "c2pa-manifest link" });
+  for (const m of text.matchAll(/<dcterms:provenance\b|dcterms:provenance\s*=/gi)) add("provenance-ref", m.index, { detail: "dcterms:provenance" });
+  for (const m of text.matchAll(/[\w\/%-]\.c2pa(?![\w.-])/gi)) add("provenance-ref", m.index, { detail: ".c2pa file" });
+  for (const [re, what] of LEAKS) for (const m of text.matchAll(re)) add("leak", m.index, { detail: what });
+  // Checklist E, owner 30 Sep "all relevant": a tool named as a PERSON-LIKE field
+  // of JSON-LD. Whole-name match (TOOL_NAME), so "Claude Monet" and "Gemini CMS"
+  // pass; a tool named in a description is ordinary text, not a field.
+  for (const m of text.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([^]*?)<\/script>/gi)) {
+    let data; try { data = JSON.parse(m[1]); } catch { continue; }
+    const hits = [];
+    const walk = (v) => {
+      if (Array.isArray(v)) { v.forEach(walk); return; }
+      if (!v || typeof v !== "object") return;
+      for (const [k, val] of Object.entries(v)) {
+        if (JSONLD_FIELDS.has(k)) for (const x of Array.isArray(val) ? val : [val]) {
+          const nameStr = typeof x === "string" ? x : x && typeof x === "object" && typeof x.name === "string" ? x.name : "";
+          if (nameStr && TOOL_NAME.test(nameStr)) hits.push(`${k}: ${nameStr}`);
+        }
+        walk(val);
+      }
+    };
+    walk(data);
+    for (const h of hits) add("jsonld-tool", m.index, { detail: h });
+  }
+  const lower = text.toLowerCase();
+  for (const s of opts.denylist || []) {
+    if (!s) continue;
+    for (let i = lower.indexOf(String(s).toLowerCase()); i >= 0; i = lower.indexOf(String(s).toLowerCase(), i + 1)) add("leak", i, { detail: "denylisted identifier" });
+  }
+  for (const h of [...(opts.internalHosts || []), ...(opts.internalPaths || [])]) {
+    if (!h) continue;
+    for (let i = lower.indexOf(String(h).toLowerCase()); i >= 0; i = lower.indexOf(String(h).toLowerCase(), i + 1)) add("leak", i, { detail: "internal host" });
+  }
+}
+
+// ---------------------------------------------------------------- visible marks
+// Owner, 30 Sep: "Visible should have been included too". His plain-ASCII rule
+// names em dash, en dash and smart quotes; an inventory of the served sites
+// found those plus ellipses and box-drawing comment rules (all 971 of sark's in
+// code comments, shipped in page source). Accented letters, currency, degree
+// signs, arrows and emoji are ordinary content and are not listed here.
+// Checker round 4 added the other dash, hyphen and ellipsis forms and the block
+// elements. Primes, guillemets and the minus sign are left alone: they have
+// ordinary uses (feet and inches, French quotes, arithmetic).
+const TYPOGRAPHY = /[\u2010-\u2015\u2018-\u201F\u2024-\u2026\u22EE\u22EF\u2E3A\u2E3B\uFE58\uFE63\uFF0D\u2500-\u259F]/g;
+const TYPO_NAME = (c) => c >= 0x2500 && c <= 0x259F ? "box-drawing or block" : (c >= 0x2024 && c <= 0x2026) || c === 0x22EE || c === 0x22EF ? "ellipsis" : c >= 0x2018 && c <= 0x201F ? "curly quote" : c === 0x2013 ? "en dash" : "dash or hyphen";
+// ---------------------------------------------------------------- plug-in points
+// The checks that use Bouios's own word lists (assistant phrases, AI tracking marks, style words)
+// and the line editor live in no-marks-ip.js and are plugged in here by no-marks.js on the owner
+// gateway. This core holds only the commodity checks (characters, spaces, dashes and quotes,
+// attribution lines, leaks, file metadata) and is the part a customer worker runs in the
+// customer's own account (owner decision 3512 for 3463). With nothing plugged in, the rules that
+// need a word list report nothing and the editor actions answer that they are not available here.
+const SCANNERS = [];
+function registerScanner(fn) { if (typeof fn === "function" && !SCANNERS.includes(fn)) SCANNERS.push(fn); }
+const ACTIONS = new Map();
+function registerActions(map) { for (const [k, fn] of Object.entries(map || {})) if (typeof fn === "function") ACTIONS.set(k, fn); }
+
+
+function scanVisible(text, add, opts) {
+  if (opts.typography !== false) for (const m of text.matchAll(TYPOGRAPHY)) add("typography", m.index, { codepoint: hex(m[0].codePointAt(0)), detail: TYPO_NAME(m[0].codePointAt(0)) });
+  for (const scan of SCANNERS) scan(text, add, opts);
+}
+
+// ---------------------------------------------------------------- settings
+// Owner, 30 Sep: "user needs to be able to change what it removes / adds".
+// Text rules: fix (change the text) | report (leave it, list it) | off (ignore).
+// File kinds: remove | keep (leave it, list it) | off (ignore).
+// C2PA manifests and AI-source labels can be kept or ignored, never removed:
+// that is the line stated to the owner, and a setting must not become a way round it.
+const TEXT_MODES = {
+  "hidden-char": ["fix", "report", "off"], "c2pa-text": ["fix", "report", "off"], "unusual-space": ["fix", "report", "off"],
+  "trailing-whitespace": ["fix", "report", "off"], "typography": ["fix", "report", "off"], "attribution-line": ["fix", "report", "off"],
+  "generator-tag": ["fix", "report", "off"], "provenance-ref": ["fix", "report", "off"],
+  "homoglyph": ["report", "off"], "leak": ["report", "off"], "ai-artefact": ["report", "off"], "jsonld-tool": ["report", "off"],
+  "style-word": ["report", "off"], "tool-author": ["report", "off"],
+};
+const FILE_MODES = {
+  gps: ["remove", "keep", "off"], credit: ["remove", "keep", "off"], software: ["remove", "keep", "off"], xmp: ["remove", "keep", "off"],
+  provenance: ["remove", "keep", "off"], "office-meta": ["remove", "keep", "off"], "font-c2pa": ["remove", "keep", "off"], comment: ["remove", "keep", "off"],
+  c2pa: ["keep", "off"], "ai-source": ["keep", "off"],
+};
+const DEFAULT_SETTINGS = Object.freeze({
+  text: Object.fromEntries(Object.entries(TEXT_MODES).map(([k, m]) => [k, k === "style-word" ? "off" : m[0]])),
+  file: Object.fromEntries(Object.entries(FILE_MODES).map(([k, m]) => [k, m[0]])),
+  add: { credit: "" },
+  denylist: [], internalHosts: [], internalPaths: [], markdownBreaks: false,
+});
+const SETTING_KEYS = new Set(["text", "file", "add", "denylist", "internalHosts", "internalPaths", "markdownBreaks"]);
+const strList = (v, name, errors) => {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v) || v.length > 200 || v.some((x) => typeof x !== "string" || !x || x.length > 200)) { errors.push(`${name} must be a list of up to 200 non-empty strings of at most 200 characters`); return undefined; }
+  return v.slice();
+};
+// Merge a user's settings over the defaults and validate every value.
+function resolveSettings(input = {}) {
+  const errors = [];
+  const out = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+  if (input !== undefined && input !== null && (typeof input !== "object" || Array.isArray(input))) return { ok: false, errors: ["settings must be an object"], settings: null };
+  const src = input || {};
+  for (const k of Object.keys(src)) if (!SETTING_KEYS.has(k)) errors.push(`unknown setting: ${k}`);
+  for (const [group, modes] of [["text", TEXT_MODES], ["file", FILE_MODES]]) {
+    const g = src[group];
+    if (g === undefined) continue;
+    if (!g || typeof g !== "object" || Array.isArray(g)) { errors.push(`${group} must be an object`); continue; }
+    for (const [k, v] of Object.entries(g)) {
+      // Own keys only: "constructor" or "__proto__" must read as unknown, not crash.
+      if (!Object.hasOwn(modes, k)) { errors.push(`unknown ${group} rule: ${k}`); continue; }
+      if (!modes[k].includes(v)) { errors.push(`${group}.${k} must be one of ${modes[k].join(", ")}` + (k === "c2pa" || k === "ai-source" ? " (C2PA manifests and AI-source labels are never removed)" : "")); continue; }
+      out[group][k] = v;
+    }
+  }
+  if (src.add !== undefined) {
+    const c = src.add && src.add.credit;
+    if (c !== undefined && (typeof c !== "string" || c.length > 80 || /[^\x20-\x7E]/.test(c))) errors.push("add.credit must be plain text of at most 80 characters");
+    else if (c !== undefined) out.add.credit = c;
+  }
+  for (const k of ["denylist", "internalHosts", "internalPaths"]) { const v = strList(src[k], k, errors); if (v) out[k] = v; }
+  if (src.markdownBreaks !== undefined) { if (typeof src.markdownBreaks !== "boolean") errors.push("markdownBreaks must be true or false"); else out.markdownBreaks = src.markdownBreaks; }
+  return errors.length ? { ok: false, errors, settings: null } : { ok: true, errors: [], settings: out };
+}
+// Layer settings: b over a, one level deep for text/file/add, lists and flags replaced.
+function mergeSettings(a = {}, b = {}) {
+  const A = a && typeof a === "object" ? a : {}, B = b && typeof b === "object" ? b : {};
+  const out = { ...A, ...B };
+  for (const k of ["text", "file", "add"]) if (A[k] || B[k]) out[k] = { ...(A[k] && typeof A[k] === "object" ? A[k] : {}), ...(B[k] && typeof B[k] === "object" ? B[k] : {}) };
+  return out;
+}
+// Old callers pass loose options (typography:false, styleWords, credit); map them in.
+function settingsFrom(opts) {
+  const base = opts && opts.settings ? resolveSettings(opts.settings) : { ok: true, settings: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)) };
+  if (!base.ok) throw new Error("invalid settings: " + base.errors.join("; "));
+  const st = base.settings;
+  if (opts) {
+    if (opts.typography === false) st.text.typography = "off";
+    if (opts.styleWords === true && st.text["style-word"] === "off") st.text["style-word"] = "report";
+    if (typeof opts.credit === "string" && opts.credit) st.add.credit = opts.credit;
+    if (opts.markdownBreaks === true) st.markdownBreaks = true;
+    for (const k of ["denylist", "internalHosts", "internalPaths"]) if (Array.isArray(opts[k])) st[k] = opts[k];
+  }
+  return st;
+}
+const scanOptsFrom = (st) => ({ typography: st.text.typography !== "off", styleWords: st.text["style-word"] !== "off", markdownBreaks: st.markdownBreaks, denylist: st.denylist, internalHosts: st.internalHosts, internalPaths: st.internalPaths });
+
+// ---------------------------------------------------------------- cleanText
+// Owner checklist v4: A hidden characters REMOVED, B spaces CONVERTED, C
+// homoglyphs FLAGGED, D attribution lines REMOVED, E generator tags and c2pa
+// link tags REMOVED, G leaks BLOCKED (reported, never silently edited).
+// Typography is converted to ASCII (the owner's plain-ASCII rule) unless
+// typography:false. Genuine emoji, joining-script ZWJ/ZWNJ and a leading BOM
+// are kept, because scanText does not report them.
+// Returns { text, fixed: {rule: count}, remaining: findings not auto-fixed }.
+const TYPO_ASCII = (c) => {
+  if (c === 0x2026 || c === 0x22EE || c === 0x22EF) return "...";
+  if (c === 0x2025) return "..";
+  if (c === 0x2024) return ".";
+  if (c === 0x2018 || c === 0x2019 || c === 0x201A || c === 0x201B) return "'";
+  if (c >= 0x201C && c <= 0x201F) return "\"";
+  return "-"; // dashes, hyphens, box-drawing and block elements
+};
+const lineSpan = (s, i) => {
+  const a = s.lastIndexOf("\n", i - 1) + 1;
+  const e = s.indexOf("\n", i);
+  return [a, e < 0 ? s.length : e + 1];
+};
+
+function cleanText(text, opts = {}) {
+  const st = settingsFrom(opts);
+  const mode = (rule) => st.text[rule] || "report";
+  const scanOpts = scanOptsFrom(st);
+  let s = String(text ?? "");
+  const fixed = {};
+  let remaining = [];
+  // Two passes: removing a line can expose nothing new, but converting a
+  // character inside a removed line must not double-count, so edits are
+  // collected, de-overlapped (wider span wins) and applied from the end.
+  for (let pass = 0; pass < 2; pass++) {
+    const edits = [];
+    remaining = [];
+    for (const f of scanText(s, scanOpts)) {
+      if (mode(f.rule) === "off") continue;
+      if (mode(f.rule) === "report") { remaining.push(f); continue; }
+      const cp = f.codepoint ? parseInt(f.codepoint.slice(2), 16) : null;
+      const w = cp !== null && cp > 0xFFFF ? 2 : 1;
+      if (f.rule === "hidden-char" || f.rule === "c2pa-text") { if (f.rule === "hidden-char") edits.push([f.index, f.index + w, "", f.rule]); }
+      else if (f.rule === "unusual-space") edits.push([f.index, f.index + w, cp === 0x2028 || cp === 0x2029 ? "\n" : " ", f.rule]);
+      else if (f.rule === "trailing-whitespace") edits.push([f.index, f.index + JSON.parse(f.detail).length, "", f.rule]);
+      else if (f.rule === "typography") edits.push([f.index, f.index + w, TYPO_ASCII(cp), f.rule]);
+      else if (f.rule === "attribution-line") {
+        const [a, e] = lineSpan(s, f.index);
+        if (e - a <= 240) edits.push([a, e, "", f.rule]); else remaining.push(f);
+      } else if (f.rule === "generator-tag" && s.startsWith("<meta", f.index)) {
+        const m = s.slice(f.index).match(/^<meta\b[^>]*>/i);
+        if (m) edits.push([f.index, f.index + m[0].length, "", f.rule]); else remaining.push(f);
+      } else if (f.rule === "provenance-ref" && /c2pa-manifest/.test(f.detail || "")) {
+        const a = s.lastIndexOf("<", f.index), e = s.indexOf(">", f.index);
+        if (a >= 0 && e > a && /^<link\b/i.test(s.slice(a, a + 5))) edits.push([a, e + 1, "", f.rule]);
+        else if (/^\s*Link\s*:/i.test(s.slice(lineSpan(s, f.index)[0]))) { const [la, le] = lineSpan(s, f.index); edits.push([la, le, "", f.rule]); }
+        else remaining.push(f);
+      } else remaining.push(f);
+    }
+    if (!edits.length) break;
+    edits.sort((x, y) => x[0] - y[0] || y[1] - x[1]);
+    const keep = [];
+    let end = -1;
+    for (const e of edits) if (e[0] >= end) { keep.push(e); end = e[1]; }
+    // Built in one forward pass (slicing once per edit was quadratic on a long text).
+    const parts = []; let at = 0;
+    for (const [a, e, r, rule] of keep) { parts.push(s.slice(at, a), r); at = e; fixed[rule] = (fixed[rule] || 0) + 1; }
+    parts.push(s.slice(at));
+    s = parts.join("");
+  }
+  return { text: s, fixed, remaining };
+}
+
+// ---------------------------------------------------------------- scanFile
+// Checklist F (files) and H (detect): EXIF GPS, credit and software tags, XMP
+// provenance / creator tool / AI source type, C2PA manifests (JUMBF) in JPEG,
+// PNG, WebP, PDF and video, a font's C2PA table, Office document properties,
+// PDF Producer/Creator/Author, Matplotlib and similar software tags. It reads
+// bytes only and changes nothing. Async because Office files are zips and
+// deflate needs DecompressionStream (present in Workers and Node 18+).
+// Findings: { rule, detail } with rule in gps | credit | software | provenance |
+// ai-source | c2pa | font-c2pa | office-meta.
+// Chunked: one String.fromCharCode per 32 KB, not per byte (a 5 MB PDF went from ~0.7 s to a fraction).
+const latin1 = (b, a = 0, e = b.length) => { let o = ""; for (let i = a; i < e; i += 32768) o += String.fromCharCode.apply(null, b.subarray(i, Math.min(e, i + 32768))); return o; };
+const u16 = (b, i, le) => le ? b[i] | (b[i + 1] << 8) : (b[i] << 8) | b[i + 1];
+const u32 = (b, i, le) => (le ? (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) : ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3])) >>> 0;
+
+function tiffFindings(b, out) {
+  if (b.length < 8) return;
+  const le = b[0] === 0x49;
+  const ifd = u32(b, 4, le);
+  if (ifd + 2 > b.length) return;
+  const n = u16(b, ifd, le);
+  for (let k = 0; k < n; k++) {
+    const e = ifd + 2 + k * 12;
+    if (e + 12 > b.length) break;
+    const tag = u16(b, e, le), count = u32(b, e + 4, le);
+    const str = () => { const off = count > 4 ? u32(b, e + 8, le) : e + 8; return latin1(b, off, Math.min(b.length, off + count)).replace(/\u0000+$/, ""); };
+    if (tag === 0x8825) out.push({ rule: "gps", detail: "EXIF GPS block" });
+    if (tag === 0x013B || tag === 0x8298) out.push({ rule: "credit", detail: (tag === 0x013B ? "Artist: " : "Copyright: ") + str() });
+    if (tag === 0x0131) out.push({ rule: "software", detail: "Software: " + str() });
+  }
+}
+function xmpFindings(x, out) {
+  if (/dcterms:provenance/i.test(x)) out.push({ rule: "provenance", detail: "XMP dcterms:provenance" });
+  const tool = x.match(/CreatorTool(?:="|>)([^"<]{0,80})/i);
+  if (tool) out.push({ rule: "software", detail: "XMP CreatorTool: " + tool[1] });
+  if (/trainedAlgorithmicMedia|algorithmicMedia/i.test(x)) out.push({ rule: "ai-source", detail: "IPTC digital source type: AI" });
+  if (/photoshop:Credit|dc:rights|dc:creator|plus:Licensor/i.test(x) && !/Matplotlib/i.test(x)) out.push({ rule: "credit", detail: "XMP credit or rights" + ((x.match(/photoshop:Credit="([^"]{0,80})"/) || [])[1] ? ": " + x.match(/photoshop:Credit="([^"]{0,80})"/)[1] : "") });
+}
+const hasC2pa = (str) => /jumb[\s\S]{0,64}c2pa|c2pa[\s\S]{0,64}jumb|application#2Fc2pa|urn:c2pa/i.test(str);
+
+// PDF info strings, read the way a PDF reader does: a literal string runs to its
+// MATCHING bracket, with "\x" escapes and balanced nested brackets inside; a hex
+// string runs from < to >. A regex stopping at the first ")" cut a real Chromium
+// Creator "(Mozilla/5.0 \(X11; ...\) ...)" short, and blanking that part left a
+// backslash that escaped the real closing bracket - the cleaned PDF no longer
+// opened (test pack, 30 Sep). Returns [{ key, start, end, value }] with start/end
+// the content span inside the delimiters. A key inside another string (a
+// Title reading "see /Author (x)") is text, not a key, and a key inside stream
+// data is binary: one forward cursor tracks both, so each match costs only the
+// text since the last one. An unclosed string runs to the end of the file, so
+// the first one stops the walk - otherwise 100,000 unclosed "/Author (" made
+// the scan quadratic (over 2 minutes on 900 KB).
+function pdfInfoStrings(t, keys) {
+  const out = [];
+  let c = 0, d = 0;
+  const hidden = (pos) => { // is pos inside a string or a stream?
+    while (c < pos) {
+      if (!d && t.startsWith("endstream", c)) { c += 9; continue; }
+      if (!d && t.startsWith("stream", c) && (t[c + 6] === "\n" || t[c + 6] === "\r")) { const e = t.indexOf("endstream", c); c = e < 0 ? t.length : e + 9; continue; }
+      if (!d && t[c] === "%") { const e = t.slice(c, c + 4096).search(/[\r\n]/); c += e < 0 ? 4096 : e; continue; }
+      const ch = t[c];
+      if (d && ch === "\\") { c += 2; continue; }
+      if (ch === "(") d++;
+      else if (ch === ")" && d) d--;
+      c++;
+    }
+    return d > 0 || c > pos;
+  };
+  const re = new RegExp("/(" + keys.join("|") + ")\\s*([(<])", "g");
+  for (const m of t.matchAll(re)) {
+    if (hidden(m.index)) continue;
+    const start = m.index + m[0].length;
+    if (m[2] === "<") {
+      if (t[start] === "<") continue; // "<<" is a dictionary, not a string
+      const end = t.indexOf(">", start);
+      if (end < 0) break;
+      const hex = t.slice(start, end).replace(/\s+/g, "");
+      let v = "", real = false;
+      for (let i = 0; i + 1 < hex.length; i += 2) {
+        const c = parseInt(hex.slice(i, i + 2), 16);
+        if (c >= 32 && c < 127) v += String.fromCharCode(c);
+        if (c !== 0x20 && c !== 0 && c !== 0xFE && c !== 0xFF) real = true;
+      }
+      // Any byte besides spaces, nulls and a byte-order mark is a real value,
+      // printable or not (a name in Chinese can have no printable byte at all).
+      out.push({ key: m[1], at: m.index, start, end, value: real ? (v.trim() || "<" + hex + ">") : "", hex: true });
+      c = end + 1;
+      continue;
+    }
+    let depth = 1, i = start;
+    for (; i < t.length && depth > 0; i++) {
+      const ch = t[i];
+      if (ch === "\\") { i++; continue; }
+      if (ch === "(") depth++;
+      else if (ch === ")") depth--;
+    }
+    if (depth !== 0) break;
+    out.push({ key: m[1], at: m.index, start, end: i - 1, value: t.slice(start, i - 1) });
+    c = i;
+  }
+  return out;
+}
+
+async function inflateRaw(bytes) {
+  const ds = new DecompressionStream("deflate-raw");
+  const w = ds.writable.getWriter();
+  w.write(bytes); w.close();
+  return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+}
+
+async function scanFile(input, name = "") {
+  const b = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const out = [];
+  const head = latin1(b, 0, Math.min(b.length, 16));
+  if (b[0] === 0xFF && b[1] === 0xD8) {                        // JPEG
+    let i = 2;
+    while (i + 4 <= b.length && b[i] === 0xFF) {
+      const m = b[i + 1];
+      if (m === 0xDA || m === 0xD9) break;
+      const len = u16(b, i + 2, false), body = b.subarray(i + 4, i + 2 + len), h = latin1(body, 0, Math.min(body.length, 40));
+      if (m === 0xE1 && h.startsWith("Exif\u0000")) tiffFindings(body.subarray(6), out);
+      else if (m === 0xE1 && h.startsWith("http://ns.adobe.com/xap/")) xmpFindings(latin1(body), out);
+      else if (m === 0xEB && hasC2pa(latin1(body))) out.push({ rule: "c2pa", detail: "C2PA manifest (JPEG APP11)" });
+      else if (m === 0xED) out.push({ rule: "credit", detail: "IPTC/Photoshop block" });
+      i += 2 + len;
+    }
+  } else if (head.startsWith("\u0089PNG")) {                     // PNG
+    let i = 8;
+    while (i + 8 <= b.length) {
+      const len = u32(b, i, false), type = latin1(b, i + 4, i + 8), body = b.subarray(i + 8, i + 8 + len);
+      if (type === "caBX") out.push({ rule: "c2pa", detail: "C2PA manifest (PNG caBX)" });
+      else if (type === "eXIf") tiffFindings(body, out);
+      else if (type === "tEXt" || type === "iTXt" || type === "zTXt") {
+        const t = latin1(body), key = t.slice(0, t.indexOf("\u0000"));
+        if (/^XML:com\.adobe\.xmp$/i.test(key)) xmpFindings(t, out);
+        else if (/^Software$/i.test(key)) out.push({ rule: "software", detail: "PNG Software: " + t.slice(key.length + 1, key.length + 81) });
+        else if (/^(Author|Copyright|Artist)$/i.test(key)) out.push({ rule: "credit", detail: "PNG " + key });
+      }
+      if (type === "IEND") break;
+      i += 12 + len;
+    }
+  } else if (head.startsWith("%PDF")) {                          // PDF
+    const t = latin1(b);
+    for (const x of pdfInfoStrings(t, ["Producer", "Creator", "Author", "CreationDate", "ModDate"])) {
+      if (!x.value.trim()) continue;
+      if (/Date$/.test(x.key)) out.push({ rule: "office-meta", detail: "PDF " + x.key });
+      else if (x.key === "Author") out.push({ rule: "credit", detail: "PDF Author" });
+      else out.push({ rule: "software", detail: `PDF ${x.key}: ${x.value.slice(0, 120)}` });
+    }
+    if (/<x:xmpmeta/.test(t)) xmpFindings(t, out);
+    if (hasC2pa(t)) out.push({ rule: "c2pa", detail: "C2PA manifest (PDF)" });
+  } else if (u32(b, 0, false) === 0x00010000 || head.startsWith("OTTO") || head.startsWith("true")) { // font
+    const n = u16(b, 4, false);
+    for (let k = 0; k < n && 12 + k * 16 + 4 <= b.length; k++) if (latin1(b, 12 + k * 16, 16 + k * 16) === "C2PA") out.push({ rule: "font-c2pa", detail: "font C2PA table" });
+  } else if (b[0] === 0x50 && b[1] === 0x4B && b[2] === 3 && b[3] === 4) { // zip: docx, pptx, xlsx
+    let i = 0;
+    while (i + 30 <= b.length && u32(b, i, true) === 0x04034b50) {
+      const method = u16(b, i + 8, true), size = u32(b, i + 18, true), nlen = u16(b, i + 26, true), xlen = u16(b, i + 28, true);
+      const fname = latin1(b, i + 30, i + 30 + nlen), data = b.subarray(i + 30 + nlen + xlen, i + 30 + nlen + xlen + size);
+      if (/^docProps\/(core|app)\.xml$/.test(fname)) {
+        const xml = new TextDecoder().decode(method === 8 ? await inflateRaw(data) : data);
+        for (const m of xml.matchAll(OFFICE_META)) if (m[2].trim() && !OFFICE_STATS.test(m[1])) out.push({ rule: "office-meta", detail: `${m[1]}: ${m[2].slice(0, 80)}` });
+      }
+      if (/^docProps\/thumbnail\.[a-z]+$/i.test(fname)) out.push({ rule: "office-meta", detail: "thumbnail image " + fname });
+      if (fname === "word/settings.xml" || /^customXml\/item\d+\.xml$/.test(fname)) {
+        const xml = new TextDecoder().decode(method === 8 ? await inflateRaw(data) : data);
+        if (/<w:rsids>/.test(xml)) out.push({ rule: "office-meta", detail: "editing-session ids (rsid)" });
+        if (EMPTY_BIB.test(xml)) out.push({ rule: "office-meta", detail: "empty bibliography store (template id) " + fname });
+      }
+      if (size === 0 && (u16(b, i + 6, true) & 8)) break; // streamed entry without sizes: stop rather than guess
+      i += 30 + nlen + xlen + size;
+    }
+  } else if (head.startsWith("RIFF") && latin1(b, 8, 12) === "WEBP") { // WebP
+    const t = latin1(b);
+    if (/EXIF/.test(latin1(b, 12, Math.min(b.length, 64)))) out.push({ rule: "credit", detail: "WebP EXIF chunk" });
+    if (/<x:xmpmeta/.test(t)) xmpFindings(t, out);
+    if (hasC2pa(t) || /C2PA/.test(t)) out.push({ rule: "c2pa", detail: "C2PA manifest (WebP)" });
+  } else {                                                        // text formats (SVG, XML) and video
+    const t = latin1(b, 0, Math.min(b.length, 4 << 20));
+    if (/<svg\b|<\?xml/i.test(t.slice(0, 400))) {
+      if (/Matplotlib|Created with matplotlib|Inkscape|Illustrator|generator="[^"]*"/i.test(t)) out.push({ rule: "software", detail: "SVG creator software" });
+      if (/<x:xmpmeta|dcterms:provenance/.test(t)) xmpFindings(t, out);
+    }
+    if (hasC2pa(t)) out.push({ rule: "c2pa", detail: "C2PA manifest" });
+  }
+  // A C2PA manifest that declares the file AI-made (IPTC trainedAlgorithmicMedia
+  // inside the manifest, as the sark crest worksheet PNG carries) is reported too.
+  if (out.some((f) => f.rule === "c2pa") && /trainedAlgorithmicMedia/.test(latin1(b, 0, Math.min(b.length, 8 << 20)))) out.push({ rule: "ai-source", detail: "C2PA manifest declares AI-generated media" });
+  return out;
+}
+
+// ---------------------------------------------------------------- cleanFile
+// Checklist F REMOVES: EXIF GPS, credit (Artist, Copyright) and Software tags
+// (orientation and the rest of EXIF are kept, and the removed values are zeroed
+// in the bytes, not just unlinked); XMP packets and IPTC blocks; PNG text chunks
+// naming software or an author; WebP EXIF/XMP chunks; PDF Producer, Creator and
+// Author (blanked in place so xref offsets stay valid); a font's C2PA table
+// (font rebuilt, other tables kept); Office core/app properties; SVG metadata and
+// generator comments. opts.credit (e.g. "Syndakat") writes that credit into the
+// cleaned image, for the owner's own content (checklist H).
+// NOT removed, reported in `remaining`: embedded C2PA manifests (JUMBF) - a
+// manifest can declare AI-generated media, and stripping that declaration is
+// not something this module does. A file it cannot parse is returned unchanged.
+// Returns { bytes, removed: [{rule, detail}], remaining: scanFile(result) }.
+const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC_TABLE[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+const concat = (parts) => { const n = parts.reduce((a, p) => a + p.length, 0), o = new Uint8Array(n); let i = 0; for (const p of parts) { o.set(p, i); i += p.length; } return o; };
+const be32b = (v) => new Uint8Array([v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]);
+const be16b = (v) => new Uint8Array([(v >>> 8) & 255, v & 255]);
+const le16b = (v) => new Uint8Array([v & 255, (v >>> 8) & 255]);
+const le32b = (v) => new Uint8Array([v & 255, (v >>> 8) & 255, (v >>> 16) & 255, v >>> 24]);
+const ascii = (str) => new TextEncoder().encode(str);
+const TYPE_SIZE = [0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8];
+const DROP_TAGS = new Map([[0x8825, "gps"], [0x013B, "credit"], [0x8298, "credit"], [0x0131, "software"], [0x9C9D, "credit"]]);
+
+// Edit a TIFF block in place (same length): drop IFD0 entries for GPS, credit
+// and software, zero their value bytes and the whole GPS IFD.
+function tiffClean(t, removed, want = () => true) {
+  if (t.length < 8) return;
+  const le = t[0] === 0x49, r16 = (i) => u16(t, i, le), r32 = (i) => u32(t, i, le);
+  const w16 = (i, v) => { if (le) { t[i] = v & 255; t[i + 1] = v >> 8; } else { t[i] = v >> 8; t[i + 1] = v & 255; } };
+  const zero = (a, n) => { for (let i = Math.max(0, a); i < Math.min(t.length, a + n); i++) t[i] = 0; };
+  const ifd = r32(4); if (ifd + 2 > t.length) return;
+  const n = r16(ifd); const keep = [];
+  for (let k = 0; k < n; k++) {
+    const e = ifd + 2 + k * 12; if (e + 12 > t.length) return;
+    const tag = r16(e), type = r16(e + 2), count = r32(e + 4), size = (TYPE_SIZE[type] || 1) * count;
+    if (!DROP_TAGS.has(tag) || !want(DROP_TAGS.get(tag))) { keep.push(t.slice(e, e + 12)); continue; }
+    removed.push({ rule: DROP_TAGS.get(tag), detail: "EXIF tag 0x" + tag.toString(16) });
+    if (tag === 0x8825) {
+      const g = r32(e + 8);
+      // Only a GPS IFD past the header whose whole block fits: a zero or corrupt
+      // pointer would otherwise zero the TIFF header and every tag with it.
+      if (g >= 8 && g + 2 <= t.length && g + 2 + r16(g) * 12 + 4 <= t.length) { const m = r16(g); for (let q = 0; q < m; q++) { const ge = g + 2 + q * 12; if (ge + 12 > t.length) break; const gs = (TYPE_SIZE[r16(ge + 2)] || 1) * r32(ge + 4); if (gs > 4) zero(r32(ge + 8), gs); } zero(g, 2 + m * 12 + 4); }
+    } else if (size > 4) zero(r32(e + 8), size);
+  }
+  if (keep.length === n) return;
+  const next = t.slice(ifd + 2 + n * 12, ifd + 2 + n * 12 + 4);
+  w16(ifd, keep.length);
+  keep.forEach((row, k) => t.set(row, ifd + 2 + k * 12));
+  t.set(next, ifd + 2 + keep.length * 12);
+  zero(ifd + 2 + keep.length * 12 + 4, (n - keep.length) * 12);
+}
+const xmpPacket = (credit) => ascii(`<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/" photoshop:Credit="${credit.replace(/[<>&"]/g, "")}"/></rdf:RDF></x:xmpmeta><?xpacket end="w"?>`);
+
+function cleanJpeg(b, removed, opts, want) {
+  const out = [b.subarray(0, 2)]; let i = 2;
+  const credit = opts.credit ? [new Uint8Array([0xFF, 0xE1]), be16b(0), ascii("http://ns.adobe.com/xap/1.0/"), new Uint8Array([0]), xmpPacket(opts.credit)] : null;
+  if (credit) { const body = concat(credit.slice(2)); out.push(new Uint8Array([0xFF, 0xE1]), be16b(body.length + 2), body); removed.push({ rule: "credit-added", detail: opts.credit }); }
+  while (i + 4 <= b.length && b[i] === 0xFF) {
+    const m = b[i + 1];
+    if (m === 0xDA || m === 0xD9) break;
+    const len = u16(b, i + 2, false), end = i + 2 + len, body = b.subarray(i + 4, end), h = latin1(body, 0, Math.min(body.length, 40));
+    if (m === 0xE1 && h.startsWith("Exif" + String.fromCharCode(0))) { const seg = b.slice(i, end); tiffClean(seg.subarray(10), removed, want); out.push(seg); }
+    else if (m === 0xE1 && h.startsWith("http://ns.adobe.com/xap/") && want("xmp")) removed.push({ rule: "xmp", detail: "XMP packet" });
+    else if (m === 0xED && want("credit")) removed.push({ rule: "credit", detail: "IPTC/Photoshop block" });
+    else if (m === 0xFE && want("comment")) removed.push({ rule: "comment", detail: "JPEG comment" });
+    else out.push(b.subarray(i, end));
+    i = end;
+  }
+  out.push(b.subarray(i));
+  return concat(out);
+}
+const pngChunk = (type, body) => { const tb = concat([ascii(type), body]); return concat([be32b(body.length), tb, be32b(crc32(tb))]); };
+function cleanPng(b, removed, opts, want) {
+  const out = [b.subarray(0, 8)]; let i = 8;
+  while (i + 12 <= b.length) {
+    const len = u32(b, i, false), type = latin1(b, i + 4, i + 8), body = b.subarray(i + 8, i + 8 + len), whole = b.subarray(i, i + 12 + len);
+    if (type === "tEXt" || type === "iTXt" || type === "zTXt") {
+      const t = latin1(body), key = t.slice(0, t.indexOf(String.fromCharCode(0)));
+      const kind = /^(Software|Source)$/i.test(key) ? "software" : /^XML:com\.adobe\.xmp$/i.test(key) ? "xmp" : /^(Author|Copyright|Artist|Description)$/i.test(key) ? "credit" : /^(Comment|Creation Time)$/i.test(key) ? "comment" : null;
+      if (kind && want(kind)) removed.push({ rule: kind, detail: "PNG " + key });
+      else out.push(whole);
+    } else if (type === "eXIf") { const t = body.slice(); tiffClean(t, removed, want); out.push(pngChunk("eXIf", t)); }
+    else out.push(pngChunk(type, body)); // CRC recomputed: a kept chunk leaves valid either way
+    if (type === "IHDR" && opts.credit) { out.push(pngChunk("tEXt", concat([ascii("Author"), new Uint8Array([0]), ascii(opts.credit)]))); removed.push({ rule: "credit-added", detail: opts.credit }); }
+    if (type === "IEND") break;
+    i += 12 + len;
+  }
+  return concat(out);
+}
+function cleanWebp(b, removed, want) {
+  const out = []; let i = 12; let flags = -1, vp8x = -1;
+  while (i + 8 <= b.length) {
+    const id = latin1(b, i, i + 4), len = u32(b, i + 4, true), end = i + 8 + len + (len & 1);
+    // A WebP EXIF chunk goes whole when any of its kinds is set to remove.
+    if ((id === "EXIF" && (want("gps") || want("credit") || want("software"))) || (id === "XMP " && want("xmp"))) removed.push({ rule: id === "EXIF" ? "exif" : "xmp", detail: "WebP " + id.trim() + " chunk" });
+    else { if (id === "VP8X") vp8x = out.reduce((a, p) => a + p.length, 0) + 8; out.push(b.subarray(i, end)); }
+    i = end;
+  }
+  const bodyAll = concat(out);
+  if (vp8x >= 0) bodyAll[vp8x] &= ~0x0C;
+  return concat([ascii("RIFF"), le32b(bodyAll.length + 4), ascii("WEBP"), bodyAll]);
+}
+function cleanPdf(b, removed, want) {
+  const o = b.slice(); const t = latin1(o);
+  const blank = (a, e) => { for (let i = a; i < e; i++) o[i] = 0x20; };
+  for (const x of pdfInfoStrings(t, ["Producer", "Creator", "Author", "CreationDate", "ModDate"])) {
+    const rule = /Date$/.test(x.key) ? "office-meta" : x.key === "Author" ? "credit" : "software";
+    if (!x.value.trim() || !want(rule)) continue;
+    // The whole entry, key and value, becomes spaces: whitespace is legal
+    // between dictionary entries, the length is unchanged so every xref offset
+    // stays valid, and no emptied field is left behind to show a wipe.
+    blank(x.at, x.end + 1);
+    removed.push({ rule, detail: "PDF " + x.key });
+  }
+  for (const m of t.matchAll(/<(xmp:CreatorTool|pdf:Producer|dcterms:provenance|dc:creator)>([\s\S]*?)<\/\1>/g)) { if (!want("xmp")) continue; const a = m.index + m[1].length + 2; blank(a, a + m[2].length); removed.push({ rule: "xmp", detail: "PDF XMP " + m[1] }); }
+  return o;
+}
+function cleanFont(b, removed) {
+  const n = u16(b, 4, false), dir = [];
+  for (let k = 0; k < n; k++) { const e = 12 + k * 16; dir.push({ tag: latin1(b, e, e + 4), sum: u32(b, e + 4, false), off: u32(b, e + 8, false), len: u32(b, e + 12, false) }); }
+  const keep = dir.filter((d) => d.tag !== "C2PA");
+  if (keep.length === n) return b;
+  removed.push({ rule: "font-c2pa", detail: "font C2PA table" });
+  const m = keep.length, es = Math.floor(Math.log2(m)), sr = (1 << es) * 16;
+  let off = 12 + m * 16; const head = [b.subarray(0, 4), be16b(m), be16b(sr), be16b(es), be16b(m * 16 - sr)], rows = [], data = [];
+  for (const d of keep) { rows.push(concat([ascii(d.tag), be32b(d.sum), be32b(off), be32b(d.len)])); const body = b.subarray(d.off, d.off + d.len); const pad = (4 - (d.len % 4)) % 4; data.push(body, new Uint8Array(pad)); off += d.len + pad; }
+  return concat([...head, ...rows, ...data]);
+}
+async function deflateRaw(bytes) { const cs = new CompressionStream("deflate-raw"); const w = cs.writable.getWriter(); w.write(bytes); w.close(); return new Uint8Array(await new Response(cs.readable).arrayBuffer()); }
+// Office document properties that name a person, a program or a moment of
+// making: author, editor, company, the application and its template, editing
+// time, revision count and the created/modified stamps (a script sets both to
+// the same second, which is itself a tell). The saved statistics go too: a
+// generated file keeps its template's "0 words", and the editor recounts them.
+const OFFICE_META = /<(dc:creator|cp:lastModifiedBy|dc:description|Application|AppVersion|Template|TotalTime|Company|Manager|cp:revision|dcterms:created|dcterms:modified|cp:lastPrinted|Pages|Words|Characters|CharactersWithSpaces|Lines|Paragraphs)\b[^>]*>([^<]*)<\/\1>/g;
+// Statistics are removed but not reported: "Words: 523" is not a mark on its own.
+const OFFICE_STATS = /^(Pages|Words|Characters|CharactersWithSpaces|Lines|Paragraphs)$/;
+const OFFICE_EMPTY = /<(dc:creator|cp:lastModifiedBy|dc:description|Company|Manager)\/>/g;
+const RSID_ATTR = / w:rsid[A-Za-z]*="[0-9A-Fa-f]{8}"/g;
+const EMPTY_BIB = /^\s*(?:<\?xml[^>]*\?>)?\s*<b:Sources\b[^>]*\/>\s*$/;
+async function cleanZip(b, removed) {
+  let rsidSeen = false;
+  // Walk local headers (sizes from the central directory when a data descriptor is used).
+  const central = new Map(); let eocd = -1;
+  for (let i = b.length - 22; i >= Math.max(0, b.length - 65557); i--) if (u32(b, i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd >= 0) { let c = u32(b, eocd + 16, true); const cnt = u16(b, eocd + 10, true); for (let k = 0; k < cnt && u32(b, c, true) === 0x02014b50; k++) { const nl = u16(b, c + 28, true), xl = u16(b, c + 30, true), cl = u16(b, c + 32, true); central.set(u32(b, c + 42, true), { csize: u32(b, c + 20, true), usize: u32(b, c + 24, true), crc: u32(b, c + 16, true) }); c += 46 + nl + xl + cl; } }
+  const entries = []; let i = 0;
+  while (i + 30 <= b.length && u32(b, i, true) === 0x04034b50) {
+    const flags = u16(b, i + 6, true), method = u16(b, i + 8, true), nl = u16(b, i + 26, true), xl = u16(b, i + 28, true);
+    const cd = central.get(i); const csize = cd ? cd.csize : u32(b, i + 18, true), usize = cd ? cd.usize : u32(b, i + 22, true), crc = cd ? cd.crc : u32(b, i + 14, true);
+    const name = b.subarray(i + 30, i + 30 + nl), start = i + 30 + nl + xl;
+    let data = b.subarray(start, start + csize), e = { name, method, data, csize, usize, crc };
+    const fname = latin1(name);
+    let edit = null;
+    if (/^docProps\/(core|app)\.xml$/.test(fname)) {
+      // Each field goes whole, element and all (every one is optional in the
+      // package schema): an emptied <dc:creator></dc:creator> still shows a wipe.
+      edit = (xml) => xml.replace(OFFICE_META, (m0, tag, val) => { if (val.trim()) removed.push({ rule: "office-meta", detail: tag }); return ""; }).replace(OFFICE_EMPTY, "").replace(/\n[ \t]*(?=\n)/g, "");
+    } else if (fname === "_rels/.rels") {
+      edit = (xml) => xml.replace(/<Relationship\b[^>]*Target="\/?docProps\/thumbnail\.[a-z]+"[^>]*\/>/gi, "");
+    } else if (/^word\/[^/]+\.xml$/.test(fname)) {
+      // Editing-session ids (rsid): Word stamps every paragraph and run with the
+      // session that touched it, so they tie copies of a file together, and a
+      // template's fixed set with unstamped paragraphs marks a generated file.
+      // Optional in the schema; the editor adds fresh ones on the next save.
+      edit = (xml) => { const out = xml.replace(RSID_ATTR, "").replace(/<w:rsids>[\s\S]*?<\/w:rsids>/g, ""); if (out !== xml) rsidSeen = true; return out; };
+    } else if (/^docProps\/thumbnail\.[a-z]+$/i.test(fname)) {
+      removed.push({ rule: "office-meta", detail: "thumbnail image" });
+      i = start + csize + ((flags & 8) ? (u32(b, start + csize, true) === 0x08074b50 ? 16 : 12) : 0);
+      continue;
+    }
+    if (edit) {
+      const xml = new TextDecoder().decode(method === 8 ? await inflateRaw(data) : data), cleaned = edit(xml);
+      if (cleaned !== xml) { const raw = ascii(cleaned); const comp = method === 8 ? await deflateRaw(raw) : raw; e = { name, method, data: comp, csize: comp.length, usize: raw.length, crc: crc32(raw) }; }
+    }
+    e.fname = fname;
+    entries.push(e);
+    i = start + csize + ((flags & 8) ? (u32(b, start + csize, true) === 0x08074b50 ? 16 : 12) : 0);
+  }
+  if (!entries.length) return b;
+  if (rsidSeen) removed.push({ rule: "office-meta", detail: "editing-session ids (rsid)" });
+  // An EMPTY bibliography store carries a template's fixed item id, the same in
+  // every file made from that template. Only an empty one goes: a store holding
+  // real sources is the author's content. Its links go with it.
+  const dropItems = [];
+  for (const e of entries) {
+    const m = /^customXml\/item(\d+)\.xml$/.exec(e.fname);
+    if (m && EMPTY_BIB.test(new TextDecoder().decode(e.method === 8 ? await inflateRaw(e.data) : e.data))) dropItems.push(m[1]);
+  }
+  if (dropItems.length) {
+    removed.push({ rule: "office-meta", detail: "empty bibliography store (template id)" });
+    const gone = new Set(dropItems.flatMap((n) => [`customXml/item${n}.xml`, `customXml/itemProps${n}.xml`, `customXml/_rels/item${n}.xml.rels`]));
+    for (let k = entries.length - 1; k >= 0; k--) if (gone.has(entries[k].fname)) entries.splice(k, 1);
+    for (let k = 0; k < entries.length; k++) {
+      const e = entries[k];
+      let edit = null;
+      if (/^word\/_rels\/[^/]+\.rels$/.test(e.fname)) edit = (x) => dropItems.reduce((a, n) => a.replace(new RegExp(`<Relationship\\b[^>]*Target="\\.\\./customXml/item${n}\\.xml"[^>]*/>`, "g"), ""), x);
+      else if (e.fname === "[Content_Types].xml") edit = (x) => dropItems.reduce((a, n) => a.replace(new RegExp(`<Override\\b[^>]*PartName="/customXml/itemProps${n}\\.xml"[^>]*/>`, "g"), ""), x);
+      if (!edit) continue;
+      const xml = new TextDecoder().decode(e.method === 8 ? await inflateRaw(e.data) : e.data), cleaned = edit(xml);
+      if (cleaned !== xml) { const raw = ascii(cleaned); const comp = e.method === 8 ? await deflateRaw(raw) : raw; entries[k] = { name: e.name, fname: e.fname, method: e.method, data: comp, csize: comp.length, usize: raw.length, crc: crc32(raw) }; }
+    }
+  }
+  const parts = [], cdir = []; let off = 0;
+  for (const e of entries) {
+    const lh = concat([le32b(0x04034b50), le16b(20), le16b(0), le16b(e.method), le16b(0), le16b(0), le32b(e.crc), le32b(e.csize), le32b(e.usize), le16b(e.name.length), le16b(0), e.name]);
+    cdir.push(concat([le32b(0x02014b50), le16b(20), le16b(20), le16b(0), le16b(e.method), le16b(0), le16b(0), le32b(e.crc), le32b(e.csize), le32b(e.usize), le16b(e.name.length), le16b(0), le16b(0), le16b(0), le16b(0), le32b(0), le32b(off), e.name]));
+    parts.push(lh, e.data); off += lh.length + e.data.length;
+  }
+  const cd = concat(cdir);
+  return concat([...parts, cd, le32b(0x06054b50), le16b(0), le16b(0), le16b(entries.length), le16b(entries.length), le32b(cd.length), le32b(off), le16b(0)]);
+}
+function cleanSvg(b, removed) {
+  let t = new TextDecoder().decode(b); const before = t;
+  t = t.replace(/<metadata\b[\s\S]*?<\/metadata>/gi, () => { removed.push({ rule: "software", detail: "SVG metadata" }); return ""; });
+  t = t.replace(/<!--[^>]*?(?:Created with|Generator|Generated by|matplotlib|Inkscape|Illustrator)[\s\S]*?-->/gi, () => { removed.push({ rule: "software", detail: "SVG generator comment" }); return ""; });
+  return t === before ? b : ascii(t);
+}
+
+async function cleanFile(input, name = "", opts = {}) {
+  const st = settingsFrom(opts);
+  const want = (kind) => st.file[kind] === "remove";
+  opts = { ...opts, credit: st.add.credit || "" };
+  const b = input instanceof Uint8Array ? input : new Uint8Array(input);
+  const removed = []; let out = b;
+  const head = latin1(b, 0, Math.min(b.length, 16));
+  try {
+    if (b[0] === 0xFF && b[1] === 0xD8) out = cleanJpeg(b, removed, opts, want);
+    else if (head.startsWith(String.fromCharCode(0x89) + "PNG")) out = cleanPng(b, removed, opts, want);
+    else if (head.startsWith("RIFF") && latin1(b, 8, 12) === "WEBP") out = cleanWebp(b, removed, want);
+    else if (head.startsWith("%PDF")) out = cleanPdf(b, removed, want);
+    else if ((u32(b, 0, false) === 0x00010000 || head.startsWith("OTTO") || head.startsWith("true")) && want("font-c2pa")) out = cleanFont(b, removed);
+    else if (b[0] === 0x50 && b[1] === 0x4B && b[2] === 3 && b[3] === 4 && want("office-meta")) out = await cleanZip(b, removed);
+    else if (/<svg\b|<\?xml/i.test(head + latin1(b, 16, Math.min(b.length, 400))) && want("software")) out = cleanSvg(b, removed);
+  } catch (e) { return { bytes: b, removed: [], remaining: await scanFile(b, name), error: String(e && e.message || e) }; }
+  if (!removed.length) out = b;
+  const remaining = (await scanFile(out, name)).filter((f) => (st.file[f.rule] || "keep") !== "off");
+  return { bytes: out, removed, remaining };
+}
+
+// ---------------------------------------------------------------- runNoMarks
+// The one entry point the gateway uses, for the owner's tool and the customer
+// route alike. Validates the settings and the input, caps sizes, and returns a
+// report. A cleaned file comes back as sha256 + size; the bytes themselves only
+// when return_file is true and the result is small (tool results have a size
+// limit, and a whole site belongs in a script, not a chat).
+const NM_LIMITS = Object.freeze({ text: 2_000_000, file: 10_000_000, returnFile: 1_000_000, findings: 500 });
+const b64decode = (s) => {
+  if (typeof s !== "string" || !/^[A-Za-z0-9+/=\s]*$/.test(s)) return null;
+  try { const bin = atob(s.replace(/\s+/g, "")); const o = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) o[i] = bin.charCodeAt(i); return o; } catch { return null; }
+};
+const b64encode = (b) => { let s = ""; for (let i = 0; i < b.length; i += 32768) s += String.fromCharCode.apply(null, b.subarray(i, i + 32768)); return btoa(s); };
+const hexOf = (buf) => [...new Uint8Array(buf)].map((x) => x.toString(16).padStart(2, "0")).join("");
+const capList = (list) => ({ count: list.length, items: list.slice(0, NM_LIMITS.findings) });
+
+async function runNoMarks(args = {}, settingsInput = {}) {
+  const rs = resolveSettings(settingsInput || {});
+  if (!rs.ok) return { ok: false, error: "invalid settings", errors: rs.errors };
+  const st = rs.settings, action = args.action;
+  if (action === "scan_text" || action === "clean_text") {
+    if (typeof args.text !== "string") return { ok: false, error: "text is required" };
+    if (args.text.length > NM_LIMITS.text) return { ok: false, error: `text is over the ${NM_LIMITS.text} character limit; send it in parts` };
+    if (action === "scan_text") return { ok: true, findings: capList(scanText(args.text, scanOptsFrom(st)).filter((f) => st.text[f.rule] !== "off")) };
+    const r = cleanText(args.text, { settings: st });
+    return { ok: true, text: r.text, changed: r.text !== args.text, fixed: r.fixed, remaining: capList(r.remaining) };
+  }
+  if (action === "scan_file" || action === "clean_file") {
+    const bytes = b64decode(args.file_base64);
+    if (!bytes) return { ok: false, error: "file_base64 is required and must be valid base64" };
+    if (bytes.length > NM_LIMITS.file) return { ok: false, error: `file is over the ${NM_LIMITS.file} byte limit` };
+    const name = typeof args.name === "string" ? args.name.slice(0, 200) : "";
+    if (action === "scan_file") return { ok: true, findings: capList((await scanFile(bytes, name)).filter((f) => (st.file[f.rule] || "keep") !== "off")) };
+    const r = await cleanFile(bytes, name, { settings: st });
+    const out = { ok: true, changed: r.removed.length > 0, removed: r.removed, remaining: capList(r.remaining), size: r.bytes.length, sha256: hexOf(await crypto.subtle.digest("SHA-256", r.bytes)) };
+    if (r.error) out.note = "file could not be parsed; returned unchanged";
+    if (args.return_file === true) { if (r.bytes.length <= NM_LIMITS.returnFile) out.file_base64 = b64encode(r.bytes); else out.note = `cleaned file is over ${NM_LIMITS.returnFile} bytes; not returned inline`; }
+    return out;
+  }
+  const plugged = ACTIONS.get(action);
+  if (plugged) return plugged(args, st, { scanText, scanOptsFrom, capList, NM_LIMITS });
+  return { ok: false, error: "action must be one of " + ["scan_text", "clean_text", "scan_file", "clean_file", ...ACTIONS.keys()].join(", ") };
+}
+
+// ---------------------------------------------------------------- public API
+// scanText(text, { denylist?, internalHosts?, internalPaths?, typography?, styleWords? }) -> findings,
+// sorted by position. Each finding: { rule, index, line, col, codepoint?, detail? }.
+function scanText(text, opts = {}) {
+  const s = String(text ?? "");
+  const at = locator(s);
+  const out = [];
+  const add = (rule, index, extra = {}) => out.push({ rule, index, ...at(index), ...extra });
+  scanChars(s, add);
+  scanLines(s, add, opts || {});
+  scanPatterns(s, add, opts || {});
+  scanVisible(s, add, opts || {});
+  return out.sort((a, b) => a.index - b.index || a.rule.localeCompare(b.rule));
+}
+
+// scanCommit({ message, authorName, authorEmail }, opts) -> findings for the
+// message plus a tool-author finding when the author names an AI tool.
+// "Syndakat" with an empty email is the owner's ruling (3048) and passes.
+function scanCommit(c = {}, opts = {}) {
+  const out = scanText(c.message || "", opts).map((f) => ({ ...f, where: "message" }));
+  // Checklist D: the author AND the committer.
+  for (const who of ["author", "committer"]) {
+    const name = String(c[who + "Name"] || ""), email = String(c[who + "Email"] || "");
+    if (TOOL_AUTHOR_NAME.test(name) || (email && TOOL_EMAIL.test(email))) out.push({ rule: "tool-author", where: who, detail: `${name} <${email}>` });
+  }
+  return out;
+}
+return { scanText, cleanText, runNoMarks, resolveSettings, mergeSettings, DEFAULT_SETTINGS, NM_LIMITS };
+})();
+// >>> NO-MARKS-LOCAL END <<<
+
 function mergeNoMarksSettings(a = {}, b = {}) {
   const A = a && typeof a === "object" ? a : {}, B = b && typeof b === "object" ? b : {};
   const out = { ...A, ...B };
@@ -1421,6 +2399,40 @@ async function callNoMarks(env, token, body) {
   }
 }
 
+
+// THE SPLIT (2026-10-24, owner decision 3512 for pending 3463). The commodity checks (hidden characters,
+// spaces, dashes and quotes, attribution lines, leaks, file metadata) run HERE, in your own account, on
+// the core copied in above, so your text and files stay with you. Two things still use the service:
+//   1. the licence and plan check, which carries no text (authorise_only);
+//   2. the checks that use Bouios's own word lists (AI leftovers, style words), sent the text only when
+//      you have left one of them on, and the editor (edit_brief, edit_check), which is the service's.
+// Locked by worker/test/no-marks-forward.test.mjs.
+const NM_WORDLIST_RULES = ["ai-artefact", "style-word"];
+async function runNoMarksSplit(env, token, args, settings) {
+  const action = args && args.action;
+  const clean = { ...args, project: undefined };
+  if (action === "edit_brief" || action === "edit_check") return callNoMarks(env, token, { ...clean, settings });
+  if (!["scan_text", "clean_text", "scan_file", "clean_file"].includes(action)) return { ok: false, error: "action must be one of scan_text, clean_text, scan_file, clean_file, edit_brief, edit_check" };
+  const rs = NM.resolveSettings(settings || {});
+  if (!rs.ok) return { ok: false, error: "invalid settings", errors: rs.errors };
+  const gate = await callNoMarks(env, token, { action, authorise_only: true });
+  if (!gate.ok) return { ok: false, ...gate };
+  const out = await NM.runNoMarks(clean, settings || {});
+  if (!out.ok) return out;
+  const text = action === "scan_text" || action === "clean_text";
+  if (text && typeof args.text === "string" && NM_WORDLIST_RULES.some((r) => rs.settings.text[r] !== "off")) {
+    const onlyWordlists = { text: Object.fromEntries(Object.keys(rs.settings.text).map((k) => [k, NM_WORDLIST_RULES.includes(k) ? rs.settings.text[k] : "off"])) };
+    const remote = await callNoMarks(env, token, { action: "scan_text", text: args.text, settings: onlyWordlists });
+    if (remote.ok && remote.findings && Array.isArray(remote.findings.items)) {
+      const into = action === "scan_text" ? out.findings : out.remaining;
+      into.items = [...into.items, ...remote.findings.items].sort((a, b) => a.index - b.index);
+      into.count = into.items.length;
+    } else {
+      out.service_checks = "not run: " + ((remote && remote.error) || "the service did not answer") + ". The checks that run in your account are complete.";
+    }
+  }
+  return out;
+}
 
 // MCP transport size ceiling - MIRROR of memory-gateway/src/index.js, added to
 // this customer worker 2026-09-16. Until today it had NO ceiling at all: the
@@ -1829,14 +2841,14 @@ async function handleMsg(msg, sessionId, env, request, url) {
         if (args.action === "get_settings") return toolText(id, JSON.stringify({ ok: true, project: domain, settings: stored, note: "Anything not listed uses the default." }));
         if (args.action === "set_settings") {
           const next = mergeNoMarksSettings(stored, args.settings || {});
-          // The service validates settings; a refused set is not saved.
-          const check = await callNoMarks(env, token, { action: "scan_text", text: "", settings: next });
-          if (!check.ok) return toolText(id, JSON.stringify({ ok: false, project: domain, error: check.error, errors: check.errors }), true);
+          // Settings are checked here, in your own account (the same rules the service uses); a refused set is not saved.
+          const check = NM.resolveSettings(next);
+          if (!check.ok) return toolText(id, JSON.stringify({ ok: false, project: domain, error: "invalid settings", errors: check.errors }), true);
           await env.DB.prepare("INSERT OR REPLACE INTO context (domain, key, content, updated_at) VALUES (?, 'no-marks:settings', ?, ?)")
             .bind(domain, JSON.stringify(next), new Date().toISOString()).run();
           return toolText(id, JSON.stringify({ ok: true, project: domain, settings: next }));
         }
-        const out = await callNoMarks(env, token, { ...args, project: undefined, settings: mergeNoMarksSettings(stored, args.settings || {}) });
+        const out = await runNoMarksSplit(env, token, args, mergeNoMarksSettings(stored, args.settings || {}));
         return toolText(id, JSON.stringify(out), out.ok === false);
       }
       if (name === "bouios_edit" || name === "bouios_delete") {
