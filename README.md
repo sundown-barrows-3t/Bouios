@@ -85,9 +85,30 @@ name it **`LICENCE`**, paste the key and deploy.
 
 ---
 
+## Optional: keep your chat transcripts (needs storage on your account)
+
+The button sets up your memory without chat storage, so memory works on any
+account. To keep chat transcripts, add storage as a second step. You need R2
+storage switched on in your Cloudflare account. This step checks that first and,
+if it is not on, tells you how to switch it on and changes nothing.
+
+In a terminal, with a Cloudflare API token that can edit Workers and R2 storage:
+
+    CLOUDFLARE_API_TOKEN=<your token> WORKER_URL=https://<your-address>.workers.dev BEARER_TOKEN=<your BEARER_TOKEN> bash hooks/add-transcript-storage.sh
+
+It creates the bucket, adds it to your worker (your existing settings and secrets
+are kept), sets up the Claude Code backup below, and then stores a small test file
+and reads it back so you can see it works. Run it again at any time: nothing is
+added twice. If your worker is not called `memory-vault`, add
+`WORKER_NAME=<your worker name>`. If your token can see more than one account, add
+`CLOUDFLARE_ACCOUNT_ID=<your account id>`.
+
+---
+
 ## Optional: back up your Claude Code chats
 
-In a terminal on the machine where you use Claude Code, run:
+The step above already does this. To do only this part, in a terminal on the
+machine where you use Claude Code, run:
 
     bash hooks/install-transcript-hook.sh https://<your-address>.workers.dev <your BEARER_TOKEN>
 
