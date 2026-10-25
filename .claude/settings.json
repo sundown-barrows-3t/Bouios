@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "mkdir -p ~/.claude; if [ -f \"$PWD/.session/session-start.sh\" ]; then bash \"$PWD/.session/session-start.sh\"; else echo '=== LOAD MEMORY FIRST ==='; echo 'Use your registered memory tools to load your working set before any work.'; echo '==='; fi"
+            "command": "mkdir -p ~/.claude; [ -f \"$PWD/hooks/fetch-customer-hooks.sh\" ] && bash \"$PWD/hooks/fetch-customer-hooks.sh\"; if [ -f \"$PWD/.session/session-start.sh\" ]; then bash \"$PWD/.session/session-start.sh\"; else echo '=== LOAD MEMORY FIRST ==='; echo 'Use your registered memory tools to load your working set before any work.'; echo '==='; fi"
           }
         ]
       }
@@ -84,6 +84,8 @@
     ]
   },
   "permissions": {
-    "allow": ["Skill"]
+    "allow": [
+      "Skill"
+    ]
   }
 }
