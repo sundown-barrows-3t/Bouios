@@ -1019,7 +1019,7 @@ async function sessionWrite(domain, body, db, tz) {
   // the gateway's compare-and-swap needs its own result.
   if (batched.length) await db.batch(batched);
   const savedAt = new Date();
-  return { ok: true, domain, applied, ...(rejected.length ? { rejected } : {}), ...(marked.length ? { marked } : {}), ...(wasteMissing.length ? { waste_missing: wasteMissing, waste_note: "Each mistake row needs a WASTE line: time, tokens or cost, cycles repeated and owner turns lost, each with its source (owner ruling 2026-10-07). Add it with bouios_edit." } : {}), saved_at: savedAt.toISOString(), confirmation: saveConfirmation(applied, savedAt, tz) };
+  return { ok: true, domain, applied, ...(rejected.length ? { rejected } : {}), ...(marked.length ? { marked } : {}), ...(wasteMissing.length ? { waste_missing: wasteMissing, waste_note: "Each mistake row needs a WASTE line: time, tokens or cost, cycles repeated and owner turns lost, each with its source (owner ruling 2026-10-07). Add it with bouios_edit." } : {}), saved_at: savedAt.toISOString(), confirmation: saveConfirmation(applied, savedAt, tz, rejected.length) };
 }
 
 // SAVE TIME (2026-09-24). A save hands back the moment it was written and a
@@ -1029,7 +1029,7 @@ async function sessionWrite(domain, body, db, tz) {
 // unknown, the line says UTC, never an unlabelled time. Counts only what was
 // applied. Kept identical in memory-gateway/src/index.js and
 // worker/src/index.js; memory-gateway/test/save-time.test.mjs.
-function saveConfirmation(applied, now, tz) {
+function saveConfirmation(applied, now, tz, refused) {
   const n = (p) => applied.filter((a) => a === p || a.startsWith(p + ":") || a.startsWith(p + " ")).length;
   const parts = [];
   if (n("hot")) parts.push("hot");
@@ -1039,6 +1039,9 @@ function saveConfirmation(applied, now, tz) {
   if (n("memory")) s += ", " + plural(n("memory"), "new memory row");
   if (n("context")) s += ", " + plural(n("context"), "context row");
   if (n("resolved")) s += ", " + plural(n("resolved"), "resolved row");
+  // A REFUSED ROW IS NAMED ON THE LINE THE OWNER SEES (AI 3939 part 1753): "saved: nothing new" hid a
+  // decision row refused for missing evidence. The response also lists each one under rejected.
+  if (refused > 0) s += ", " + plural(refused, "row") + " REFUSED (named under rejected, not stored)";
   const fmt = (zone) => new Intl.DateTimeFormat("en-GB", { timeZone: zone, hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" }).format(now);
   let t;
   try { t = fmt(tz || "UTC"); } catch (_) { t = fmt("UTC"); }
