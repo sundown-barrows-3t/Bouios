@@ -47,6 +47,10 @@ const SCHEMA = [
   // Where each chat/Cowork session's record has got to (2026-10-06):
   // which part object is being filled and how many bytes it holds, so adding a
   // line does not have to list the bucket. See recordChatTurn.
+  // Past-chat excerpt index (2026-10-27, BOUIOS 4053): what the user typed in each stored transcript, so the
+  // per-message lookup and bouios_transcripts can find a past chat. Same table as the owner gateway's.
+  "CREATE TABLE IF NOT EXISTS transcript_excerpts (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, turn_index INTEGER NOT NULL, ts TEXT, domain TEXT NOT NULL, excerpt TEXT NOT NULL, UNIQUE(session_id, turn_index))",
+  "CREATE INDEX IF NOT EXISTS transcript_excerpts_domain_id ON transcript_excerpts (domain, id)",
   "CREATE TABLE IF NOT EXISTS chat_record_parts (session_id TEXT PRIMARY KEY, part INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, updated_at TEXT)",
   // The last rules and instructions our service sent this licensed install
   // (2026-10-07), so our service being unreachable cannot strip it. See rememberLicensed.
@@ -195,7 +199,111 @@ async function historyWindowDays(request, url, env) {
     return null;
   }
 }
-async function transcriptRoute(request, env, url, path) {
+// PAST-CHAT EXCERPT INDEX (2026-10-27, BOUIOS 4053; owner: "How the hell does customer have no transcripts").
+// The owner gateway has indexed what the owner typed in every uploaded transcript since 25 Sep (ddaff8e), so
+// its per-message lookup finds a past chat. This worker stored the customer's transcripts but never indexed
+// them, so their lookup could not. These are the gateway's own functions (extractOwnerTurnExcerpts,
+// ownerTurnExcerptOfLine, ownerTurnExcerptsFromStream), copied because this file deploys standalone.
+// Only what the person typed is indexed: never the model's words, never a tool result riding the user role.
+// Everything stays in this account: the index is a table in this worker's own database.
+function extractOwnerTurnExcerpts(text) {
+  const out = [];
+  const lines = String(text || "").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (!rec || rec.type !== "user") continue;
+    const msg = rec.message;
+    if (!msg || typeof msg !== "object") continue;
+    let raw = "";
+    if (typeof msg.content === "string") {
+      raw = msg.content;
+    } else if (Array.isArray(msg.content)) {
+      const textParts = msg.content.filter((p) => p && p.type === "text" && typeof p.text === "string");
+      if (!textParts.length) continue;
+      raw = textParts.map((p) => p.text).join(" ");
+    } else {
+      continue;
+    }
+    raw = raw.trim();
+    if (!raw) continue;
+    const ts = typeof rec.timestamp === "string" ? rec.timestamp : null;
+    out.push({ turn_index: i, ts, excerpt: raw.slice(0, 300) });
+  }
+  return out;
+}
+function ownerTurnExcerptOfLine(line, i) {
+  line = line.trim();
+  if (!line || line.indexOf('"user"') === -1) return null;
+  return extractOwnerTurnExcerpts(line).map((r) => ({ ...r, turn_index: i }))[0] || null;
+}
+const TRANSCRIPT_LINE_MAX_CHARS = 1024 * 1024;
+async function ownerTurnExcerptsFromStream(byteStream) {
+  const out = [];
+  const reader = byteStream.pipeThrough(new TextDecoderStream()).getReader();
+  let carry = "", dropping = false, i = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const parts = value.split("\n");
+    for (let k = 0; k < parts.length; k++) {
+      if (!dropping) { carry += parts[k]; if (carry.length > TRANSCRIPT_LINE_MAX_CHARS) { carry = ""; dropping = true; } }
+      if (k < parts.length - 1) {
+        if (!dropping) { const r = ownerTurnExcerptOfLine(carry, i); if (r) out.push(r); }
+        i++; carry = ""; dropping = false;
+      }
+    }
+  }
+  if (!dropping) { const last = ownerTurnExcerptOfLine(carry, i); if (last) out.push(last); }
+  return out;
+}
+const transcriptSessionId = (key) => String(key).replace(/^transcript:/, "").replace(/\.jsonl(\.gz)?$/, "");
+// Re-index one stored transcript: delete its rows, insert the fresh set (an upload is the whole transcript,
+// never a delta, so this can never duplicate). Reads the stored object, so a streamed upload is indexed too.
+// FAIL OPEN: the upload has already been stored when this runs; an indexing error never fails it.
+async function indexStoredTranscript(env, key, domain) {
+  try {
+    const obj = await env.TRANSCRIPTS.get(key);
+    if (!obj || !obj.body) return 0;
+    let src = obj.body;
+    if (/\.gz$/.test(key)) {
+      if (typeof DecompressionStream === "undefined") return 0;
+      src = src.pipeThrough(new DecompressionStream("gzip"));
+    }
+    const rows = await ownerTurnExcerptsFromStream(src);
+    await ensureSchema(env.DB);
+    const sid = transcriptSessionId(key);
+    await env.DB.prepare("DELETE FROM transcript_excerpts WHERE session_id = ?").bind(sid).run();
+    const ins = (r) => env.DB.prepare("INSERT INTO transcript_excerpts (session_id, turn_index, ts, domain, excerpt) VALUES (?, ?, ?, ?, ?)").bind(sid, r.turn_index, r.ts, domain || "", r.excerpt);
+    for (let k = 0; k < rows.length; k += 50) await env.DB.batch(rows.slice(k, k + 50).map(ins));
+    return rows.length;
+  } catch (_) {
+    return 0;
+  }
+}
+// The project an upload names (header x-bouios-project, sent by the upload hook from the session's own load),
+// or "" for an untagged upload. Untagged past chats are searched for every project of this account, as the
+// owner gateway treats untagged transcripts.
+const uploadProject = (request) => normaliseProject(request.headers.get("x-bouios-project") || "") || "";
+// Index after the response, off the upload's path: a large transcript must never slow or fail the upload.
+function afterTranscriptPut(env, ctx, key, domain) {
+  if (String(key).startsWith("chat/")) return;
+  const job = indexStoredTranscript(env, key, domain);
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(job);
+  else globalThis.__lastTranscriptIndex = job; // in-process tests with no ctx await this
+}
+// The plan's history window, asked once per isolate per ten minutes (only the licence is sent, never data).
+let historyCache = { at: 0, days: undefined };
+async function historyWindowDaysCached(request, url, env) {
+  if (historyCache.days !== undefined && Date.now() - historyCache.at < 600000) return historyCache.days;
+  const days = await historyWindowDays(request, url, env);
+  historyCache = { at: Date.now(), days };
+  return days;
+}
+
+async function transcriptRoute(request, env, url, path, ctx) {
   if (!env.TRANSCRIPTS) return json({ error: "transcript storage is not set up on this install" }, 501);
   let id = "";
   try { id = path === "/transcript" ? "" : decodeURIComponent(path.slice("/transcript/".length)); } catch { return json({ error: "invalid transcript id" }, 400); }
@@ -211,7 +319,7 @@ async function transcriptRoute(request, env, url, path) {
     // in the 128MB isolate - the cause of the owner gateway's out-of-memory
     // 503s (memory 3169). The shorter-copy check uses the declared length.
     // Without one (chunked) it is buffered and checked as before.
-    const opts = { httpMetadata: { contentType: request.headers.get("content-type") || "application/x-ndjson" } };
+    const opts = { httpMetadata: { contentType: request.headers.get("content-type") || "application/x-ndjson" }, ...(uploadProject(request) ? { customMetadata: { project: uploadProject(request) } } : {}) };
     const declared = Number(request.headers.get("content-length") || 0);
     const existing = await env.TRANSCRIPTS.head(id);
     const tooShort = (n) => existing && n < existing.size;
@@ -219,11 +327,13 @@ async function transcriptRoute(request, env, url, path) {
       if (tooShort(declared)) return json({ error: "a transcript with this id is already stored and is longer; upload under a new id" }, 409);
       const { readable, writable } = new FixedLengthStream(declared);
       const [put] = await Promise.all([env.TRANSCRIPTS.put(id, readable, opts), request.body.pipeTo(writable)]);
+      afterTranscriptPut(env, ctx, id, uploadProject(request));
       return json({ ok: true, id, size: put ? put.size : declared });
     }
     const bytes = await request.arrayBuffer();
     if (tooShort(bytes.byteLength)) return json({ error: "a transcript with this id is already stored and is longer; upload under a new id" }, 409);
     const put = await env.TRANSCRIPTS.put(id, bytes, opts);
+    afterTranscriptPut(env, ctx, id, uploadProject(request));
     return json({ ok: true, id, size: put ? put.size : bytes.byteLength });
   }
   if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
@@ -647,10 +757,9 @@ async function relevantMemory(db, domain, topic, excludeIds) {
 // gateway's /search exactly: up to 6 memory rows (the best 3 with their body, up to 1500 characters),
 // up to 5 log lines scored by the same terms, and the same two keys the hook reads, `transcripts` and
 // `elsewhere`. `elsewhere` is always empty (ruling 2938: no other project's rows ride on a lookup).
-// `transcripts` is empty here: a customer's transcripts are in their own bucket and carry no excerpt
-// index in the database yet, so the hook prints no past-chat line for them. Read-only: it writes
-// nothing, so a lookup can never arm the load guard or add a log row.
-async function searchRoute(url, env) {
+// `transcripts` comes from the past-chat excerpt index (indexStoredTranscript), within the plan's history
+// window. Read-only: it writes nothing, so a lookup can never arm the load guard or add a log row.
+async function searchRoute(url, env, request) {
   const domain = normaliseProject(url.searchParams.get("domain"));
   const q = String(url.searchParams.get("q") || "").slice(0, 500);
   if (!domain || !relevanceTerms(q).length) return json({ error: "domain and a query with at least one content word are required" }, 400);
@@ -677,7 +786,22 @@ async function searchRoute(url, env) {
       "ORDER BY score DESC, id DESC LIMIT 5"
     ).bind(...binds).all();
     const log = (logRows.results || []).map((r) => ({ id: r.id, ts: r.ts, summary: r.summary }));
-    return json({ domain, q, memory: mem, elsewhere: [], log, transcripts: [] });
+    // Past chats: the log's term scoring against the excerpt index, within the plan's history window (an unknown
+    // window is open, the worker's fail-open rule for the customer's own data); this project's chats or untagged.
+    const days = await historyWindowDaysCached(request, url, env);
+    const since = days === null || days === undefined ? null : new Date(Date.now() - days * 86400000).toISOString();
+    const tscore = terms.map(() => "(CASE WHEN lower(excerpt) LIKE ? THEN 1 ELSE 0 END)").join(" + ");
+    const tbinds = [];
+    for (const t of terms) tbinds.push("%" + t + "%");
+    tbinds.push(domain);
+    if (since) tbinds.push(since);
+    for (const t of terms) tbinds.push("%" + t + "%");
+    const tx = await env.DB.prepare(
+      "SELECT session_id, turn_index, ts, excerpt, (" + tscore + ") AS score FROM transcript_excerpts " +
+      "WHERE (domain = ? OR domain = '')" + (since ? " AND ts >= ?" : "") + " AND (" + tscore + ") > 0 ORDER BY score DESC, id DESC LIMIT 5"
+    ).bind(...tbinds).all();
+    const transcripts = (tx.results || []).map((r) => ({ session_id: r.session_id, turn: r.turn_index, ts: r.ts, excerpt: r.excerpt }));
+    return json({ domain, q, memory: mem, elsewhere: [], log, transcripts });
   } catch (e) {
     return json({ error: "search failed", detail: String(e) }, 500);
   }
@@ -1179,7 +1303,7 @@ async function loadedThisSession(db, domain, sessionId) {
   return domainLoadedRecently(db, domain);
 }
 
-const AUTO_LOAD_TOOLS = new Set(["bouios_save", "bouios_handoff", "bouios_get", "bouios_edit", "bouios_delete", "bouios_no_marks"]);
+const AUTO_LOAD_TOOLS = new Set(["bouios_save", "bouios_handoff", "bouios_get", "bouios_edit", "bouios_delete", "bouios_no_marks", "bouios_transcripts"]);
 const AUTO_LOAD_PREFACE = "Memory was not loaded in this chat; loaded it now.";
 
 // The one MCP load path: bouios_load and the auto-load both come through here.
@@ -1413,6 +1537,30 @@ const MCP_TOOLS = [
         load_token: { type: "string" },
       },
       required: ["project", "reason"],
+    },
+  },
+  {
+    // Your own past chats, from YOUR bucket and YOUR database (2026-10-27, BOUIOS 4053): the owner's
+    // bouios_transcripts, the same three actions, reading only this account's storage, within the plan's
+    // history window. Nothing is sent anywhere.
+    name: "bouios_transcripts",
+    description:
+      "Search and read your stored chat transcripts, to recover work or a decision from a past chat. " +
+      "Actions: search (q, a few words: finds what you typed in past chats for the project), " +
+      "list (recent transcripts for the project, newest first), " +
+      "read (session_id + q: the lines of one stored transcript that contain the words, clipped, with their line numbers). " +
+      "A transcript can hold anything that was in the chat, so quote only what the task needs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Project, uppercase. Only transcripts tagged with it, or never tagged, are returned." },
+        action: { type: "string", enum: ["search", "list", "read"] },
+        q: { type: "string", description: "Words to look for (search, read)." },
+        session_id: { type: "string", description: "read: the transcript's session id (with or without .jsonl)." },
+        limit: { type: "number", description: "search and list: how many rows, default 5, at most 20." },
+        max_chars: { type: "number", description: "read: at most this many characters of matching lines, default 6000, at most 20000." },
+      },
+      required: ["project", "action"],
     },
   },
   {
@@ -2747,6 +2895,96 @@ function clampMcpLoadSize(out) {
 
 function rpcResult(id, result) { return { jsonrpc: "2.0", id, result }; }
 function rpcError(id, code, message) { return { jsonrpc: "2.0", id, error: { code, message } }; }
+// bouios_transcripts on the customer's own storage (2026-10-27, BOUIOS 4053). The gateway's transcriptTool,
+// adapted to this worker's object names (<session>.jsonl, untagged or tagged with customMetadata.project)
+// and to the plan's history window, which this worker already applies to GET /transcript.
+async function transcriptTool(env, domain, args, request, url) {
+  const action = args && args.action;
+  const clampN = (v, dflt, max) => { const n = Math.floor(Number(v)); return Number.isFinite(n) && n > 0 ? Math.min(n, max) : dflt; };
+  const days = await historyWindowDaysCached(request, url, env);
+  const sinceMs = days === null || days === undefined ? null : Date.now() - days * 86400000;
+  if (action === "search") {
+    const q = String(args.q || "").slice(0, 500);
+    const terms = relevanceTerms(q);
+    if (!terms.length) return { ok: false, error: "q needs at least one content word" };
+    await ensureSchema(env.DB);
+    const score = terms.map(() => "(CASE WHEN lower(excerpt) LIKE ? THEN 1 ELSE 0 END)").join(" + ");
+    const like = terms.map((t) => "%" + t + "%");
+    const since = sinceMs === null ? null : new Date(sinceMs).toISOString();
+    const rows = await env.DB.prepare(
+      "SELECT session_id, turn_index, ts, excerpt, (" + score + ") AS score FROM transcript_excerpts WHERE (domain = ? OR domain = '')" +
+      (since ? " AND ts >= ?" : "") + " AND (" + score + ") > 0 ORDER BY score DESC, id DESC LIMIT ?"
+    ).bind(...like, domain, ...(since ? [since] : []), ...like, clampN(args.limit, 5, 20)).all();
+    return { ok: true, project: domain, q, history_days: days, matches: (rows.results || []).map((r) => ({ session_id: r.session_id, line: r.turn_index, ts: r.ts, excerpt: r.excerpt })), note: "What you typed only. To read a whole stretch of one chat use read with session_id and q." };
+  }
+  if (!env.TRANSCRIPTS) return { ok: false, error: "transcript storage is not set up on this install" };
+  const inWindow = (o) => sinceMs === null || (o.uploaded && new Date(o.uploaded).getTime() >= sinceMs);
+  if (action === "list") {
+    const objects = [];
+    let cursor;
+    do {
+      const page = await env.TRANSCRIPTS.list({ cursor, limit: 1000, include: ["customMetadata"] });
+      for (const o of page.objects || []) {
+        if (String(o.key).startsWith("chat/") || !inWindow(o)) continue;
+        const project = (o.customMetadata && o.customMetadata.project) || null;
+        if (project && project !== domain) continue;
+        objects.push({ session_id: transcriptSessionId(o.key), size: o.size, uploaded: o.uploaded, project });
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    objects.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded));
+    return { ok: true, project: domain, history_days: days, transcripts: objects.slice(0, clampN(args.limit, 5, 20)) };
+  }
+  if (action === "read") {
+    const sid = transcriptSessionId(String(args.session_id || ""));
+    if (!TRANSCRIPT_ID.test(sid)) return { ok: false, error: "session_id is not a stored transcript name" };
+    const terms = relevanceTerms(String(args.q || "").slice(0, 500));
+    if (!terms.length) return { ok: false, error: "q needs at least one content word" };
+    let obj = null;
+    for (const key of [sid + ".jsonl", sid, sid + ".jsonl.gz"]) {
+      obj = await env.TRANSCRIPTS.get(key);
+      if (obj) { obj.__key = key; break; }
+    }
+    if (!obj || !obj.body) return { ok: false, error: "no stored transcript with that id" };
+    if (!inWindow(obj)) return { ok: false, error: "this transcript is older than your plan's history period; it is still in your storage" };
+    const tag = obj.customMetadata && obj.customMetadata.project;
+    if (tag && tag !== domain) return { ok: false, error: "that transcript belongs to another project" };
+    let src = obj.body;
+    if (/\.gz$/.test(obj.__key)) {
+      if (typeof DecompressionStream === "undefined") return { ok: false, error: "gzip not supported here" };
+      src = src.pipeThrough(new DecompressionStream("gzip"));
+    }
+    const budget = clampN(args.max_chars, 6000, 20000);
+    const hits = [];
+    let used = 0, lineNo = 0, scanned = 0, carry = "", dropping = false, full = false;
+    const check = (line) => {
+      lineNo++;
+      if (!line) return;
+      scanned++;
+      const low = line.toLowerCase();
+      if (!terms.some((t) => low.includes(t))) return;
+      const clip = line.length > 900 ? line.slice(0, 900) + "..." : line;
+      if (used + clip.length > budget) { full = true; return; }
+      used += clip.length;
+      hits.push({ line: lineNo - 1, text: clip });
+    };
+    const reader = src.pipeThrough(new TextDecoderStream()).getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const parts = value.split("\n");
+      for (let k = 0; k < parts.length; k++) {
+        if (!dropping) { carry += parts[k]; if (carry.length > TRANSCRIPT_LINE_MAX_CHARS) { carry = ""; dropping = true; } }
+        if (k < parts.length - 1) { if (!dropping) check(carry); else lineNo++; carry = ""; dropping = false; }
+      }
+      if (full) { try { await reader.cancel(); } catch (_) {} break; }
+    }
+    if (!full && !dropping) check(carry);
+    return { ok: true, project: domain, session_id: sid, lines_scanned: scanned, matches: hits, ...(full ? { truncated: true, note: "max_chars reached: narrow q or raise max_chars" } : {}), ...(tag ? {} : { untagged: true }) };
+  }
+  return { ok: false, error: "action must be search, list or read" };
+}
+
 function toolText(id, text, isError) {
   const result = { content: [{ type: "text", text }] };
   if (isError) result.isError = true;
@@ -2880,6 +3118,10 @@ async function handleMsg(msg, sessionId, env, request, url) {
         const next = typeof args.next_step === "string" && args.next_step.length ? args.next_step : "resume open tasks";
         const block = "load memory\nProject: " + domain + ". Continue previous session. First action: " + next;
         return toolText(id, JSON.stringify({ saved, handoff_block: block, instruction: "Show handoff_block to the user in a code box." }));
+      }
+      if (name === "bouios_transcripts") {
+        const out = await transcriptTool(env, domain, args, request, url);
+        return toolText(id, JSON.stringify(out), out.ok === false);
       }
       if (name === "bouios_no_marks") {
         const token = accessTokenFromRequest(request, url, env);
@@ -3099,8 +3341,8 @@ export default {
     // GET /search: the per-message record lookup the Claude Code prompt hook makes (BOUIOS decision
     // 173, owner 2026-10-25: a customer's lookup runs against THEIR OWN server). Same bearer as every
     // route below, same answer shape and ranking as the owner gateway's /search.
-    if (path === "/search" && request.method === "GET") return searchRoute(url, env);
-    if (path === "/transcript" || path.startsWith("/transcript/")) return transcriptRoute(request, env, url, path);
+    if (path === "/search" && request.method === "GET") return searchRoute(url, env, request);
+    if (path === "/transcript" || path.startsWith("/transcript/")) return transcriptRoute(request, env, url, path, ctx);
     if (path === "/chat" || path.startsWith("/chat/")) return chatRoute(request, env, url, path);
     return json({ error: "not found", routes: ["GET /health", "GET /search?domain=&q=", "POST /mcp/{token}", "POST /mcp (after sign-in)", "PUT /transcript/{id}", "GET /transcript", "GET /transcript/{id}", "GET /chat", "GET /chat/{session}/{part}.jsonl"] }, 404);
   },
