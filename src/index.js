@@ -15,6 +15,143 @@ function toolText(id, text, isError) {
   if (isError) result.isError = true;
   return rpcResult(id, result);
 }
+// core/records.js - open-item counting, fetch logging and the auto-load slimming and preface,
+// shared by the owner gateway and the customer worker. Moved here from memory-gateway/src/index.js and
+// worker/src/index.js (one code base).
+
+
+// A SENTENCE SAYING THERE IS NOTHING OUTSTANDING IS NOT AN OUTSTANDING ITEM.
+// Caught by this reader's own over-counting case rather than by reading it:
+// "Everything landed and both runs are green. Nothing outstanding." matched on
+// the word outstanding and reported one open item, so a finished state produced
+// a false count in the one line every session reads. Checked BEFORE the marker,
+// because the marker word is present either way.
+const OPEN_NEGATED = /\b(no|none|nothing|not)\b[^.]{0,40}\b(outstanding|open|unverified|remaining|left|to do|todo)\b/i;
+
+// OPEN ITEMS ARE COUNTED FROM WHAT THE RECORD ACTUALLY SAYS (2026-09-10).
+//
+// countOpenTasks below matches bullets under a literal "## STILL OPEN" heading.
+// Measured against the live store: no hot state has used that heading in
+// months, so it returned 0 on every load - while the store held ONE pending row
+// and the current hot named seven unfinished items in prose. Every session on
+// every surface was told "0 open tasks" and started believing nothing was
+// outstanding. Over the same period the owner raised "you left items open" 48
+// times. That is a mechanical cause, not a behaviour one, and it is in the
+// gateway, so fixing it reaches Chat and Cowork where no hook exists.
+//
+// CONSERVATIVE ON PURPOSE. hot is free prose, and a loose matcher would turn
+// every sentence describing FINISHED work into a false open item - worse than
+// zero, because a list that is always wrong gets ignored, which is the
+// over-firing failure this repo has shipped twice. Only four sources count:
+// real pending rows, bullets under the existing heading (kept, not replaced), a
+// NEXT block, and lines carrying an explicit unfinished marker. Bounded to 12
+// items of 160 characters so it cannot grow into the payload.
+const OPEN_MARKER = /\b(not yet (?:verified|confirmed|checked|done)|still (?:open|unverified|outstanding|not)|unverified|remains? open|outstanding|to do|todo)\b/i;
+
+function openItems(hotState, pendingRows) {
+  const out = [];
+  const push = (s) => {
+    const t = String(s || "").replace(/\s+/g, " ").trim();
+    if (t.length < 8) return;
+    if (out.length >= 12) return;
+    if (out.some((o) => o.slice(0, 60) === t.slice(0, 60))) return;
+    out.push(t.slice(0, 160));
+  };
+
+  for (const r of pendingRows || []) push("pending " + r.id + ": " + r.title);
+
+  const hot = String(hotState || "");
+  if (hot) {
+    // The existing heading, kept so a hot state written the old way still works.
+    const h = hot.search(/##\s*STILL OPEN/i);
+    if (h !== -1) {
+      const after = hot.slice(h);
+      const nxt = after.slice(3).search(/\n##\s/);
+      for (const l of (nxt === -1 ? after : after.slice(0, nxt + 3)).split("\n")) {
+        if (/^\s*-\s+/.test(l)) push(l.replace(/^\s*-\s+/, ""));
+      }
+    }
+    for (const line of hot.split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      // A HEADING IS NOT AN ITEM. "## STILL OPEN" carries the marker words in
+      // its own title, so the line scan counted the heading itself alongside the
+      // bullets beneath it - caught by P4 rather than by reading.
+      if (/^#/.test(t)) continue;
+      if (/^NEXT\b/i.test(t)) { push(t.replace(/^NEXT[:\s-]*/i, "")); continue; }
+      if (OPEN_NEGATED.test(t)) continue;
+      if (OPEN_MARKER.test(t)) push(t);
+    }
+  }
+  return out;
+}
+
+function countOpenTasks(hotState) {
+  if (!hotState) return 0;
+  const idx = hotState.search(/##\s*STILL OPEN/i);
+  if (idx === -1) return 0;
+  const after = hotState.slice(idx);
+  const next = after.slice(3).search(/\n##\s/);
+  const block = next === -1 ? after : after.slice(0, next + 3);
+  return block.split("\n").filter((l) => /^\s*-\s+/.test(l)).length;
+}
+
+// MEMORY USE IS MEASURED (rebuild A3, 2026-10-06, rulings 2969/2974). Row 2191
+// counted loads against full-row fetches by hand and found fetches in single
+// figures a month - and nothing noticed, because a session that never reads a
+// row looks exactly like one that did. Each bouios_get now writes one FETCH row
+// and each per-message lookup (/search?log=1) one LOOKUP row; /status
+// memory_use counts them. Ids and counts only - never a title, body, key name
+// or query text. Every reader that means "saves" or "history" excludes both
+// prefixes with a case-SENSITIVE GLOB (LIKE ignores case and would also drop a
+// real line starting "Fetch the ..."), and sessionWrite refuses a caller-written
+// line that imitates one. Identical in worker/src/index.js (parity).
+// memory-use-logging.test.mjs.
+function measureIds(ids) {
+  const shown = ids.slice(0, 40).join(",");
+  return ids.length > 40 ? shown + " +" + (ids.length - 40) + " more" : shown;
+}
+
+async function logFetch(db, domain, sessionId, args, ids, keyCount, found) {
+  try {
+    let surface = typeof args.surface === "string" && /^[A-Za-z0-9_.-]{1,20}$/.test(args.surface) ? args.surface : "";
+    if (!surface && sessionId) {
+      const ld = await db.prepare("SELECT summary FROM log WHERE domain = ? AND summary LIKE 'Session loaded%' AND summary LIKE ? ORDER BY id DESC LIMIT 1")
+        .bind(domain, "%session=" + sessionId + "%").first();
+      const m = ld && /surface=([A-Za-z0-9_.-]+)/.exec(ld.summary);
+      if (m) surface = m[1].replace(/\.$/, "");
+    }
+    const line = "FETCH " + domain + " ids=" + measureIds(ids) + " found=" + found + " keys=" + keyCount +
+      " surface=" + (surface || "undeclared") + (sessionId ? " mcp-session=" + sessionId : "");
+    await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, line.slice(0, LOG_LINE_MAX)).run();
+  } catch (_) { /* a lost measurement must never cost the caller the rows */ }
+}
+
+const AUTO_LOAD_PREFACE = "Memory was not loaded in this chat; loaded it now.";
+
+// Puts the preface, the load's confirmation line and its payload ahead of the
+// tool's own result, in the same text block the model reads.
+//
+// SMALL BY DESIGN (2026-10-08, owner: "loads are ridiculous", defect 3504): the
+// load still RUNS here, because it writes the record the write gate reads, but
+// only the arming fields ride back - confirmation, load_token, current_task and
+// a pending count, about 1K. A bouios_get of one row used to return the whole
+// ~50K load first. The model calls bouios_load, with a topic, when it wants the
+// full set.
+function slimAutoLoad(loaded) {
+  const slim = { confirmation: loaded.confirmation, load_token: loaded.load_token };
+  if (loaded.current_task) slim.current_task = loaded.current_task;
+  slim.pending_count = Array.isArray(loaded.pending) ? loaded.pending.length : 0;
+  slim.note = "Session armed only. Call bouios_load with a topic for rules, pending, log and context.";
+  return slim;
+}
+
+function prefaceAutoLoad(res, loaded) {
+  const block = res && res.result && Array.isArray(res.result.content) ? res.result.content[0] : null;
+  if (!block || typeof block.text !== "string") return res;
+  block.text = AUTO_LOAD_PREFACE + "\n" + (loaded.confirmation || "") + "\n" + JSON.stringify(slimAutoLoad(loaded)) + "\n\n" + block.text;
+  return res;
+}
 // core/search.js - topic search terms, relevance scoring, lessons query, log-line clip and the context window,
 // shared by the owner gateway and the customer worker. Moved here from memory-gateway/src/index.js and
 // worker/src/index.js (one code base). The gateway imports this file; worker/build.mjs splices it into worker/src/index.js.
@@ -280,6 +417,167 @@ function contextWindow(rows, topic) {
     };
   });
 }
+// core/store.js - constraint-row checks, supersede detection and the edit, delete and refusal-log helpers,
+// shared by the owner gateway and the customer worker. Moved here from memory-gateway/src/index.js and
+// worker/src/index.js (one code base).
+
+const MEMORY_TYPES = ["pattern", "mistake", "decision", "pending"];
+
+// CONSTRAINT-ROW write gate (owner directive, incident 2026-08-04). A memory row
+// that ASSERTS a ban/prohibition ("ban", "never use", "do not use", "must not
+// use", "prohibit", "blacklist", "forbidden") is a CONSTRAINT ROW: acted on by
+// future sessions to delete or exclude work, so a dishonestly-sourced or
+// scope-widened one silently poisons everything downstream. Three checks:
+//   1. PROVENANCE - tagged OWNER-SAID, INFERRED or OBSERVED.
+//   2. VERBATIM   - an OWNER-SAID ban must quote the owner's actual words.
+//   3. SCOPE      - an OWNER-SAID ban reaching beyond the quote ("everything
+//      derived from it", "the whole family", "and its derivatives", "all files
+//      from") is a SEPARATE INFERRED claim, refused as OWNER-SAID.
+// Scoped to the ASSERTING types (decision, pattern) ON PURPOSE, exactly as the
+// evidence gate is scoped to type=decision: a mistake/pending row DISCUSSING a
+// ban ("a session wrongly banned X") is not asserting one and must keep saving.
+// "exclude"/"exclusion" are deliberately NOT trigger verbs - they collide with
+// ordinary scoping decisions ("exclude archives from the warm load") and would
+// hard-block them; an exclusion phrased as prohibition-of-use ("do not use X")
+// is still caught. Negative space is locked in constraint-row-gate.test.mjs.
+const CONSTRAINT_RE = /\bban(?:ned|s|ning)?\b|\bnever (?:use|reuse|touch)\b|\bdo not (?:use|reuse|touch|copy|include)\b|\bdon['’]?t (?:use|reuse|touch|copy|include)\b|\bmust not (?:use|reuse|touch|copy|include)\b|\bprohibit(?:ed|ion|s)?\b|\bblacklist(?:ed|ing)?\b|\bforbidden\b/i;
+
+const PROVENANCE_RE = /\b(OWNER-SAID|INFERRED|OBSERVED)\b/;
+
+const VERBATIM_RE = /"[^"]{3,}"|'[^']{3,}'|“[^”]{3,}”|‘[^’]{3,}’/;
+
+const REACH_RE = /everything derived|whole family|and its derivatives|all files (?:from|derived)|entire family|all derivatives|everything (?:from|based on) (?:it|that)/i;
+
+function constraintRowError(m) {
+  if (m.type !== "decision" && m.type !== "pattern") return null;
+  const text = m.title + "\n" + m.body;
+  if (!CONSTRAINT_RE.test(text)) return null;
+  const prov = (text.match(PROVENANCE_RE) || [])[1];
+  if (!prov) return "constraint refused: a ban/prohibition row must be tagged OWNER-SAID, INFERRED or OBSERVED (provenance)";
+  if (prov === "OWNER-SAID" && !VERBATIM_RE.test(m.body)) return "constraint refused: an OWNER-SAID ban must quote the owner's actual words verbatim (in quotes)";
+  if (prov === "OWNER-SAID" && REACH_RE.test(text)) return "constraint refused: reach beyond the owner's words ('everything derived from it' etc.) is a separate claim - tag it INFERRED and confirm before acting";
+  return null;
+}
+
+// SUPERSEDE MARKER (2026-08-09). CLAUDE.md's own documented convention -
+// "Body. SUPERSEDES memory <id> if replacing." - had zero server-side effect:
+// a superseded row sat in every future load looking exactly as current as its
+// replacement, because the load is titles-only and nothing marked the old
+// title. That is the real mechanism behind a session quoting a stale row as
+// current (owner-observed, 2026-07-05: "That's wrong! OLD!!"). This scans a
+// saved row's body for the phrase and marks the referenced row's TITLE - not
+// the body, which is invisible without a bouios_get - so staleness is visible
+// on every load without an extra read. Since 2026-10-06 the mark also takes
+// the row out of every served set (NOT_SUPERSEDED above); bouios_get keeps it.
+function findSupersededIds(body) {
+  const ids = new Set();
+  const re = /supersedes\s+memory\s+(?:rows?\s+)?((?:\d+\s*(?:,|and|&)?\s*)+)/gi;
+  let m;
+  while ((m = re.exec(body))) {
+    const nums = m[1].match(/\d+/g) || [];
+    for (const n of nums) ids.add(Number(n));
+  }
+  return [...ids];
+}
+
+// bouios_edit / bouios_delete (2026-09-30) - see the tool definitions.
+const TRANSCRIPT_NAME_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl(\.gz)?$/;
+
+const BUNDLE_NAME_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/([A-Za-z0-9._-]{1,64})$/;
+
+async function archiveOld(env, domain, what, old, reason) {
+  await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)")
+    .bind(domain, what + " ARCHIVE (" + reason.slice(0, 200) + "): " + JSON.stringify(old)).run();
+}
+
+// One memory row or one context row; the old value is archived first.
+async function editRecord(env, domain, args, reason) {
+  const db = env.DB;
+  if (Number.isInteger(args.memory_id)) {
+    const old = await db.prepare("SELECT id, domain, type, title, body FROM memory WHERE id = ? AND (domain = ? OR domain = 'GLOBAL')").bind(args.memory_id, domain).first();
+    if (!old) return { ok: false, error: "memory row " + args.memory_id + " not found in " + domain + " or GLOBAL" };
+    const next = { title: old.title, body: old.body, type: old.type };
+    if (typeof args.title === "string" && args.title.trim()) next.title = args.title;
+    if (typeof args.body === "string" && args.body.trim()) next.body = args.body;
+    if (typeof args.type === "string") {
+      if (!MEMORY_TYPES.includes(args.type)) return { ok: false, error: "type must be one of " + MEMORY_TYPES.join(", ") };
+      next.type = args.type;
+    }
+    if (next.title === old.title && next.body === old.body && next.type === old.type) return { ok: false, error: "nothing to change: give title, body or type" };
+    await archiveOld(env, domain, "EDIT memory " + old.id, old, reason);
+    await db.prepare("UPDATE memory SET title = ?, body = ?, type = ? WHERE id = ?").bind(next.title, next.body, next.type, old.id).run();
+    return { ok: true, edited: { memory_id: old.id }, archived_to_log: true };
+  }
+  if (typeof args.context_key === "string" && args.context_key) {
+    if (typeof args.content !== "string" || !args.content.trim()) return { ok: false, error: "content is required for a context row" };
+    const old = await db.prepare("SELECT domain, key, content, updated_at FROM context WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(domain, args.context_key).first();
+    if (!old) return { ok: false, error: "context key not found in " + domain };
+    await archiveOld(env, domain, "EDIT context " + old.key, old, reason);
+    await db.prepare("UPDATE context SET content = ?, updated_at = ? WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(args.content, new Date().toISOString(), domain, old.key).run();
+    return { ok: true, edited: { context_key: old.key }, archived_to_log: true };
+  }
+  return { ok: false, error: "give memory_id (with title, body or type) or context_key (with content)" };
+}
+
+// Rows are archived then deleted; stored objects are logged then deleted.
+async function deleteRecords(env, domain, args, reason) {
+  const db = env.DB;
+  const done = { memory_ids: [], context_keys: [], objects: [] };
+  const missing = [];
+  const objs = [];
+  if (typeof args.transcript === "string" && args.transcript) {
+    if (!TRANSCRIPT_NAME_RE.test(args.transcript)) return { ok: false, error: "transcript must be UUID.jsonl or UUID.jsonl.gz" };
+    objs.push("transcript:" + args.transcript);
+  }
+  if (typeof args.bundle === "string" && args.bundle) {
+    const m = args.bundle.match(BUNDLE_NAME_RE);
+    if (!m || m[2].startsWith(".")) return { ok: false, error: "bundle must be <session-uuid>/<repo>" };
+    objs.push("bundle:" + m[1] + ":" + m[2]);
+  }
+  if (objs.length && !env.TRANSCRIPTS) return { ok: false, error: "object storage not configured" };
+  const ids = (Array.isArray(args.memory_ids) ? args.memory_ids : []).filter((x) => Number.isInteger(x) && x > 0).slice(0, 50);
+  for (const mid of ids) {
+    const old = await db.prepare("SELECT id, domain, type, title, body, created_at FROM memory WHERE id = ? AND (domain = ? OR domain = 'GLOBAL')").bind(mid, domain).first();
+    if (!old) { missing.push("memory " + mid); continue; }
+    await archiveOld(env, domain, "DELETE memory " + mid, old, reason);
+    await db.prepare("DELETE FROM memory WHERE id = ?").bind(mid).run();
+    done.memory_ids.push(mid);
+  }
+  const keys = (Array.isArray(args.context_keys) ? args.context_keys : []).filter((k) => typeof k === "string" && k).slice(0, 50);
+  for (const k of keys) {
+    const old = await db.prepare("SELECT domain, key, content, updated_at FROM context WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(domain, k).first();
+    if (!old) { missing.push("context " + k); continue; }
+    await archiveOld(env, domain, "DELETE context " + k, old, reason);
+    await db.prepare("DELETE FROM context WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(domain, k).run();
+    done.context_keys.push(k);
+  }
+  for (const key of objs) {
+    const head = await env.TRANSCRIPTS.head(key);
+    if (!head) { missing.push(key); continue; }
+    await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)")
+      .bind(domain, "DELETE object " + key + " (" + head.size + " bytes) - not restorable (" + reason.slice(0, 200) + ")").run();
+    await env.TRANSCRIPTS.delete(key);
+    done.objects.push(key);
+  }
+  if (!done.memory_ids.length && !done.context_keys.length && !done.objects.length) {
+    return { ok: false, error: missing.length ? "nothing deleted - not found: " + missing.join(", ") : "give memory_ids, context_keys, transcript or bundle" };
+  }
+  return { ok: true, deleted: done, not_found: missing, archived_to_log: true };
+}
+
+// A REFUSED WRITE LEAVES A TRACE (2026-09-24, refusal-logging.test.mjs).
+// Refusals used to go back to the caller only, so a session whose every save
+// was refused looked in the store exactly like one that never tried - the two
+// "ok but nothing written" episodes (SARK log 3244, 12760) were never
+// diagnosed for want of a record. Never throws: a failed insert must not turn
+// a plain refusal into an error. /status excludes these rows from its write
+// counts, and they never match the "Session loaded" load record.
+async function logRefusal(env, domain, what) {
+  if (!env || !env.DB) return;
+  try {
+    await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain || "GLOBAL", "REFUSED " + String(what).slice(0, 300)).run();
+  } catch (_) {}
+}
 // core/tokens.js - the load token (mint and verify), shared by the owner gateway and the customer worker.
 // Moved here from memory-gateway/src/index.js and worker/src/index.js (one code base).
 
@@ -412,7 +710,6 @@ function confirmationText(domain, rulesN, hotDate, openN, branded = false) {
 }
 const MEMORY_NOTE = "titles only - call bouios_get({project, ids:[...]}) for full body of any row you need";
 
-const MEMORY_TYPES = ["pattern", "mistake", "decision", "pending"];
 const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS hot (domain TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at TEXT NOT NULL)",
   "CREATE TABLE IF NOT EXISTS context (domain TEXT NOT NULL, key TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (domain, key))",
@@ -901,80 +1198,8 @@ async function checkAccess(db, domain, request, url, env) {
   }
 }
 
-// OPEN ITEMS ARE COUNTED FROM WHAT THE RECORD ACTUALLY SAYS (2026-09-10).
-//
-// countOpenTasks below matches bullets under a literal "## STILL OPEN" heading.
-// Measured against the live store: no hot state has used that heading in
-// months, so it returned 0 on every load - while the store held ONE pending row
-// and the current hot named seven unfinished items in prose. Every session on
-// every surface was told "0 open tasks" and started believing nothing was
-// outstanding. Over the same period the owner raised "you left items open" 48
-// times. That is a mechanical cause, not a behaviour one, and it is in the
-// gateway, so fixing it reaches Chat and Cowork where no hook exists.
-//
-// CONSERVATIVE ON PURPOSE. hot is free prose, and a loose matcher would turn
-// every sentence describing FINISHED work into a false open item - worse than
-// zero, because a list that is always wrong gets ignored, which is the
-// over-firing failure this repo has shipped twice. Only four sources count:
-// real pending rows, bullets under the existing heading (kept, not replaced), a
-// NEXT block, and lines carrying an explicit unfinished marker. Bounded to 12
-// items of 160 characters so it cannot grow into the payload.
-const OPEN_MARKER = /\b(not yet (?:verified|confirmed|checked|done)|still (?:open|unverified|outstanding|not)|unverified|remains? open|outstanding|to do|todo)\b/i;
-// A SENTENCE SAYING THERE IS NOTHING OUTSTANDING IS NOT AN OUTSTANDING ITEM.
-// Caught by this reader's own over-counting case rather than by reading it:
-// "Everything landed and both runs are green. Nothing outstanding." matched on
-// the word outstanding and reported one open item, so a finished state produced
-// a false count in the one line every session reads. Checked BEFORE the marker,
-// because the marker word is present either way.
-const OPEN_NEGATED = /\b(no|none|nothing|not)\b[^.]{0,40}\b(outstanding|open|unverified|remaining|left|to do|todo)\b/i;
 
-function openItems(hotState, pendingRows) {
-  const out = [];
-  const push = (s) => {
-    const t = String(s || "").replace(/\s+/g, " ").trim();
-    if (t.length < 8) return;
-    if (out.length >= 12) return;
-    if (out.some((o) => o.slice(0, 60) === t.slice(0, 60))) return;
-    out.push(t.slice(0, 160));
-  };
 
-  for (const r of pendingRows || []) push("pending " + r.id + ": " + r.title);
-
-  const hot = String(hotState || "");
-  if (hot) {
-    // The existing heading, kept so a hot state written the old way still works.
-    const h = hot.search(/##\s*STILL OPEN/i);
-    if (h !== -1) {
-      const after = hot.slice(h);
-      const nxt = after.slice(3).search(/\n##\s/);
-      for (const l of (nxt === -1 ? after : after.slice(0, nxt + 3)).split("\n")) {
-        if (/^\s*-\s+/.test(l)) push(l.replace(/^\s*-\s+/, ""));
-      }
-    }
-    for (const line of hot.split("\n")) {
-      const t = line.trim();
-      if (!t) continue;
-      // A HEADING IS NOT AN ITEM. "## STILL OPEN" carries the marker words in
-      // its own title, so the line scan counted the heading itself alongside the
-      // bullets beneath it - caught by P4 rather than by reading.
-      if (/^#/.test(t)) continue;
-      if (/^NEXT\b/i.test(t)) { push(t.replace(/^NEXT[:\s-]*/i, "")); continue; }
-      if (OPEN_NEGATED.test(t)) continue;
-      if (OPEN_MARKER.test(t)) push(t);
-    }
-  }
-  return out;
-}
-
-function countOpenTasks(hotState) {
-  if (!hotState) return 0;
-  const idx = hotState.search(/##\s*STILL OPEN/i);
-  if (idx === -1) return 0;
-  const after = hotState.slice(idx);
-  const next = after.slice(3).search(/\n##\s/);
-  const block = next === -1 ? after : after.slice(0, next + 3);
-  return block.split("\n").filter((l) => /^\s*-\s+/.test(l)).length;
-}
 
 
 
@@ -1220,49 +1445,8 @@ async function sessionLoad(domain, surface, env, token) {
   return out;
 }
 
-// Constraint-row write gate - MUST stay in parity with memory-gateway/src/index.js.
-// A decision/pattern row that ASSERTS a ban/prohibition needs provenance
-// (OWNER-SAID/INFERRED/OBSERVED); an OWNER-SAID ban must quote the owner verbatim
-// and must not reach beyond the quote. mistake/pending rows discussing a ban are
-// not asserting one and are never gated. See constraint-row-gate.test.mjs.
-const CONSTRAINT_RE = /\bban(?:ned|s|ning)?\b|\bnever (?:use|reuse|touch)\b|\bdo not (?:use|reuse|touch|copy|include)\b|\bdon['’]?t (?:use|reuse|touch|copy|include)\b|\bmust not (?:use|reuse|touch|copy|include)\b|\bprohibit(?:ed|ion|s)?\b|\bblacklist(?:ed|ing)?\b|\bforbidden\b/i;
-const PROVENANCE_RE = /\b(OWNER-SAID|INFERRED|OBSERVED)\b/;
-const VERBATIM_RE = /"[^"]{3,}"|'[^']{3,}'|“[^”]{3,}”|‘[^’]{3,}’/;
-const REACH_RE = /everything derived|whole family|and its derivatives|all files (?:from|derived)|entire family|all derivatives|everything (?:from|based on) (?:it|that)/i;
-function constraintRowError(m) {
-  if (m.type !== "decision" && m.type !== "pattern") return null;
-  const text = m.title + "\n" + m.body;
-  if (!CONSTRAINT_RE.test(text)) return null;
-  const prov = (text.match(PROVENANCE_RE) || [])[1];
-  if (!prov) return "constraint refused: a ban/prohibition row must be tagged OWNER-SAID, INFERRED or OBSERVED (provenance)";
-  if (prov === "OWNER-SAID" && !VERBATIM_RE.test(m.body)) return "constraint refused: an OWNER-SAID ban must quote the owner's actual words verbatim (in quotes)";
-  if (prov === "OWNER-SAID" && REACH_RE.test(text)) return "constraint refused: reach beyond the owner's words ('everything derived from it' etc.) is a separate claim - tag it INFERRED and confirm before acting";
-  return null;
-}
 
 
-// SUPERSEDE MARKER - ported from the gateway 2026-09-16, parity gap found by
-// reading memory row 1867 rather than by any test. That row's whole subject is
-// that a titles-only load can be trusted blind, and its candidate fix (c) was a
-// first-class supersede link so a disproved row cannot come back as live
-// guidance. The gateway has had it for weeks; the CUSTOMER worker never did, so
-// on a customer's own deployment a row that has been refuted still returns with
-// a clean title and no signal at all - which is exactly the failure the row
-// describes, shipped to the people paying for it.
-//
-// Identical logic to memory-gateway/src/index.js on purpose: same regex, same
-// idempotent UPDATE, same domain scoping. memory-gateway/test/supersede-marker
-// .test.mjs asserts both copies.
-function findSupersededIds(body) {
-  const ids = new Set();
-  const re = /supersedes\s+memory\s+(?:rows?\s+)?((?:\d+\s*(?:,|and|&)?\s*)+)/gi;
-  let m;
-  while ((m = re.exec(body))) {
-    const nums = m[1].match(/\d+/g) || [];
-    for (const n of nums) ids.add(Number(n));
-  }
-  return [...ids];
-}
 
 async function sessionWrite(domain, body, db, tz) {
   // Every log line a caller writes carries WHERE it was written from (2026-09-22),
@@ -1528,7 +1712,6 @@ async function loadedThisSession(db, domain, sessionId) {
 }
 
 const AUTO_LOAD_TOOLS = new Set(["bouios_save", "bouios_handoff", "bouios_get", "bouios_edit", "bouios_delete", "bouios_no_marks", "bouios_transcripts"]);
-const AUTO_LOAD_PREFACE = "Memory was not loaded in this chat; loaded it now.";
 
 // The one MCP load path: bouios_load and the auto-load both come through here.
 async function mcpLoad(domain, args, sessionId, env, request, url) {
@@ -1545,26 +1728,7 @@ async function mcpLoad(domain, args, sessionId, env, request, url) {
   return loaded;
 }
 
-// Puts the preface, the load's confirmation line and its payload ahead of the
-// tool's own result, in the same text block the model reads.
-//
-// SMALL BY DESIGN (2026-10-08, defect 3504): the load still runs here, because
-// it writes the record the write gate reads, but only the arming fields ride
-// back, about 1K. The model calls bouios_load with a topic for the full set.
-function slimAutoLoad(loaded) {
-  const slim = { confirmation: loaded.confirmation, load_token: loaded.load_token };
-  if (loaded.current_task) slim.current_task = loaded.current_task;
-  slim.pending_count = Array.isArray(loaded.pending) ? loaded.pending.length : 0;
-  slim.note = "Session armed only. Call bouios_load with a topic for rules, pending, log and context.";
-  return slim;
-}
 
-function prefaceAutoLoad(res, loaded) {
-  const block = res && res.result && Array.isArray(res.result.content) ? res.result.content[0] : null;
-  if (!block || typeof block.text !== "string") return res;
-  block.text = AUTO_LOAD_PREFACE + "\n" + (loaded.confirmation || "") + "\n" + JSON.stringify(slimAutoLoad(loaded)) + "\n\n" + block.text;
-  return res;
-}
 
 // ---- MCP (JSON-RPC 2.0, Streamable HTTP) ----
 
@@ -1819,7 +1983,7 @@ const MCP_TOOLS = [
 ];
 
 // Layer settings: b over a, one level deep for text/file/add (same rule as the service).
-// >>> NO-MARKS-LOCAL BEGIN: generated from memory-gateway/src/no-marks-core.js by memory-gateway/generate-worker-nomarks.mjs - do not edit by hand <<<
+// >>> NO-MARKS-LOCAL BEGIN: generated from core/no-marks-core.js by worker/build.mjs - do not edit by hand <<<
 const NM = (() => {
 // no-marks.js - the no-marks scanner and cleaner (pending 3043, owner checklist v4).
 //
@@ -2878,28 +3042,6 @@ async function runNoMarksSplit(env, token, args, settings) {
 
 
 
-// MEMORY USE IS MEASURED (rebuild A3, 2026-10-06) - same as the gateway's
-// logFetch, same row shape, so one counter reads both. Each bouios_get writes
-// one FETCH row: ids and counts only, never a title, body or content. A lost
-// write never costs the caller the rows. memory-use-logging.test.mjs.
-function measureIds(ids) {
-  const shown = ids.slice(0, 40).join(",");
-  return ids.length > 40 ? shown + " +" + (ids.length - 40) + " more" : shown;
-}
-async function logFetch(db, domain, sessionId, args, ids, keyCount, found) {
-  try {
-    let surface = typeof args.surface === "string" && /^[A-Za-z0-9_.-]{1,20}$/.test(args.surface) ? args.surface : "";
-    if (!surface && sessionId) {
-      const ld = await db.prepare("SELECT summary FROM log WHERE domain = ? AND summary LIKE 'Session loaded%' AND summary LIKE ? ORDER BY id DESC LIMIT 1")
-        .bind(domain, "%session=" + sessionId + "%").first();
-      const m = ld && /surface=([A-Za-z0-9_.-]+)/.exec(ld.summary);
-      if (m) surface = m[1].replace(/\.$/, "");
-    }
-    const line = "FETCH " + domain + " ids=" + measureIds(ids) + " found=" + found + " keys=" + keyCount +
-      " surface=" + (surface || "undeclared") + (sessionId ? " mcp-session=" + sessionId : "");
-    await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, line.slice(0, LOG_LINE_MAX)).run();
-  } catch (_) { /* a lost measurement must never cost the caller the rows */ }
-}
 
 const MCP_LOAD_SIZE_CEILING = 60000;
 function clampMcpLoadSize(out) {
@@ -3345,101 +3487,10 @@ async function handleMcp(request, env, ctx) {
   return new Response(JSON.stringify(Array.isArray(body) ? responses : responses[0]), { status: 200, headers });
 }
 
-// REFUSALS LEAVE A TRACE (2026-09-24, parity with the gateway's b5a0edc). A
-// refused save used to go back to the caller only, so a session whose every
-// save was refused looked in this log like one that never tried. One row per
-// refusal, starting "REFUSED". It never matches the "Session loaded" rows the
-// load check reads, and a failed insert never turns the refusal into an error.
-// bouios_edit / bouios_delete (2026-09-30) - see the tool definitions.
-const TRANSCRIPT_NAME_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl(\.gz)?$/;
-const BUNDLE_NAME_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/([A-Za-z0-9._-]{1,64})$/;
 
-async function archiveOld(env, domain, what, old, reason) {
-  await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)")
-    .bind(domain, what + " ARCHIVE (" + reason.slice(0, 200) + "): " + JSON.stringify(old)).run();
-}
 
-// One memory row or one context row; the old value is archived first.
-async function editRecord(env, domain, args, reason) {
-  const db = env.DB;
-  if (Number.isInteger(args.memory_id)) {
-    const old = await db.prepare("SELECT id, domain, type, title, body FROM memory WHERE id = ? AND (domain = ? OR domain = 'GLOBAL')").bind(args.memory_id, domain).first();
-    if (!old) return { ok: false, error: "memory row " + args.memory_id + " not found in " + domain + " or GLOBAL" };
-    const next = { title: old.title, body: old.body, type: old.type };
-    if (typeof args.title === "string" && args.title.trim()) next.title = args.title;
-    if (typeof args.body === "string" && args.body.trim()) next.body = args.body;
-    if (typeof args.type === "string") {
-      if (!MEMORY_TYPES.includes(args.type)) return { ok: false, error: "type must be one of " + MEMORY_TYPES.join(", ") };
-      next.type = args.type;
-    }
-    if (next.title === old.title && next.body === old.body && next.type === old.type) return { ok: false, error: "nothing to change: give title, body or type" };
-    await archiveOld(env, domain, "EDIT memory " + old.id, old, reason);
-    await db.prepare("UPDATE memory SET title = ?, body = ?, type = ? WHERE id = ?").bind(next.title, next.body, next.type, old.id).run();
-    return { ok: true, edited: { memory_id: old.id }, archived_to_log: true };
-  }
-  if (typeof args.context_key === "string" && args.context_key) {
-    if (typeof args.content !== "string" || !args.content.trim()) return { ok: false, error: "content is required for a context row" };
-    const old = await db.prepare("SELECT domain, key, content, updated_at FROM context WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(domain, args.context_key).first();
-    if (!old) return { ok: false, error: "context key not found in " + domain };
-    await archiveOld(env, domain, "EDIT context " + old.key, old, reason);
-    await db.prepare("UPDATE context SET content = ?, updated_at = ? WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(args.content, new Date().toISOString(), domain, old.key).run();
-    return { ok: true, edited: { context_key: old.key }, archived_to_log: true };
-  }
-  return { ok: false, error: "give memory_id (with title, body or type) or context_key (with content)" };
-}
 
-// Rows are archived then deleted; stored objects are logged then deleted.
-async function deleteRecords(env, domain, args, reason) {
-  const db = env.DB;
-  const done = { memory_ids: [], context_keys: [], objects: [] };
-  const missing = [];
-  const objs = [];
-  if (typeof args.transcript === "string" && args.transcript) {
-    if (!TRANSCRIPT_NAME_RE.test(args.transcript)) return { ok: false, error: "transcript must be UUID.jsonl or UUID.jsonl.gz" };
-    objs.push("transcript:" + args.transcript);
-  }
-  if (typeof args.bundle === "string" && args.bundle) {
-    const m = args.bundle.match(BUNDLE_NAME_RE);
-    if (!m || m[2].startsWith(".")) return { ok: false, error: "bundle must be <session-uuid>/<repo>" };
-    objs.push("bundle:" + m[1] + ":" + m[2]);
-  }
-  if (objs.length && !env.TRANSCRIPTS) return { ok: false, error: "object storage not configured" };
-  const ids = (Array.isArray(args.memory_ids) ? args.memory_ids : []).filter((x) => Number.isInteger(x) && x > 0).slice(0, 50);
-  for (const mid of ids) {
-    const old = await db.prepare("SELECT id, domain, type, title, body, created_at FROM memory WHERE id = ? AND (domain = ? OR domain = 'GLOBAL')").bind(mid, domain).first();
-    if (!old) { missing.push("memory " + mid); continue; }
-    await archiveOld(env, domain, "DELETE memory " + mid, old, reason);
-    await db.prepare("DELETE FROM memory WHERE id = ?").bind(mid).run();
-    done.memory_ids.push(mid);
-  }
-  const keys = (Array.isArray(args.context_keys) ? args.context_keys : []).filter((k) => typeof k === "string" && k).slice(0, 50);
-  for (const k of keys) {
-    const old = await db.prepare("SELECT domain, key, content, updated_at FROM context WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(domain, k).first();
-    if (!old) { missing.push("context " + k); continue; }
-    await archiveOld(env, domain, "DELETE context " + k, old, reason);
-    await db.prepare("DELETE FROM context WHERE domain = ? AND key = ? AND key != 'gateway-bearer-token'").bind(domain, k).run();
-    done.context_keys.push(k);
-  }
-  for (const key of objs) {
-    const head = await env.TRANSCRIPTS.head(key);
-    if (!head) { missing.push(key); continue; }
-    await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)")
-      .bind(domain, "DELETE object " + key + " (" + head.size + " bytes) - not restorable (" + reason.slice(0, 200) + ")").run();
-    await env.TRANSCRIPTS.delete(key);
-    done.objects.push(key);
-  }
-  if (!done.memory_ids.length && !done.context_keys.length && !done.objects.length) {
-    return { ok: false, error: missing.length ? "nothing deleted - not found: " + missing.join(", ") : "give memory_ids, context_keys, transcript or bundle" };
-  }
-  return { ok: true, deleted: done, not_found: missing, archived_to_log: true };
-}
 
-async function logRefusal(env, domain, what) {
-  if (!env || !env.DB) return;
-  try {
-    await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain || "GLOBAL", "REFUSED " + String(what).slice(0, 300)).run();
-  } catch (_) {}
-}
 
 export default {
   async fetch(request, env, ctx) {
