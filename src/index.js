@@ -288,9 +288,14 @@ async function indexStoredTranscript(env, key, domain) {
 // owner gateway treats untagged transcripts.
 const uploadProject = (request) => normaliseProject(request.headers.get("x-bouios-project") || "") || "";
 // Index after the response, off the upload's path: a large transcript must never slow or fail the upload.
-function afterTranscriptPut(env, ctx, key, domain) {
+function afterTranscriptPut(env, ctx, key, domain, size) {
   if (String(key).startsWith("chat/")) return;
-  const job = indexStoredTranscript(env, key, domain);
+  // The owner gateway's "transcript PUT {id} {bytes}b" row, in this account's own log, so the load's
+  // recent_transcripts can name the chat (an untagged upload belongs to no project, so it writes none).
+  const logged = domain
+    ? env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, "transcript PUT " + transcriptSessionId(key) + " " + Number(size || 0) + "b").run().catch(() => {})
+    : Promise.resolve();
+  const job = Promise.all([logged, indexStoredTranscript(env, key, domain)]);
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(job);
   else globalThis.__lastTranscriptIndex = job; // in-process tests with no ctx await this
 }
@@ -327,13 +332,13 @@ async function transcriptRoute(request, env, url, path, ctx) {
       if (tooShort(declared)) return json({ error: "a transcript with this id is already stored and is longer; upload under a new id" }, 409);
       const { readable, writable } = new FixedLengthStream(declared);
       const [put] = await Promise.all([env.TRANSCRIPTS.put(id, readable, opts), request.body.pipeTo(writable)]);
-      afterTranscriptPut(env, ctx, id, uploadProject(request));
+      afterTranscriptPut(env, ctx, id, uploadProject(request), put ? put.size : declared);
       return json({ ok: true, id, size: put ? put.size : declared });
     }
     const bytes = await request.arrayBuffer();
     if (tooShort(bytes.byteLength)) return json({ error: "a transcript with this id is already stored and is longer; upload under a new id" }, 409);
     const put = await env.TRANSCRIPTS.put(id, bytes, opts);
-    afterTranscriptPut(env, ctx, id, uploadProject(request));
+    afterTranscriptPut(env, ctx, id, uploadProject(request), put ? put.size : bytes.byteLength);
     return json({ ok: true, id, size: put ? put.size : bytes.byteLength });
   }
   if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
@@ -816,7 +821,7 @@ async function sessionLoad(domain, surface, env, token) {
     if (tm) { try { loadTopic = decodeURIComponent(tm[1]); } catch (e) { loadTopic = tm[1]; } }
   }
   const lq = lessonsQuery(loadTopic);
-  const [rules, hot, context, pending, recent, lessons, memTotal] = await Promise.all([
+  const [rules, hot, context, pending, recent, lessons, memTotal, tputs] = await Promise.all([
     fetchRules(env, token),
     db.prepare("SELECT state, updated_at FROM hot WHERE domain = ?").bind(domain).all(),
     db.prepare("SELECT key, content FROM context WHERE domain = ?").bind(domain).all(),
@@ -854,6 +859,9 @@ async function sessionLoad(domain, surface, env, token) {
       lq.sql
     ).bind(...lq.binds(domain)).all(),
     db.prepare("SELECT COUNT(*) AS n FROM memory WHERE domain = ? OR domain = 'GLOBAL'").bind(domain).first(),
+    // The three newest uploads of this project's chats (bb11701 on the owner gateway, 2026-08-08: the load
+    // points at where the record lives). Built from the "transcript PUT" rows the upload writes below.
+    db.prepare("SELECT ts, summary FROM log WHERE summary LIKE 'transcript PUT%' AND domain = ? ORDER BY id DESC LIMIT 3").bind(domain).all().catch(() => ({ results: [] })),
   ]);
   // NO TOPIC GIVEN IS THE COMMON CASE, and an opt-in search that nobody opts
   // into is the same blindness it was built to fix (cb3c070 shipped the search;
@@ -926,6 +934,11 @@ async function sessionLoad(domain, surface, env, token) {
     } : {}),
     // The only rows here that arrive WITH a body - parity with the gateway.
     lessons: (lessons.results || []).map(lessonRow),
+    // Where the project's past chats are (bb11701 on the owner gateway): one entry per "transcript PUT" row.
+    recent_transcripts: (tputs.results || []).map((r) => {
+      const m = /^transcript PUT (\S+) (\d+)b$/.exec(r.summary || "");
+      return m ? { ts: r.ts, id: m[1], bytes: Number(m[2]) } : { ts: r.ts, id: null, bytes: null };
+    }),
     lessons_note: "lessons carries 8 mistake and pattern rows WITH their bodies, clipped to 500 characters - the ones matching your topic first (marked matched - read those before anything else; they are the recorded answer to what you named), then the newest; superseded rows are never included - because these are the rows whose purpose is to stop a repeat and a title alone cannot do that. Read them before diagnosing or building - if one describes what you are about to do, you are about to repeat it. Everything in memory above is titles only by design; use bouios_get for any of those bodies.",
   };
   const _lt = await mintLoadToken(env, domain);
