@@ -2,6 +2,8 @@
 // core/mcp.js - JSON-RPC reply helpers shared by the owner gateway and the customer worker.
 // Moved here from memory-gateway/src/index.js and worker/src/index.js (one code base).
 
+
+
 function rpcResult(id, result) {
   return { jsonrpc: "2.0", id, result };
 }
@@ -14,6 +16,166 @@ function toolText(id, text, isError) {
   const result = { content: [{ type: "text", text }] };
   if (isError) result.isError = true;
   return rpcResult(id, result);
+}
+
+// MCP TRANSPORT SIZE GUARD, one function for the owner gateway and the customer worker.
+// Merged from the two copies in step 5a (the worker's had drifted: it cut every context
+// row over 300 characters, protected no owner words, and lacked the pointer and field steps).
+// The gateway's version is the one kept. The ceiling is the only thing a shell may choose:
+// it passes its own as the second argument and the logic is the same for both.
+//
+// 40000 (owner 2026-10-08: "You are not supposed to load all that"; memory 3298).
+// Measured: the client shows a load whole up to about 39K and spills larger ones
+// to a file, and 60000 let 70+ open rows and every context excerpt through.
+const MCP_LOAD_SIZE_CEILING = 40000;
+function clampMcpLoadSize(out, ceiling = MCP_LOAD_SIZE_CEILING) {
+  let size = JSON.stringify(out).length;
+  if (size <= ceiling) return out;
+  if (out.skills && Array.isArray(out.skills.skills)) {
+    out.skills.skills = out.skills.skills.map((s) => ({ name: s.name, est_tokens: s.est_tokens, bodyOmitted: true }));
+    out.skills.note = "Skill bodies omitted this load (response size guard). Names unchanged from your prior load in this session; ask if a body is needed.";
+  }
+  size = JSON.stringify(out).length;
+  if (size <= ceiling) return out;
+  if (Array.isArray(out.memory)) {
+    out.memory = out.memory.map((m) => {
+      if (m.type === "pending" || !m.body || m.body.length <= 300) return m;
+      return { ...m, body: m.body.slice(0, 300) + "...(truncated, size guard - ask for memory id " + m.id + " if the rest is needed)", truncated: true };
+    });
+  }
+  size = JSON.stringify(out).length;
+  if (size <= ceiling) return out;
+  // CONTEXT IS NO LONGER CUT HERE. It used to be the third step, so on a payload
+  // even slightly over the ceiling it fired every single load: measured
+  // 2026-09-16, fifteen of seventeen context rows chopped to 300 characters -
+  // architecture, enforcement-design, gateway-config, owner-behaviour and the
+  // rest - on every load for months, while the log that actually caused the
+  // overflow was returned whole. The owner's standing rule is that we do not trim
+  // his content; cutting the cheapest thing to cut instead of the biggest thing
+  // was how we ended up doing it anyway. It is now the LAST step below, after
+  // transcripts, log, relevant and lessons, so it fires only when everything else
+  // has failed to make room.
+
+  // EXTENDED 2026-09-16, because this guard had been outgrown rather than
+  // broken. It was written on 2026-07-02 against a 127KB payload made of
+  // skills, memory and context, and it still trims exactly those three. Every
+  // field added since is invisible to it: log, lessons (2026-09-05), relevant
+  // (2026-09-09), recent_transcripts, hot_archives. Measured on a real load
+  // from this account today - 62,037 bytes, of which log 24%, rules 19%,
+  // lessons 16%, context 11% - so the three fields it knows are a minority of
+  // the payload and it cannot get under the ceiling no matter how hard it trims.
+  //
+  // That is the regression the owner reported: loads went 50.0 -> 61.1KB
+  // delivered, then 64.0 -> 77.0KB REJECTED whole by the harness, which reads
+  // to the model AND to the load gate as a failed load, leaving the session
+  // read-only. The growth was the session's own checkpoints - each save writes a
+  // log row and the next load returns it - so diligent saving is what bricks it.
+  //
+  // Steps are ordered by what is least costly to lose and stop the moment it
+  // fits. hot, pending and the confirmation line are never touched, here or
+  // above.
+  const _clip = (s, n) => (typeof s === "string" && s.length > n ? s.slice(0, n) + "...(truncated, size guard)" : s);
+  const _fits = () => JSON.stringify(out).length <= ceiling;
+  // A ROW THAT HOLDS THE OWNER'S OWN WORDS IS NEVER CUT (2026-10-08, owner: "stop
+  // changing what i say"). Rule 2673 arrived as a 150-character stub, a session
+  // read its title as the owner's ban, and told him he had a rule he never made.
+  // The search already caps a body (lessons 700, relevant 400); this keeps the
+  // guard from cutting it again. The generic halving loop below is the backstop
+  // if such rows alone exceed the ceiling.
+  const _own = (r) => !!r && (/OWNER-SAID/.test(String(r.body || "").slice(0, 300)) || /^(OWNER|RULE-|STANDING)/i.test(String(r.title || "")));
+  // A ROW IS NEVER SENT AS PARTIAL TEXT (owner 2026-10-08: "why is it truncating
+  // rows - that's not ok"). A cut body reads as complete and carries no way back:
+  // the old marker named no id, so a session could not even ask for the rest.
+  // Over the ceiling a row keeps its id, type and title and its body becomes a
+  // pointer to bouios_get, the same titles-and-ids discipline as the memory list.
+  const _ptr = (r) => { if (r && typeof r.body === "string" && r.body.length) { r.body_omitted = true; r.body = r.id != null ? "(body not sent, size guard: bouios_get ids [" + r.id + "] returns it whole)" : "(body not sent, size guard)"; } };
+  const _steps = [
+    () => { delete out.recent_transcripts; },
+    () => { (out.log || []).forEach((r) => { if (r && r.summary) r.summary = _clip(r.summary, 400); }); },
+    // THE TOP 3 MATCHES STAY READABLE (2026-09-30). Every relevant body was cut
+    // to 150 characters here, so the one row that answers the question arrived
+    // as a stub and sessions filled the rest from general knowledge. Only rows
+    // 4-8 are cut at this step; the top 3 (each already capped at 400 by the
+    // search) are cut only near the end, below. relevance-retrieval R-TOP3.
+    () => { (out.relevant || []).forEach((r, i) => { if (i >= 3 && !_own(r)) _ptr(r); }); },
+    // A LESSON MATCHED BY THE TOPIC STAYS READABLE (2026-10-06), same as the
+    // top 3 relevant rows: the first 3 marked `matched` are skipped here and at
+    // the 150 step, and cut only with the relevant top 3 below. Measured live:
+    // the matched answer (row 99) arrived as 176 characters, without the half
+    // naming the symptom, and 3 of 3 runs answered wrong. retrieval-authority LES7.
+    () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (_own(r)) return; _ptr(r); }); },
+    () => { delete out.hot_archives; delete out.hot_archives_note; },
+    () => { if (Array.isArray(out.log)) out.log = out.log.slice(0, 10); },
+    () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 20); },
+    () => {
+      if (!Array.isArray(out.context)) return;
+      out.context = out.context.map((c) => {
+        // NEVER CUT A ROW THAT BINDS BEHAVIOUR (2026-10-06, live AI load):
+        // layer2-instructions-for-claude (4085 characters) arrived cut to 221
+        // by this step although contextWindow had kept it whole, so the
+        // instruction layer was dropped on a load that had room to spare. A
+        // superseded row is not protected: contextWindow
+        // has already excerpted it.
+        if (!c.content || c.content.length <= 300 || /handoff/i.test(c.key || "") || (CONTEXT_ALWAYS_FULL.test(c.key || "") && !/^\s*\[?SUPERSEDED\b/i.test(c.content))) return c;
+        return { ...c, content: c.content.slice(0, 300) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)", truncated: true };
+      });
+    },
+    // 2467: handoffs are read whole, so everything else pays first - shorter
+    // context excerpts, lessons and memory titles.
+    () => {
+      (out.context || []).forEach((c) => {
+        if (c && c.truncated && typeof c.content === "string" && c.content.length > 200) c.content = c.content.slice(0, 120) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)";
+      });
+    },
+    () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (_own(r)) return; _ptr(r); }); },
+    () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 12); },
+    // Only then is the handoff clipped, to a visible pointer, before the last resort.
+    () => {
+      (out.context || []).forEach((c) => {
+        if (c && /handoff/i.test(c.key || "") && typeof c.content === "string" && c.content.length > 1500) {
+          c.content = c.content.slice(0, 1500) + "...(truncated, size guard - bouios_get({keys:[\"" + c.key + "\"]}) for the rest)";
+          c.truncated = true;
+        }
+      });
+    },
+    // THE ANSWERS ARE CUT LAST (2026-10-06). Measured on the live store after
+    // 6141f58: this step ran before the memory, related and handoff steps, so
+    // the top 3 relevant rows and the matched lessons arrived as 176-character
+    // stubs while the finished load sat 3.7KB under the ceiling. They are what
+    // the session asked for; everything above pays first.
+    () => { (out.relevant || []).forEach((r) => { if (_own(r)) return; _ptr(r); }); (out.lessons || []).forEach((r) => { if (_own(r)) return; _ptr(r); }); },
+  ];
+  for (const step of _steps) {
+    if (_fits()) return out;
+    step();
+  }
+
+  // AND A LAST RESORT THAT DOES NOT KNOW FIELD NAMES AT ALL, which is the whole
+  // lesson of this regression: a guard that lists the fields it knows goes quietly
+  // out of date the next time the payload gains one, and the failure it then
+  // allows is a session that cannot write. Halve the largest remaining
+  // non-protected field until it fits. The protected set is never eligible, so a
+  // payload whose core alone exceeds the ceiling still goes out whole rather than
+  // gutted - an oversized load is bad, a load missing its pending rows is worse.
+  const _PROTECTED = new Set([
+    "confirmation", "current_task", "current_task_note", "domain", "read_order", "owner_rulings", "rules", "pending", "pending_not_listed", "pending_suspect",
+    "open_items", "hot", "hot_updated", "load_token", "load_token_note",
+  ]);
+  let _guard = 0;
+  while (!_fits() && _guard++ < 40) {
+    let big = null, bigSize = 0;
+    for (const k of Object.keys(out)) {
+      if (_PROTECTED.has(k)) continue;
+      const n = JSON.stringify(out[k] === undefined ? null : out[k]).length;
+      if (n > bigSize) { big = k; bigSize = n; }
+    }
+    if (!big || bigSize < 200) break;
+    const v = out[big];
+    if (Array.isArray(v)) out[big] = v.slice(0, Math.max(1, Math.floor(v.length / 2)));
+    else if (typeof v === "string") out[big] = v.slice(0, Math.max(200, Math.floor(v.length / 2))) + "...(truncated, size guard)";
+    else delete out[big];
+  }
+  return out;
 }
 // core/records.js - open-item counting, fetch logging and the auto-load slimming and preface,
 // shared by the owner gateway and the customer worker. Moved here from memory-gateway/src/index.js and
@@ -421,6 +583,8 @@ function contextWindow(rows, topic) {
 // shared by the owner gateway and the customer worker. Moved here from memory-gateway/src/index.js and
 // worker/src/index.js (one code base).
 
+
+
 const MEMORY_TYPES = ["pattern", "mistake", "decision", "pending"];
 
 // CONSTRAINT-ROW write gate (owner directive, incident 2026-08-04). A memory row
@@ -578,6 +742,168 @@ async function logRefusal(env, domain, what) {
     await env.DB.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain || "GLOBAL", "REFUSED " + String(what).slice(0, 300)).run();
   } catch (_) {}
 }
+
+// THE SCHEMA BOTH SIDES SHARE. Applied lazily on first DB use, so a fresh customer deploy (the
+// Deploy to Cloudflare button provisions an EMPTY D1) works with no post-deploy /setup call.
+// Every statement is CREATE ... IF NOT EXISTS and additive: customer D1s are never migrated, so
+// nothing here may drop, rename or alter a table. A shell passes the tables only its side has
+// (the gateway: rules, hooks, usage, session_usage; the worker: chat_record_parts,
+// licensed_text_cache) as the second argument of ensureSchema.
+const CORE_SCHEMA = [
+  "CREATE TABLE IF NOT EXISTS hot (domain TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at TEXT NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS context (domain TEXT NOT NULL, key TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (domain, key))",
+  "CREATE TABLE IF NOT EXISTS memory (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, type TEXT NOT NULL CHECK (type IN ('pattern','mistake','decision','pending')), title TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, source TEXT)",
+  "CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, domain TEXT NOT NULL, summary TEXT NOT NULL)",
+  // SAVE MUST NOT MAKE EVERY FUTURE LOAD MORE EXPENSIVE (2026-09-17).
+  // log had no index of any kind - sqlite_master showed the primary key and
+  // nothing else - so all five of the load's log queries were a full descending
+  // scan of the whole table. MEASURED on the real store that day: the log-window
+  // query returned 25 rows after reading 9,240, and the hot_archives query
+  // returned 3 after reading 8,644, out of 15,840 rows totalling 7.5MB.
+  // That is the half of the save-by-load loop 79b2035 did not reach. It removed
+  // archived states from the PAYLOAD; the cost of finding the rows that are kept
+  // still grew with every save, in every project, for ever - and worst of all
+  // through the archives, which are 8.3% of the rows but 52% of the bytes
+  // (1,318 rows, 3,569,680 chars, average 2,708 against a 400-char cap on a real
+  // log line). A load was paying to scan past other projects' work-state
+  // snapshots to reach its own record of what was agreed and done.
+  // (domain, id) is the exact shape every one of those queries asks for: seek to
+  // the project, walk its own rows newest first, stop at the LIMIT. Nothing is
+  // deleted, no row is hidden, and no result changes - only what it costs to get
+  // it. Locked by save-load-decoupling.test.mjs, negative space first.
+  "CREATE INDEX IF NOT EXISTS log_domain_id ON log (domain, id)",
+  // TRANSCRIPT EXCERPT INDEX (Phase 3: "transcript excerpt index so the record
+  // search covers past transcripts"). /search read only memory + log; the
+  // /transcript backstop was write-only, so a decision buried in a past chat
+  // was invisible to the record-search hook no matter how it was worded.
+  // turn_index is the transcript's own line number, so a re-PUT (the hooks
+  // upload the WHOLE transcript each time, not a delta) is idempotent: the
+  // indexer deletes this session's rows and re-inserts, never appends.
+  "CREATE TABLE IF NOT EXISTS transcript_excerpts (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, turn_index INTEGER NOT NULL, ts TEXT, domain TEXT NOT NULL, excerpt TEXT NOT NULL, UNIQUE(session_id, turn_index))",
+  "CREATE INDEX IF NOT EXISTS transcript_excerpts_domain_id ON transcript_excerpts (domain, id)",
+];
+// Which statements have been run, per database. Keyed by the database object, so a fresh
+// database runs them again, and keyed by statement, so extra tables passed on a later call
+// still run once even though the core ones already did.
+const SCHEMA_DONE = new WeakMap();
+async function ensureSchema(db, extraSchema = []) {
+  let done = SCHEMA_DONE.get(db);
+  if (!done) { done = new Set(); SCHEMA_DONE.set(db, done); }
+  for (const sql of [...CORE_SCHEMA, ...extraSchema]) {
+    if (done.has(sql)) continue;
+    await db.prepare(sql).run();
+    done.add(sql);
+  }
+}
+
+// The session id inside a stored transcript's object name (with or without the owner store's
+// "transcript:" prefix and the .jsonl / .jsonl.gz ending).
+const transcriptSessionId = (key) => String(key).replace(/^transcript:/, "").replace(/\.jsonl(\.gz)?$/, "");
+
+// ONE LINE IS CAPPED TOO. Memory is bounded by the longest line, so a single
+// huge line (a multi-MB tool result rides the "user" role) is dropped once it
+// passes TRANSCRIPT_LINE_MAX_CHARS rather than built, trimmed and parsed whole.
+// Owner turns are excerpted to 300 characters and never come near the cap; the
+// dropped line still counts toward turn_index so later numbering is unchanged.
+const TRANSCRIPT_LINE_MAX_CHARS = 1024 * 1024;
+
+// bouios_transcripts: search the excerpt index, list the stored transcripts, read one. The
+// worker's version, merged in step 5a: it also finds rows indexed with no project (domain = '')
+// and applies a history window. What differs between the two sides comes in as `policy`, so
+// nothing in here asks who is calling:
+//   historyDays    how many days back to look; null or undefined is no limit
+//   listPrefix     object-name prefix for the listing (undefined lists the whole bucket)
+//   keepKey(key)   whether a listed object is a transcript
+//   objectKeys(id) the object names to try, in order, for one session id
+//   idPattern, idError   what a session id must look like, and the refusal when it does not
+//   noStorageError       what to say when the transcript bucket is not bound
+//   searchNote           the line returned with search results
+async function transcriptTool(env, domain, args, policy) {
+  const action = args && args.action;
+  const clampN = (v, dflt, max) => { const n = Math.floor(Number(v)); return Number.isFinite(n) && n > 0 ? Math.min(n, max) : dflt; };
+  const days = policy.historyDays === undefined ? null : policy.historyDays;
+  const sinceMs = days === null ? null : Date.now() - days * 86400000;
+  if (action === "search") {
+    const q = String(args.q || "").slice(0, 500);
+    const terms = relevanceTerms(q);
+    if (!terms.length) return { ok: false, error: "q needs at least one content word" };
+    await ensureSchema(env.DB);
+    const score = terms.map(() => "(CASE WHEN lower(excerpt) LIKE ? THEN 1 ELSE 0 END)").join(" + ");
+    const like = terms.map((t) => "%" + t + "%");
+    const since = sinceMs === null ? null : new Date(sinceMs).toISOString();
+    const rows = await env.DB.prepare(
+      "SELECT session_id, turn_index, ts, excerpt, (" + score + ") AS score FROM transcript_excerpts WHERE (domain = ? OR domain = '')" +
+      (since ? " AND ts >= ?" : "") + " AND (" + score + ") > 0 ORDER BY score DESC, id DESC LIMIT ?"
+    ).bind(...like, domain, ...(since ? [since] : []), ...like, clampN(args.limit, 5, 20)).all();
+    return { ok: true, project: domain, q, history_days: days, matches: (rows.results || []).map((r) => ({ session_id: r.session_id, line: r.turn_index, ts: r.ts, excerpt: r.excerpt })), note: policy.searchNote };
+  }
+  if (!env.TRANSCRIPTS) return { ok: false, error: policy.noStorageError };
+  const inWindow = (o) => sinceMs === null || (o.uploaded && new Date(o.uploaded).getTime() >= sinceMs);
+  if (action === "list") {
+    const objects = [];
+    let cursor;
+    do {
+      const page = await env.TRANSCRIPTS.list({ cursor, limit: 1000, include: ["customMetadata"], ...(policy.listPrefix ? { prefix: policy.listPrefix } : {}) });
+      for (const o of page.objects || []) {
+        if (!policy.keepKey(o.key) || !inWindow(o)) continue;
+        const project = (o.customMetadata && o.customMetadata.project) || null;
+        if (project && project !== domain) continue;
+        objects.push({ session_id: transcriptSessionId(o.key), size: o.size, uploaded: o.uploaded, project });
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+    objects.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded));
+    return { ok: true, project: domain, history_days: days, transcripts: objects.slice(0, clampN(args.limit, 5, 20)) };
+  }
+  if (action === "read") {
+    const sid = transcriptSessionId(String(args.session_id || ""));
+    if (!policy.idPattern.test(sid)) return { ok: false, error: policy.idError };
+    const terms = relevanceTerms(String(args.q || "").slice(0, 500));
+    if (!terms.length) return { ok: false, error: "q needs at least one content word" };
+    let obj = null;
+    for (const key of policy.objectKeys(sid)) {
+      obj = await env.TRANSCRIPTS.get(key);
+      if (obj) { obj.__key = key; break; }
+    }
+    if (!obj || !obj.body) return { ok: false, error: "no stored transcript with that id" };
+    if (!inWindow(obj)) return { ok: false, error: "this transcript is older than your plan's history period; it is still in your storage" };
+    const tag = obj.customMetadata && obj.customMetadata.project;
+    if (tag && tag !== domain) return { ok: false, error: "that transcript belongs to another project" };
+    let src = obj.body;
+    if (/\.gz$/.test(obj.__key)) {
+      if (typeof DecompressionStream === "undefined") return { ok: false, error: "gzip not supported here" };
+      src = src.pipeThrough(new DecompressionStream("gzip"));
+    }
+    const budget = clampN(args.max_chars, 6000, 20000);
+    const hits = [];
+    let used = 0, lineNo = 0, scanned = 0, carry = "", dropping = false, full = false;
+    const check = (line) => {
+      lineNo++;
+      if (!line) return;
+      scanned++;
+      const low = line.toLowerCase();
+      if (!terms.some((t) => low.includes(t))) return;
+      const clip = line.length > 900 ? line.slice(0, 900) + "..." : line;
+      if (used + clip.length > budget) { full = true; return; }
+      used += clip.length;
+      hits.push({ line: lineNo - 1, text: clip });
+    };
+    const reader = src.pipeThrough(new TextDecoderStream()).getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const parts = value.split("\n");
+      for (let k = 0; k < parts.length; k++) {
+        if (!dropping) { carry += parts[k]; if (carry.length > TRANSCRIPT_LINE_MAX_CHARS) { carry = ""; dropping = true; } }
+        if (k < parts.length - 1) { if (!dropping) check(carry); else lineNo++; carry = ""; dropping = false; }
+      }
+      if (full) { try { await reader.cancel(); } catch (_) {} break; }
+    }
+    if (!full && !dropping) check(carry);
+    return { ok: true, project: domain, session_id: sid, lines_scanned: scanned, matches: hits, ...(full ? { truncated: true, note: "max_chars reached: narrow q or raise max_chars" } : {}), ...(tag ? {} : { untagged: true }) };
+  }
+  return { ok: false, error: "action must be search, list or read" };
+}
 // core/tokens.js - the load token (mint and verify), shared by the owner gateway and the customer worker.
 // Moved here from memory-gateway/src/index.js and worker/src/index.js (one code base).
 
@@ -710,47 +1036,21 @@ function confirmationText(domain, rulesN, hotDate, openN, branded = false) {
 }
 const MEMORY_NOTE = "titles only - call bouios_get({project, ids:[...]}) for full body of any row you need";
 
-const SCHEMA = [
-  "CREATE TABLE IF NOT EXISTS hot (domain TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at TEXT NOT NULL)",
-  "CREATE TABLE IF NOT EXISTS context (domain TEXT NOT NULL, key TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (domain, key))",
-  "CREATE TABLE IF NOT EXISTS memory (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT NOT NULL, type TEXT NOT NULL CHECK (type IN ('pattern','mistake','decision','pending')), title TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, source TEXT)",
-  "CREATE TABLE IF NOT EXISTS log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, domain TEXT NOT NULL, summary TEXT NOT NULL)",
-  // SAVE MUST NOT MAKE EVERY FUTURE LOAD MORE EXPENSIVE (2026-09-17). Parity
-  // with the gateway, and a customer's store fills exactly the same way ours did.
-  // log had no index of any kind, so every query against it was a full descending
-  // scan of the whole table. Measured on the owner's store that day: 15,840 rows,
-  // of which 1,318 are HOT ARCHIVE rows totalling 3,569,680 characters - 8.3% of
-  // the rows and 52% of the bytes, because the archive INSERT above is the one
-  // writer into this table with no length cap (a real log line is capped at
-  // LOG_LINE_MAX 400; an archive averaged 2,708 and reached 10,256). So every
-  // save made every later read of this table cost more, for ever.
-  // (domain, id) is the shape the reads ask for: seek to the project, walk its
-  // own rows newest first, stop at the LIMIT. Nothing is deleted and no result
-  // changes - only what it costs to get it.
-  "CREATE INDEX IF NOT EXISTS log_domain_id ON log (domain, id)",
-  // Sign-in surface for hosted connectors (2026-08-04, ported from the gateway).
-  // A hosted claude.ai connector sends no credential in any slot, so without this
-  // a customer on chat gets a bare 401 with no way in - the same defect the
-  // gateway had. The customer's own BEARER_TOKEN is the key the authorize step
-  // checks; the access token IS that token, which /mcp then accepts.
+// The tables only the customer worker has. The ones both sides share (hot, context, memory, log,
+// transcript_excerpts and their indexes) are CORE_SCHEMA in core/store.js. Applied lazily on first
+// DB use, so a fresh customer deploy (the Deploy to Cloudflare button provisions an EMPTY D1) works
+// with no post-deploy /setup call. Customer databases are never migrated: every statement is
+// CREATE ... IF NOT EXISTS and nothing is dropped or renamed.
+const WORKER_SCHEMA = [
   // Where each chat/Cowork session's record has got to (2026-10-06):
   // which part object is being filled and how many bytes it holds, so adding a
   // line does not have to list the bucket. See recordChatTurn.
-  // Past-chat excerpt index (2026-10-27, BOUIOS 4053): what the user typed in each stored transcript, so the
-  // per-message lookup and bouios_transcripts can find a past chat. Same table as the owner gateway's.
-  "CREATE TABLE IF NOT EXISTS transcript_excerpts (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, turn_index INTEGER NOT NULL, ts TEXT, domain TEXT NOT NULL, excerpt TEXT NOT NULL, UNIQUE(session_id, turn_index))",
-  "CREATE INDEX IF NOT EXISTS transcript_excerpts_domain_id ON transcript_excerpts (domain, id)",
   "CREATE TABLE IF NOT EXISTS chat_record_parts (session_id TEXT PRIMARY KEY, part INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, updated_at TEXT)",
   // The last rules and instructions our service sent this licensed install
   // (2026-10-07), so our service being unreachable cannot strip it. See rememberLicensed.
   "CREATE TABLE IF NOT EXISTS licensed_text_cache (kind TEXT PRIMARY KEY, body TEXT NOT NULL, at INTEGER NOT NULL)",
 ];
-let schemaReady = false;
-async function ensureSchema(db) {
-  if (schemaReady) return;
-  for (const sql of SCHEMA) await db.prepare(sql).run();
-  schemaReady = true;
-}
+const ensureWorkerSchema = (db) => ensureSchema(db, WORKER_SCHEMA);
 
 const PROJECT_RE = /^[A-Z][A-Z0-9_-]{1,19}$/;
 function normaliseProject(raw) {
@@ -791,7 +1091,7 @@ const licensedSeen = new WeakMap();
 async function rememberLicensed(env, kind, body) {
   if (!env.DB) return;
   try {
-    await ensureSchema(env.DB);
+    await ensureWorkerSchema(env.DB);
     let seen = licensedSeen.get(env.DB);
     if (!seen) { seen = new Map(); licensedSeen.set(env.DB, seen); }
     let last = seen.get(kind);
@@ -811,7 +1111,7 @@ async function rememberLicensed(env, kind, body) {
 async function lastLicensed(env, kind) {
   if (!env.DB) return null;
   try {
-    await ensureSchema(env.DB);
+    await ensureWorkerSchema(env.DB);
     const row = await env.DB.prepare("SELECT body, at FROM licensed_text_cache WHERE kind = ?").bind(kind).first();
     if (row && typeof row.body === "string" && Date.now() - Number(row.at) < LAST_GOOD_MAX_AGE_MS) return row.body;
   } catch {
@@ -928,7 +1228,6 @@ function ownerTurnExcerptOfLine(line, i) {
   if (!line || line.indexOf('"user"') === -1) return null;
   return extractOwnerTurnExcerpts(line).map((r) => ({ ...r, turn_index: i }))[0] || null;
 }
-const TRANSCRIPT_LINE_MAX_CHARS = 1024 * 1024;
 async function ownerTurnExcerptsFromStream(byteStream) {
   const out = [];
   const reader = byteStream.pipeThrough(new TextDecoderStream()).getReader();
@@ -948,7 +1247,6 @@ async function ownerTurnExcerptsFromStream(byteStream) {
   if (!dropping) { const last = ownerTurnExcerptOfLine(carry, i); if (last) out.push(last); }
   return out;
 }
-const transcriptSessionId = (key) => String(key).replace(/^transcript:/, "").replace(/\.jsonl(\.gz)?$/, "");
 // Re-index one stored transcript: delete its rows, insert the fresh set (an upload is the whole transcript,
 // never a delta, so this can never duplicate). Reads the stored object, so a streamed upload is indexed too.
 // FAIL OPEN: the upload has already been stored when this runs; an indexing error never fails it.
@@ -962,7 +1260,7 @@ async function indexStoredTranscript(env, key, domain) {
       src = src.pipeThrough(new DecompressionStream("gzip"));
     }
     const rows = await ownerTurnExcerptsFromStream(src);
-    await ensureSchema(env.DB);
+    await ensureWorkerSchema(env.DB);
     const sid = transcriptSessionId(key);
     await env.DB.prepare("DELETE FROM transcript_excerpts WHERE session_id = ?").bind(sid).run();
     const ins = (r) => env.DB.prepare("INSERT INTO transcript_excerpts (session_id, turn_index, ts, domain, excerpt) VALUES (?, ?, ?, ?, ?)").bind(sid, r.turn_index, r.ts, domain || "", r.excerpt);
@@ -1114,7 +1412,7 @@ function chatLine(msg, response, sessionId) {
 async function recordChatTurn(env, sessionId, text) {
   if (!text || !env.TRANSCRIPTS || !env.DB || !sessionId || !CHAT_SESSION_ID.test(sessionId)) return;
   try {
-    await ensureSchema(env.DB);
+    await ensureWorkerSchema(env.DB);
     const row = await env.DB.prepare("SELECT part, size FROM chat_record_parts WHERE session_id = ?").bind(sessionId).first();
     let part = (row && Number(row.part)) || 0;
     let size = (row && Number(row.size)) || 0;
@@ -1265,7 +1563,7 @@ async function searchRoute(url, env, request) {
   const q = String(url.searchParams.get("q") || "").slice(0, 500);
   if (!domain || !relevanceTerms(q).length) return json({ error: "domain and a query with at least one content word are required" }, 400);
   try {
-    await ensureSchema(env.DB);
+    await ensureWorkerSchema(env.DB);
     const mem = (await relevantMemory(env.DB, domain, q, [])).slice(0, 6)
       .map((r) => ({ id: r.id, type: r.type, title: r.title, excerpt: String(r.excerpt || r.body || "").slice(0, 240) }));
     const top = mem.slice(0, 3).map((r) => r.id);
@@ -1310,7 +1608,7 @@ async function searchRoute(url, env, request) {
 
 async function sessionLoad(domain, surface, env, token) {
   const db = env.DB;
-  await ensureSchema(db);
+  await ensureWorkerSchema(db);
   let loadTopic = "";
   {
     const tm = / topic=(\S+)/.exec(String(surface || ""));
@@ -1462,7 +1760,7 @@ async function sessionWrite(domain, body, db, tz) {
     const clean = raw.slice(0, 24).replace(/[^A-Za-z0-9_.-]/g, "");
     return " [surface=" + (clean || "undeclared") + "]";
   };
-  await ensureSchema(db);
+  await ensureWorkerSchema(db);
   const batched = [];   // must land together or not at all - see db.batch() below
   // What counts as a stated done-condition. Deliberately loose: any of these
   // phrasings is a real commitment about what finished means, and a matcher
@@ -3018,254 +3316,30 @@ async function runNoMarksSplit(env, token, args, settings) {
   return out;
 }
 
-// MCP transport size ceiling - MIRROR of memory-gateway/src/index.js, added to
-// this customer worker 2026-09-16. Until today it had NO ceiling at all: the
-// bouios_load result went out at whatever size sessionLoad() produced, so a
-// customer whose log and lessons had grown hit exactly the failure the owner
-// hit on the gateway - the client rejects the whole tool result, the model
-// never sees the load, and the load gate reads it as never loaded, leaving the
-// session unable to write. Keep this function byte-equivalent to the gateway's.
-//
-// MCP transport size ceiling. sessionStart() output was measured at ~127KB for
-// a real account (max tier, 46 memory rows, 6 full skill bodies) - proven
-// 2026-07-02 to repeatedly trip the client's "exceeds maximum allowed tokens"
-// error inside a live session. An oversized single-line tool result is a
-// plausible cause of the chronic MCP disconnect/reconnect cycling (mem440/
-// 469/609/642/etc) that survived the earlier 403/licence fix (c7833b9) -
-// that fix addressed one confirmed 403 cause; this addresses a second,
-// independent, now-measured cause. Shrinks in order of least information
-// loss: skill bodies (re-derivable, rarely change) first, then memory row
-// bodies (kept as a preview + id so nothing is silently lost - full body
-// remains fetchable by asking for that memory id). Pending rows and hot
-// state are NEVER touched - those are exactly what bouios_handoff and the
-// checkpoint protocol depend on being complete every time.
+// MCP transport size ceiling for the customer load. The guard itself (clampMcpLoadSize) is
+// core/mcp.js, the same function the owner gateway runs; this is the ceiling this side passes it.
+// Added 2026-09-16: until then the worker had NO ceiling, so the bouios_load result went out at
+// whatever size sessionLoad() produced and a customer whose log and lessons had grown hit the
+// failure the owner hit on the gateway - the client rejects the whole tool result, the model never
+// sees the load, and the load gate reads it as never loaded, leaving the session unable to write.
+// 60000 is the value the worker has always used (the gateway's is 40000, core/mcp.js); it is kept
+// because moving it is a customer-visible change that has not been decided.
+const WORKER_LOAD_CEILING = 60000;
 
-
-
-
-const MCP_LOAD_SIZE_CEILING = 60000;
-function clampMcpLoadSize(out) {
-  let size = JSON.stringify(out).length;
-  if (size <= MCP_LOAD_SIZE_CEILING) return out;
-  if (out.skills && Array.isArray(out.skills.skills)) {
-    out.skills.skills = out.skills.skills.map((s) => ({ name: s.name, est_tokens: s.est_tokens, bodyOmitted: true }));
-    out.skills.note = "Skill bodies omitted this load (response size guard). Names unchanged from your prior load in this session; ask if a body is needed.";
-  }
-  size = JSON.stringify(out).length;
-  if (size <= MCP_LOAD_SIZE_CEILING) return out;
-  if (Array.isArray(out.memory)) {
-    out.memory = out.memory.map((m) => {
-      if (m.type === "pending" || !m.body || m.body.length <= 300) return m;
-      return { ...m, body: m.body.slice(0, 300) + "...(truncated, size guard - ask for memory id " + m.id + " if the rest is needed)", truncated: true };
-    });
-  }
-  size = JSON.stringify(out).length;
-  if (size <= MCP_LOAD_SIZE_CEILING) return out;
-  if (Array.isArray(out.context)) {
-    out.context = out.context.map((c) => {
-      // Never cut a row that binds behaviour (2026-10-06, live AI load, parity
-      // with the gateway: layer2-instructions-for-claude, 4085 characters, was
-      // cut to 221 here after contextWindow had kept it whole). A superseded row
-      // is not protected: contextWindow has already excerpted it.
-      if (!c.content || c.content.length <= 300 || /handoff/i.test(c.key || "") || (CONTEXT_ALWAYS_FULL.test(c.key || "") && !/^\s*\[?SUPERSEDED\b/i.test(c.content))) return c;
-      return { ...c, content: c.content.slice(0, 300) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)", truncated: true };
-    });
-  }
-
-  // EXTENDED 2026-09-16, because this guard had been outgrown rather than
-  // broken. It was written on 2026-07-02 against a 127KB payload made of
-  // skills, memory and context, and it still trims exactly those three. Every
-  // field added since is invisible to it: log, lessons (2026-09-05), relevant
-  // (2026-09-09), recent_transcripts, hot_archives. Measured on a real load
-  // from this account today - 62,037 bytes, of which log 24%, rules 19%,
-  // lessons 16%, context 11% - so the three fields it knows are a minority of
-  // the payload and it cannot get under the ceiling no matter how hard it trims.
-  //
-  // That is the regression the owner reported: loads went 50.0 -> 61.1KB
-  // delivered, then 64.0 -> 77.0KB REJECTED whole by the harness, which reads
-  // to the model AND to the load gate as a failed load, leaving the session
-  // read-only. The growth was the session's own checkpoints - each save writes a
-  // log row and the next load returns it - so diligent saving is what bricks it.
-  //
-  // Steps are ordered by what is least costly to lose and stop the moment it
-  // fits. hot, pending and the confirmation line are never touched, here or
-  // above.
-  const _clip = (s, n) => (typeof s === "string" && s.length > n ? s.slice(0, n) + "...(truncated, size guard)" : s);
-  const _fits = () => JSON.stringify(out).length <= MCP_LOAD_SIZE_CEILING;
-  // A ROW THAT HOLDS THE OWNER'S OWN WORDS IS NEVER CUT (2026-10-08, owner: "stop
-  // changing what i say"). Rule 2673 arrived as a 150-character stub, a session
-  // read its title as the owner's ban, and told him he had a rule he never made.
-  // The search already caps a body (lessons 700, relevant 400); this keeps the
-  // guard from cutting it again. The generic halving loop below is the backstop
-  // if such rows alone exceed the ceiling.
-  const _own = (r) => !!r && (/OWNER-SAID/.test(String(r.body || "").slice(0, 300)) || /^(OWNER|RULE-|STANDING)/i.test(String(r.title || "")));
-  // A ROW IS NEVER SENT AS PARTIAL TEXT (owner 2026-10-08: "why is it truncating
-  // rows - that's not ok"). A cut body reads as complete and carries no way back:
-  // the old marker named no id, so a session could not even ask for the rest.
-  // Over the ceiling a row keeps its id, type and title and its body becomes a
-  // pointer to bouios_get, the same titles-and-ids discipline as the memory list.
-  const _ptr = (r) => { if (r && typeof r.body === "string" && r.body.length) { r.body_omitted = true; r.body = r.id != null ? "(body not sent, size guard: bouios_get ids [" + r.id + "] returns it whole)" : "(body not sent, size guard)"; } };
-  const _steps = [
-    () => { delete out.recent_transcripts; },
-    () => { (out.log || []).forEach((r) => { if (r && r.summary) r.summary = _clip(r.summary, 400); }); },
-    // The top 3 matches stay readable until late (parity with the gateway, 2026-09-30).
-    () => { (out.relevant || []).forEach((r, i) => { if (i >= 3 && !_own(r)) _ptr(r); }); },
-    // A LESSON MATCHED BY THE TOPIC STAYS READABLE (2026-10-06), same as the
-    // top 3 relevant rows: the first 3 marked `matched` are skipped here and at
-    // the 150 step, and cut only with the relevant top 3 below. Measured live:
-    // the matched answer (row 99) arrived as 176 characters, without the half
-    // naming the symptom, and 3 of 3 runs answered wrong. retrieval-authority LES7.
-    () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (_own(r)) return; _ptr(r); }); },
-    () => { delete out.hot_archives; delete out.hot_archives_note; },
-    () => { if (Array.isArray(out.log)) out.log = out.log.slice(0, 10); },
-    () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 20); },
-    // Handoffs are read whole, so everything else pays first (parity with the
-    // gateway, 2026-09-25).
-    () => {
-      (out.context || []).forEach((c) => {
-        if (c && c.truncated && typeof c.content === "string" && c.content.length > 200) c.content = c.content.slice(0, 120) + "...(truncated, size guard - ask for context key " + c.key + " if the rest is needed)";
-      });
-    },
-    () => { let k = 0; (out.lessons || []).forEach((r) => { if (r && r.matched && k++ < 3) return; if (_own(r)) return; _ptr(r); }); },
-    () => { if (Array.isArray(out.memory)) out.memory = out.memory.slice(0, 12); },
-    // Only then is the handoff clipped, to a visible pointer, before the last resort.
-    () => {
-      (out.context || []).forEach((c) => {
-        if (c && /handoff/i.test(c.key || "") && typeof c.content === "string" && c.content.length > 1500) {
-          c.content = c.content.slice(0, 1500) + "...(truncated, size guard - bouios_get({keys:[\"" + c.key + "\"]}) for the rest)";
-          c.truncated = true;
-        }
-      });
-    },
-    // THE ANSWERS ARE CUT LAST (2026-10-06). Measured on the live store after
-    // 6141f58: this step ran before the memory, related and handoff steps, so
-    // the top 3 relevant rows and the matched lessons arrived as 176-character
-    // stubs while the finished load sat 3.7KB under the ceiling. They are what
-    // the session asked for; everything above pays first.
-    () => { (out.relevant || []).forEach((r) => { _ptr(r); }); (out.lessons || []).forEach((r) => { _ptr(r); }); },
-  ];
-  for (const step of _steps) {
-    if (_fits()) return out;
-    step();
-  }
-
-  // AND A LAST RESORT THAT DOES NOT KNOW FIELD NAMES AT ALL, which is the whole
-  // lesson of this regression: a guard that lists the fields it knows goes quietly
-  // out of date the next time the payload gains one, and the failure it then
-  // allows is a session that cannot write. Halve the largest remaining
-  // non-protected field until it fits. The protected set is never eligible, so a
-  // payload whose core alone exceeds the ceiling still goes out whole rather than
-  // gutted - an oversized load is bad, a load missing its pending rows is worse.
-  const _PROTECTED = new Set([
-    "confirmation", "current_task", "current_task_note", "domain", "read_order", "pending", "pending_suspect",
-    "open_items", "hot", "hot_updated", "load_token", "load_token_note",
-  ]);
-  let _guard = 0;
-  while (!_fits() && _guard++ < 40) {
-    let big = null, bigSize = 0;
-    for (const k of Object.keys(out)) {
-      if (_PROTECTED.has(k)) continue;
-      const n = JSON.stringify(out[k] === undefined ? null : out[k]).length;
-      if (n > bigSize) { big = k; bigSize = n; }
-    }
-    if (!big || bigSize < 200) break;
-    const v = out[big];
-    if (Array.isArray(v)) out[big] = v.slice(0, Math.max(1, Math.floor(v.length / 2)));
-    else if (typeof v === "string") out[big] = v.slice(0, Math.max(200, Math.floor(v.length / 2))) + "...(truncated, size guard)";
-    else delete out[big];
-  }
-  return out;
-}
-
-// bouios_transcripts on the customer's own storage (2026-10-27, BOUIOS 4053). The gateway's transcriptTool,
-// adapted to this worker's object names (<session>.jsonl, untagged or tagged with customMetadata.project)
-// and to the plan's history window, which this worker already applies to GET /transcript.
-async function transcriptTool(env, domain, args, request, url) {
-  const action = args && args.action;
-  const clampN = (v, dflt, max) => { const n = Math.floor(Number(v)); return Number.isFinite(n) && n > 0 ? Math.min(n, max) : dflt; };
-  const days = await historyWindowDaysCached(request, url, env);
-  const sinceMs = days === null || days === undefined ? null : Date.now() - days * 86400000;
-  if (action === "search") {
-    const q = String(args.q || "").slice(0, 500);
-    const terms = relevanceTerms(q);
-    if (!terms.length) return { ok: false, error: "q needs at least one content word" };
-    await ensureSchema(env.DB);
-    const score = terms.map(() => "(CASE WHEN lower(excerpt) LIKE ? THEN 1 ELSE 0 END)").join(" + ");
-    const like = terms.map((t) => "%" + t + "%");
-    const since = sinceMs === null ? null : new Date(sinceMs).toISOString();
-    const rows = await env.DB.prepare(
-      "SELECT session_id, turn_index, ts, excerpt, (" + score + ") AS score FROM transcript_excerpts WHERE (domain = ? OR domain = '')" +
-      (since ? " AND ts >= ?" : "") + " AND (" + score + ") > 0 ORDER BY score DESC, id DESC LIMIT ?"
-    ).bind(...like, domain, ...(since ? [since] : []), ...like, clampN(args.limit, 5, 20)).all();
-    return { ok: true, project: domain, q, history_days: days, matches: (rows.results || []).map((r) => ({ session_id: r.session_id, line: r.turn_index, ts: r.ts, excerpt: r.excerpt })), note: "What you typed only. To read a whole stretch of one chat use read with session_id and q." };
-  }
-  if (!env.TRANSCRIPTS) return { ok: false, error: "transcript storage is not set up on this install" };
-  const inWindow = (o) => sinceMs === null || (o.uploaded && new Date(o.uploaded).getTime() >= sinceMs);
-  if (action === "list") {
-    const objects = [];
-    let cursor;
-    do {
-      const page = await env.TRANSCRIPTS.list({ cursor, limit: 1000, include: ["customMetadata"] });
-      for (const o of page.objects || []) {
-        if (String(o.key).startsWith("chat/") || !inWindow(o)) continue;
-        const project = (o.customMetadata && o.customMetadata.project) || null;
-        if (project && project !== domain) continue;
-        objects.push({ session_id: transcriptSessionId(o.key), size: o.size, uploaded: o.uploaded, project });
-      }
-      cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor);
-    objects.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded));
-    return { ok: true, project: domain, history_days: days, transcripts: objects.slice(0, clampN(args.limit, 5, 20)) };
-  }
-  if (action === "read") {
-    const sid = transcriptSessionId(String(args.session_id || ""));
-    if (!TRANSCRIPT_ID.test(sid)) return { ok: false, error: "session_id is not a stored transcript name" };
-    const terms = relevanceTerms(String(args.q || "").slice(0, 500));
-    if (!terms.length) return { ok: false, error: "q needs at least one content word" };
-    let obj = null;
-    for (const key of [sid + ".jsonl", sid, sid + ".jsonl.gz"]) {
-      obj = await env.TRANSCRIPTS.get(key);
-      if (obj) { obj.__key = key; break; }
-    }
-    if (!obj || !obj.body) return { ok: false, error: "no stored transcript with that id" };
-    if (!inWindow(obj)) return { ok: false, error: "this transcript is older than your plan's history period; it is still in your storage" };
-    const tag = obj.customMetadata && obj.customMetadata.project;
-    if (tag && tag !== domain) return { ok: false, error: "that transcript belongs to another project" };
-    let src = obj.body;
-    if (/\.gz$/.test(obj.__key)) {
-      if (typeof DecompressionStream === "undefined") return { ok: false, error: "gzip not supported here" };
-      src = src.pipeThrough(new DecompressionStream("gzip"));
-    }
-    const budget = clampN(args.max_chars, 6000, 20000);
-    const hits = [];
-    let used = 0, lineNo = 0, scanned = 0, carry = "", dropping = false, full = false;
-    const check = (line) => {
-      lineNo++;
-      if (!line) return;
-      scanned++;
-      const low = line.toLowerCase();
-      if (!terms.some((t) => low.includes(t))) return;
-      const clip = line.length > 900 ? line.slice(0, 900) + "..." : line;
-      if (used + clip.length > budget) { full = true; return; }
-      used += clip.length;
-      hits.push({ line: lineNo - 1, text: clip });
-    };
-    const reader = src.pipeThrough(new TextDecoderStream()).getReader();
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      const parts = value.split("\n");
-      for (let k = 0; k < parts.length; k++) {
-        if (!dropping) { carry += parts[k]; if (carry.length > TRANSCRIPT_LINE_MAX_CHARS) { carry = ""; dropping = true; } }
-        if (k < parts.length - 1) { if (!dropping) check(carry); else lineNo++; carry = ""; dropping = false; }
-      }
-      if (full) { try { await reader.cancel(); } catch (_) {} break; }
-    }
-    if (!full && !dropping) check(carry);
-    return { ok: true, project: domain, session_id: sid, lines_scanned: scanned, matches: hits, ...(full ? { truncated: true, note: "max_chars reached: narrow q or raise max_chars" } : {}), ...(tag ? {} : { untagged: true }) };
-  }
-  return { ok: false, error: "action must be search, list or read" };
-}
+// bouios_transcripts on the customer's own storage (2026-10-27, BOUIOS 4053) is transcriptTool in
+// core/store.js; this is the customer's side of it: the object names this worker stores
+// (<session>.jsonl, untagged or tagged with customMetadata.project, the chat records under chat/
+// left out) and the plan's history window, which this worker already applies to GET /transcript.
+const workerTranscriptPolicy = (days) => ({
+  historyDays: days,
+  listPrefix: undefined,
+  keepKey: (key) => !String(key).startsWith("chat/"),
+  objectKeys: (sid) => [sid + ".jsonl", sid, sid + ".jsonl.gz"],
+  idPattern: TRANSCRIPT_ID,
+  idError: "session_id is not a stored transcript name",
+  noStorageError: "transcript storage is not set up on this install",
+  searchNote: "What you typed only. To read a whole stretch of one chat use read with session_id and q.",
+});
 
 
 // SKILLS IN YOUR OWN STORE. How many skills a plan loads is a number the gateway
@@ -3355,12 +3429,12 @@ async function handleMsg(msg, sessionId, env, request, url) {
     if (AUTO_LOAD_TOOLS.has(name)
         && !(await loadedThisSession(env.DB, domain, sessionId))
         && !(await verifyLoadToken(env, domain, args.load_token))) {
-      try { autoLoaded = clampMcpLoadSize(await mcpLoad(domain, { surface: args.surface }, sessionId, env, request, url)); } catch (_) { autoLoaded = null; }
+      try { autoLoaded = clampMcpLoadSize(await mcpLoad(domain, { surface: args.surface }, sessionId, env, request, url), WORKER_LOAD_CEILING); } catch (_) { autoLoaded = null; }
     }
     const res = await (async () => {
     try {
       if (name === "bouios_load") {
-        return toolText(id, JSON.stringify(clampMcpLoadSize(await mcpLoad(domain, args, sessionId, env, request, url))));
+        return toolText(id, JSON.stringify(clampMcpLoadSize(await mcpLoad(domain, args, sessionId, env, request, url), WORKER_LOAD_CEILING)));
       }
       if (name === "bouios_save") {
         // Bearer auth (the /mcp/{token} gate this call already passed) proves
@@ -3397,7 +3471,7 @@ async function handleMsg(msg, sessionId, env, request, url) {
         return toolText(id, JSON.stringify({ saved, handoff_block: block, instruction: "Show handoff_block to the user in a code box." }));
       }
       if (name === "bouios_transcripts") {
-        const out = await transcriptTool(env, domain, args, request, url);
+        const out = await transcriptTool(env, domain, args, workerTranscriptPolicy(await historyWindowDaysCached(request, url, env)));
         return toolText(id, JSON.stringify(out), out.ok === false);
       }
       if (name === "bouios_no_marks") {
