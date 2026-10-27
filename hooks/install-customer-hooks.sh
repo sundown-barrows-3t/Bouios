@@ -1,16 +1,19 @@
 #!/bin/bash
-# install-customer-hooks.sh <licence> - put the licence on THIS machine and wire the
+# install-customer-hooks.sh <licence> [worker-url] [worker-key] - put the licence on THIS machine and wire the
 # session-checks fetch into Claude Code (2026-10-25, BOUIOS decision 173).
 #
 # Called by install.sh and install-rest.sh when LICENCE is given. It stores the licence
 # as BOUIOS_LICENCE in ~/.claude/bouios.env (readable by you only, beside the lines the
-# transcript hook keeps there), copies fetch-customer-hooks.sh to ~/.claude, adds it as a
+# transcript hook keeps there). With the worker address and key as well (the installers pass
+# them) it stores those as BOUIOS_URL and BOUIOS_TOKEN: the per-message record lookup in the
+# served hook asks YOUR worker with them, so it works whether or not transcript storage was
+# set up. They are never sent anywhere else, copies fetch-customer-hooks.sh to ~/.claude, adds it as a
 # SessionStart hook in ~/.claude/settings.json beside whatever is there and never twice,
 # and runs it once. The checks themselves are not in this repo or on your disk until a
 # licensed fetch brings them; without a valid licence the fetch installs nothing.
 # Locked by .session/test-customer-hooks-fetch.sh.
 set -u
-lic="${1:-}"
+lic="${1:-}"; wurl="${2:-}"; wkey="${3:-}"
 if [ -z "$lic" ]; then
   echo "  Session checks: skipped (no licence given)."
   exit 0
@@ -24,8 +27,10 @@ dir="$HOME/.claude"
 mkdir -p "$dir"
 cp "$here/fetch-customer-hooks.sh" "$dir/bouios-fetch-hooks.sh" && chmod +x "$dir/bouios-fetch-hooks.sh"
 ( umask 077
-  [ -f "$dir/bouios.env" ] && grep -v '^BOUIOS_LICENCE=' "$dir/bouios.env" > "$dir/bouios.env.tmp" || : > "$dir/bouios.env.tmp"
+  drop='^BOUIOS_LICENCE='; [ -n "$wurl" ] && [ -n "$wkey" ] && drop='^(BOUIOS_LICENCE|BOUIOS_URL|BOUIOS_TOKEN)='
+  [ -f "$dir/bouios.env" ] && grep -Ev "$drop" "$dir/bouios.env" > "$dir/bouios.env.tmp" || : > "$dir/bouios.env.tmp"
   printf 'BOUIOS_LICENCE=%q\n' "$lic" >> "$dir/bouios.env.tmp"
+  [ -n "$wurl" ] && [ -n "$wkey" ] && printf 'BOUIOS_URL=%q\nBOUIOS_TOKEN=%q\n' "$wurl" "$wkey" >> "$dir/bouios.env.tmp"
   mv "$dir/bouios.env.tmp" "$dir/bouios.env" )
 chmod 600 "$dir/bouios.env"
 python3 - "$dir/settings.json" <<'PY'
