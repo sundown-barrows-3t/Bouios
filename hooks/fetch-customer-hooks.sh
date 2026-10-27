@@ -1,6 +1,6 @@
 #!/bin/bash
 # fetch-customer-hooks.sh - install the current session checks from Bouios into
-# ~/.claude (2026-10-25, BOUIOS decision 173: the checks are Bouios's control plane,
+# ~/.claude (2026-10-25: the checks are Bouios's control plane,
 # served per session to a licensed customer and never committed to the customer's own
 # store; a lapsed licence leaves the customer on data-only).
 #
@@ -16,8 +16,7 @@
 #     installed (only the files and settings entries listed in the marker): a lapsed
 #     licence is data-only. A gateway that cannot be reached, or answers 5xx or 429, never
 #     removes anything: an outage degrades to the last good copy, not to a dead product.
-#   - It does nothing at all in an owner session (CLAUDE_OWNER, ~/.claude/owner or
-#     GATEWAY_BEARER_TOKEN), and never overwrites a ~/.claude/pre-tool-enforcement.sh it
+#   - It does nothing on a machine that runs Bouios's own development checks, and never overwrites a ~/.claude/pre-tool-enforcement.sh it
 #     did not install.
 #   - It sends the licence in a header read from stdin, never on a command line.
 #   - The marker ~/.claude/bouios-customer is written last and only after every file

@@ -35,8 +35,11 @@ if [ "$event" != "PreCompact" ] && [ -f "$mark" ]; then
   [ $(( size - last )) -lt 204800 ] && [ "$age" -lt 1800 ] && exit 0
 fi
 
+# The project this session loaded from your memory, so a past chat is found for that project;
+# nothing when no project was loaded (the upload is then untagged).
+proj=$(head -n 1 "$HOME/.claude/loaded-project" 2>/dev/null | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z0-9_-' | cut -c1-20)
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X PUT \
-  -H "Authorization: Bearer $BOUIOS_TOKEN" -H "Content-Type: application/x-ndjson" \
+  -H "Authorization: Bearer $BOUIOS_TOKEN" -H "Content-Type: application/x-ndjson" ${proj:+-H "x-bouios-project: $proj"} \
   --data-binary "@$tp" "${BOUIOS_URL%/}/transcript/$name" 2>/dev/null)
 [ -n "$code" ] || code=000
 printf '%s %s %s size=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$code" "$name" "$size" >> "$LOG" 2>/dev/null

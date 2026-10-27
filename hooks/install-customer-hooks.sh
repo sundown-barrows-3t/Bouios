@@ -1,6 +1,6 @@
 #!/bin/bash
 # install-customer-hooks.sh <licence> [worker-url] [worker-key] - put the licence on THIS machine and wire the
-# session-checks fetch into Claude Code (2026-10-25, BOUIOS decision 173).
+# session-checks fetch into Claude Code (2026-10-25).
 #
 # Called by install.sh and install-rest.sh when LICENCE is given. It stores the licence
 # as BOUIOS_LICENCE in ~/.claude/bouios.env (readable by you only, beside the lines the
