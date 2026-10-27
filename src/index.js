@@ -641,6 +641,48 @@ async function relevantMemory(db, domain, topic, excludeIds) {
   return (rows.results || []).slice(0, 8);
 }
 
+// GET /search?domain=<PROJECT>&q=<words> - the record for one message, from THIS customer's own
+// database only (BOUIOS decision 173; owner rulings 2969: memory is found at the moment it is needed,
+// and 3132: a customer's data never leaves their own account). The shape and ranking are the owner
+// gateway's /search exactly: up to 6 memory rows (the best 3 with their body, up to 1500 characters),
+// up to 5 log lines scored by the same terms, and the same two keys the hook reads, `transcripts` and
+// `elsewhere`. `elsewhere` is always empty (ruling 2938: no other project's rows ride on a lookup).
+// `transcripts` is empty here: a customer's transcripts are in their own bucket and carry no excerpt
+// index in the database yet, so the hook prints no past-chat line for them. Read-only: it writes
+// nothing, so a lookup can never arm the load guard or add a log row.
+async function searchRoute(url, env) {
+  const domain = normaliseProject(url.searchParams.get("domain"));
+  const q = String(url.searchParams.get("q") || "").slice(0, 500);
+  if (!domain || !relevanceTerms(q).length) return json({ error: "domain and a query with at least one content word are required" }, 400);
+  try {
+    await ensureSchema(env.DB);
+    const mem = (await relevantMemory(env.DB, domain, q, [])).slice(0, 6)
+      .map((r) => ({ id: r.id, type: r.type, title: r.title, excerpt: String(r.excerpt || r.body || "").slice(0, 240) }));
+    const top = mem.slice(0, 3).map((r) => r.id);
+    if (top.length) {
+      const full = await env.DB.prepare("SELECT id, substr(body, 1, 1500) AS body FROM memory WHERE id IN (" + top.map(() => "?").join(",") + ")").bind(...top).all();
+      const byId = new Map((full.results || []).map((x) => [x.id, x.body]));
+      for (const r of mem) if (byId.has(r.id)) r.body = byId.get(r.id);
+    }
+    const terms = relevanceTerms(q);
+    const score = terms.map(() => "(CASE WHEN lower(summary) LIKE ? THEN 1 ELSE 0 END)").join(" + ");
+    const binds = [];
+    for (const t of terms) binds.push("%" + t + "%");
+    binds.push(domain);
+    for (const t of terms) binds.push("%" + t + "%");
+    const logRows = await env.DB.prepare(
+      "SELECT id, ts, substr(summary, 1, 300) AS summary, (" + score + ") AS score FROM log " +
+      "WHERE domain = ? AND summary NOT LIKE 'Session loaded%' AND summary NOT LIKE 'transcript PUT%' " +
+      "AND summary NOT LIKE 'AUTO-CHECKPOINT%' AND summary NOT LIKE 'REFUSED %' AND summary NOT GLOB 'FETCH *' AND summary NOT GLOB 'LOOKUP *' AND (" + score + ") > 0 " +
+      "ORDER BY score DESC, id DESC LIMIT 5"
+    ).bind(...binds).all();
+    const log = (logRows.results || []).map((r) => ({ id: r.id, ts: r.ts, summary: r.summary }));
+    return json({ domain, q, memory: mem, elsewhere: [], log, transcripts: [] });
+  } catch (e) {
+    return json({ error: "search failed", detail: String(e) }, 500);
+  }
+}
+
 async function sessionLoad(domain, surface, env, token) {
   const db = env.DB;
   await ensureSchema(db);
@@ -3054,8 +3096,12 @@ export default {
     const h = request.headers.get("authorization") || "";
     const m = h.match(/^Bearer\s+(.+)$/i);
     if (!m || !env.BEARER_TOKEN || !timingSafeEqual(m[1], env.BEARER_TOKEN)) return json({ error: "unauthorised" }, 401);
+    // GET /search: the per-message record lookup the Claude Code prompt hook makes (BOUIOS decision
+    // 173, owner 2026-10-25: a customer's lookup runs against THEIR OWN server). Same bearer as every
+    // route below, same answer shape and ranking as the owner gateway's /search.
+    if (path === "/search" && request.method === "GET") return searchRoute(url, env);
     if (path === "/transcript" || path.startsWith("/transcript/")) return transcriptRoute(request, env, url, path);
     if (path === "/chat" || path.startsWith("/chat/")) return chatRoute(request, env, url, path);
-    return json({ error: "not found", routes: ["GET /health", "POST /mcp/{token}", "POST /mcp (after sign-in)", "PUT /transcript/{id}", "GET /transcript", "GET /transcript/{id}", "GET /chat", "GET /chat/{session}/{part}.jsonl"] }, 404);
+    return json({ error: "not found", routes: ["GET /health", "GET /search?domain=&q=", "POST /mcp/{token}", "POST /mcp (after sign-in)", "PUT /transcript/{id}", "GET /transcript", "GET /transcript/{id}", "GET /chat", "GET /chat/{session}/{part}.jsonl"] }, 404);
   },
 };
