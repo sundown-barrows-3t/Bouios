@@ -317,6 +317,10 @@ function prefaceAutoLoad(res, loaded) {
 // core/search.js - topic search terms, relevance scoring, lessons query, log-line clip and the context window,
 // shared by the owner gateway and the customer worker. Moved here from memory-gateway/src/index.js and
 // worker/src/index.js (one code base). The gateway imports this file; worker/build.mjs splices it into worker/src/index.js.
+// Also here (step 5b): relevantMemory and searchFullText, the whole /search lookup (searchRoute) and the
+// past-chat excerpt indexer. Each shell keeps only what is its own: the auth check, the schema call, the
+// history window and the lookup log row.
+
 
 // RELEVANCE RETRIEVAL (2026-09-08). THE LOAD SHOWED 41 ROWS OUT OF 707 AND
 // CALLED ITSELF LOADED.
@@ -578,6 +582,257 @@ function contextWindow(rows, topic) {
       excerpt_only: true,
     };
   });
+}
+
+
+// GET /search's extra for the Code prompt hook (plan v6 step 2): fills the
+// best 3 rows' bodies in place. Returns [] always: other projects' matching rows
+// no longer ride on a lookup (owner ruling 2938, 2026-09-29, which supersedes the
+// 2026-09-30 `elsewhere` addition). The key stays in the /search JSON, empty, so
+// a hook reading it keeps working.
+// THE TOP 3 IN FULL (2026-09-30, approved rebuild plan v6 step 2 /
+// v2 item 0: "Code per-message lookup returns full text"). The hook
+// printed 160 characters per match, so the row that answers the
+// question reached the session as a title and a fragment; measured on
+// the live June test, the answer row's title reached 3 of 5 sessions
+// and its text none. The best 3 now carry their body (up to 1500
+// characters); the rest stay title + excerpt.
+// "Full text" here means the row's whole body, not a database full-text index: nothing in either
+// database has an FTS table, the match is the LIKE and instr scoring of relevanceScore, so there is
+// nothing to create or back-fill on a customer's database and no fallback to choose.
+// Moved to core in step 5b: the customer worker used to do this inline in its own /search handler.
+async function searchFullText(db, domain, q, mem) {
+  const top = mem.slice(0, 3).map((r) => r.id);
+  if (top.length) {
+    const full = await db.prepare("SELECT id, substr(body, 1, 1500) AS body FROM memory WHERE id IN (" + top.map(() => "?").join(",") + ")").bind(...top).all();
+    const byId = new Map((full.results || []).map((x) => [x.id, x.body]));
+    for (const r of mem) if (byId.has(r.id)) r.body = byId.get(r.id);
+  }
+  return [];
+}
+
+async function relevantMemory(db, domain, topic, excludeIds) {
+  const { all, score, pat } = relevanceScore(topic);
+  if (!all.length) return [];
+  // Scoring is relevanceScore() below exactTerms(): identifiers weigh 20/15,
+  // plain words 3/1 (title/body). Superseded rows are excluded and equal
+  // scores order by AUTHORITY before id (2026-10-06).
+  // Row 2206 residue: exclusion used to happen HERE, in JS, after the SQL
+  // had already applied LIMIT 24. So an already-shown row (one of the
+  // newest-40 or the 12 lessons) burned one of those 24 slots and was then
+  // thrown away, rather than the SQL simply never fetching it and a genuinely
+  // new match from further down the score order taking its place. On a busy
+  // topic where most of the top-scored rows are also recent, this silently
+  // shrank the effective search depth from 24 to whatever survived exclusion
+  // - sometimes well under the 8-row final cap, with older real matches never
+  // reached. Excluding in SQL means LIMIT 24 always yields 24 CANDIDATE rows
+  // that are not already visible elsewhere in the load.
+  const ids = Array.from(new Set((excludeIds || []).filter((n) => Number.isInteger(n))));
+  const excludeClause = ids.length ? " AND id NOT IN (" + ids.map(() => "?").join(",") + ")" : "";
+  const sql =
+    // SCOPED TO ONE PROJECT, deliberately (2026-09-22). This search was
+    // briefly widened to reach mistake/pattern rows in every project and the
+    // owner rejected it the same evening: "Chats are not supposed to read each
+    // others chats! It creates context issues". Cross-project reach in the
+    // load is his call, not a retrieval optimisation to make on inference. He
+    // later ruled out every cross-project path in the load (2938, 2026-09-29),
+    // so this is not a slot that was left open for another query to fill.
+    "SELECT id, domain, type, title, substr(body, 1, 400) AS body, (" + score + ") AS score " +
+    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND " + NOT_SUPERSEDED + excludeClause +
+    " AND (" + score + ") > 0 " +
+    "ORDER BY score DESC, " + AUTHORITY + ", id DESC LIMIT 24";
+  const binds = [];
+  for (const a of all) binds.push(pat(a), pat(a));
+  binds.push(domain);
+  for (const id of ids) binds.push(id);
+  for (const a of all) binds.push(pat(a), pat(a));
+  let rows;
+  try {
+    rows = await db.prepare(sql).bind(...binds).all();
+  } catch (e) {
+    // A search that fails must never take the load down with it. The load is
+    // the thing every session depends on; this is an addition to it.
+    return [];
+  }
+  return (rows.results || []).slice(0, 8);
+}
+
+// GET /search?domain=<PROJECT>&q=<words> - the record for one message, from the caller's own database only
+// (BOUIOS decision 173; owner rulings 2969: memory is found at the moment it is needed, and 3132: a
+// customer's data never leaves their own account). ONE handler for the owner gateway and the customer
+// worker (step 5b). It returns {status, body}; the shell has already checked auth and sends the JSON.
+// Result: up to 6 memory rows (the best 3 with their body, up to 1500 characters), up to 5 log lines
+// scored by the same terms, up to 5 past-chat excerpts, and `elsewhere`, always empty (ruling 2938: no
+// other project's rows ride on a lookup). The key stays so a hook reading it keeps working.
+// Read-only: it writes nothing itself. The shell may log the lookup through hooks.afterLookup (the owner
+// gateway's log=1 row); the load guard is never armed by a lookup.
+// input: { domain (already normalised), q }
+// hooks (all optional): prepare() runs first inside the try (the worker's lazy schema call);
+//   since() returns an ISO time or null, the oldest past chat to search (the customer plan's history
+//   window; null is open); untaggedChats is true when excerpts saved with no project are searched for
+//   every project (the customer worker's rule); afterLookup({mem, log, transcripts, elsewhere}).
+// A past chat is found by the same term scoring as the log, against the small excerpt index: never a
+// live scan of the stored transcripts. It is a separate field so a caller can tell "an old chat said
+// this" apart from "the log recorded this", which matter differently.
+async function searchRoute(db, input, hooks = {}) {
+  const domain = input && input.domain;
+  const q = String((input && input.q) || "").slice(0, 500);
+  const terms = relevanceTerms(q);
+  if (!domain || !terms.length) return { status: 400, body: { error: "domain and a query with at least one content word are required" } };
+  try {
+    if (hooks.prepare) await hooks.prepare();
+    const mem = (await relevantMemory(db, domain, q, [])).slice(0, 6)
+      .map((r) => ({ id: r.id, type: r.type, title: r.title, excerpt: String(r.excerpt || r.body || "").slice(0, 240) }));
+    const elsewhere = await searchFullText(db, domain, q, mem);
+    const score = terms.map(() => "(CASE WHEN lower(summary) LIKE ? THEN 1 ELSE 0 END)").join(" + ");
+    const binds = [];
+    for (const t of terms) binds.push("%" + t + "%");
+    binds.push(domain);
+    for (const t of terms) binds.push("%" + t + "%");
+    const logRows = await db.prepare(
+      "SELECT id, ts, substr(summary, 1, 300) AS summary, (" + score + ") AS score FROM log " +
+      "WHERE domain = ? AND summary NOT LIKE 'Session loaded%' AND summary NOT LIKE 'transcript PUT%' " +
+      "AND summary NOT LIKE 'AUTO-CHECKPOINT%' AND summary NOT LIKE 'REFUSED %' AND summary NOT GLOB 'FETCH *' AND summary NOT GLOB 'LOOKUP *' AND (" + score + ") > 0 " +
+      "ORDER BY score DESC, id DESC LIMIT 5"
+    ).bind(...binds).all();
+    const log = (logRows.results || []).map((r) => ({ id: r.id, ts: r.ts, summary: r.summary }));
+    const since = hooks.since ? await hooks.since() : null;
+    const tscore = terms.map(() => "(CASE WHEN lower(excerpt) LIKE ? THEN 1 ELSE 0 END)").join(" + ");
+    const tbinds = [];
+    for (const t of terms) tbinds.push("%" + t + "%");
+    tbinds.push(domain);
+    if (since) tbinds.push(since);
+    for (const t of terms) tbinds.push("%" + t + "%");
+    const tx = await db.prepare(
+      "SELECT session_id, turn_index, ts, excerpt, (" + tscore + ") AS score FROM transcript_excerpts " +
+      "WHERE " + (hooks.untaggedChats ? "(domain = ? OR domain = '')" : "domain = ?") + (since ? " AND ts >= ?" : "") + " AND (" + tscore + ") > 0 ORDER BY score DESC, id DESC LIMIT 5"
+    ).bind(...tbinds).all();
+    const transcripts = (tx.results || []).map((r) => ({ session_id: r.session_id, turn: r.turn_index, ts: r.ts, excerpt: r.excerpt }));
+    if (hooks.afterLookup) await hooks.afterLookup({ mem, log, transcripts, elsewhere });
+    return { status: 200, body: { domain, q, memory: mem, elsewhere, log, transcripts } };
+  } catch (e) {
+    return { status: 500, body: { error: "search failed", detail: String(e) } };
+  }
+}
+
+// TRANSCRIPT EXCERPT INDEX (Phase 3; one copy since step 5b). Turns an uploaded transcript into
+// short, searchable excerpts of what the PERSON actually said, so /search can surface a past decision
+// they are re-asking about instead of only memory + log. See CORE_SCHEMA in core/store.js for why the
+// table exists and why a re-upload is a delete+reinsert rather than an append.
+//
+// NEVER ASSISTANT TEXT, ON PURPOSE. This indexes what the person asked, not
+// what the model said back - the model's own words are not "the record" in
+// the sense CLAUDE.md means, and indexing them would let a session's own
+// prior guess get surfaced back to it as if it were stated fact.
+//
+// NEVER A TOOL RESULT. A Claude Code transcript line with type "user" is not
+// always something the person typed - a tool_result block rides the same
+// role because the API models it as a user turn. Only content blocks (or a
+// plain string body) carrying real text count; a turn that is ALL
+// tool_result blocks (message.content an array with no {type:"text"} entry)
+// is skipped outright, never indexed as if it were a person's message.
+function extractOwnerTurnExcerpts(text) {
+  const out = [];
+  const lines = String(text || "").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (!rec || rec.type !== "user") continue; // assistant/summary/etc never indexed
+    const msg = rec.message;
+    if (!msg || typeof msg !== "object") continue;
+    let raw = "";
+    if (typeof msg.content === "string") {
+      raw = msg.content;
+    } else if (Array.isArray(msg.content)) {
+      const textParts = msg.content.filter((p) => p && p.type === "text" && typeof p.text === "string");
+      if (!textParts.length) continue; // tool_result-only turn - not the person's text
+      raw = textParts.map((p) => p.text).join(" ");
+    } else {
+      continue;
+    }
+    raw = raw.trim();
+    if (!raw) continue;
+    const ts = typeof rec.timestamp === "string" ? rec.timestamp : null;
+    out.push({ turn_index: i, ts, excerpt: raw.slice(0, 300) });
+  }
+  return out;
+}
+
+// One line of a stream, numbered by its position in the file exactly as extractOwnerTurnExcerpts numbers
+// it, so a re-upload replaces the same rows. The cheap pre-check skips JSON.parse for lines that cannot
+// be a user turn.
+function ownerTurnExcerptOfLine(line, i) {
+  line = line.trim();
+  if (!line || line.indexOf('"user"') === -1) return null;
+  return extractOwnerTurnExcerpts(line).map((r) => ({ ...r, turn_index: i }))[0] || null;
+}
+
+// OVER THE CAP: INDEXED ONE LINE AT A TIME (2026-10-06, rebuild A4). Reads a stored object as a byte
+// stream and keeps only the current line and the owner-turn excerpts, so memory stays bounded by the
+// longest single line, not by the transcript. The one-line cap (TRANSCRIPT_LINE_MAX_CHARS, core/store.js)
+// applies: a huge line is dropped, not built, and still counts toward turn_index. onLine (optional) sees
+// each kept line, for the owner gateway's usage summary; it must not throw.
+async function ownerTurnExcerptsFromStream(byteStream, onLine) {
+  const out = [];
+  const reader = byteStream.pipeThrough(new TextDecoderStream()).getReader();
+  let carry = "", dropping = false, i = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    const parts = value.split("\n");
+    for (let k = 0; k < parts.length; k++) {
+      const piece = parts[k];
+      const ends = k < parts.length - 1; // a newline follows this piece
+      if (!dropping) {
+        carry += piece;
+        if (carry.length > TRANSCRIPT_LINE_MAX_CHARS) { carry = ""; dropping = true; }
+      }
+      if (ends) {
+        if (!dropping) { if (onLine) onLine(carry); const r = ownerTurnExcerptOfLine(carry, i); if (r) out.push(r); }
+        i++; carry = ""; dropping = false;
+      }
+    }
+  }
+  if (!dropping) { if (onLine) onLine(carry); const last = ownerTurnExcerptOfLine(carry, i); if (last) out.push(last); }
+  return out;
+}
+
+// Replace one session's excerpt rows: delete, then insert the fresh set, in batches of 50 where the
+// binding has batch() so a long session cannot run into the per-request query limit one row at a time.
+// An upload is the whole transcript, never a delta, so this can never duplicate. Throws on failure.
+async function replaceTranscriptExcerpts(db, sessionId, domain, rows) {
+  await db.prepare("DELETE FROM transcript_excerpts WHERE session_id = ?").bind(sessionId).run();
+  const ins = (r) => db.prepare(
+    "INSERT INTO transcript_excerpts (session_id, turn_index, ts, domain, excerpt) VALUES (?, ?, ?, ?, ?)"
+  ).bind(sessionId, r.turn_index, r.ts, domain, r.excerpt);
+  if (typeof db.batch === "function") {
+    for (let k = 0; k < rows.length; k += 50) await db.batch(rows.slice(k, k + 50).map(ins));
+  } else {
+    for (const r of rows) await ins(r).run();
+  }
+  return rows.length;
+}
+
+// The stream path for both shells: read the stream, replace the session's rows, return the count.
+// Throws on failure (the shell decides whether that is reported or swallowed).
+async function indexExcerptsFromStream(db, sessionId, domain, byteStream, onLine) {
+  const rows = await ownerTurnExcerptsFromStream(byteStream, onLine);
+  return replaceTranscriptExcerpts(db, sessionId, domain, rows);
+}
+
+// FAIL OPEN, ALWAYS (an indexing error never fails the upload): the text path. Every failure mode - a
+// malformed line, a DB error, the table not existing yet - is swallowed here so the caller never sees it
+// and the upload itself, the thing the backstop exists for, is unaffected either way. Idempotent re-PUT:
+// see replaceTranscriptExcerpts.
+async function indexTranscriptExcerpts(db, sessionId, domain, text) {
+  if (!db || !sessionId) return;
+  try {
+    await replaceTranscriptExcerpts(db, sessionId, domain, extractOwnerTurnExcerpts(text));
+  } catch (_) {
+    // FAIL OPEN - see comment above. The upload already succeeded before this ever runs.
+  }
 }
 // core/store.js - constraint-row checks, supersede detection and the edit, delete and refusal-log helpers,
 // shared by the owner gateway and the customer worker. Moved here from memory-gateway/src/index.js and
@@ -1191,62 +1446,10 @@ async function historyWindowDays(request, url, env) {
 // PAST-CHAT EXCERPT INDEX (2026-10-27, BOUIOS 4053; owner: "How the hell does customer have no transcripts").
 // The owner gateway has indexed what the owner typed in every uploaded transcript since 25 Sep (ddaff8e), so
 // its per-message lookup finds a past chat. This worker stored the customer's transcripts but never indexed
-// them, so their lookup could not. These are the gateway's own functions (extractOwnerTurnExcerpts,
-// ownerTurnExcerptOfLine, ownerTurnExcerptsFromStream), copied because this file deploys standalone.
+// them, so their lookup could not. The extractor, the line stream and the delete-and-insert are now the
+// gateway's own functions in core/search.js (step 5b, one copy; this file no longer carries its own).
 // Only what the person typed is indexed: never the model's words, never a tool result riding the user role.
 // Everything stays in this account: the index is a table in this worker's own database.
-function extractOwnerTurnExcerpts(text) {
-  const out = [];
-  const lines = String(text || "").split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    let rec;
-    try { rec = JSON.parse(line); } catch { continue; }
-    if (!rec || rec.type !== "user") continue;
-    const msg = rec.message;
-    if (!msg || typeof msg !== "object") continue;
-    let raw = "";
-    if (typeof msg.content === "string") {
-      raw = msg.content;
-    } else if (Array.isArray(msg.content)) {
-      const textParts = msg.content.filter((p) => p && p.type === "text" && typeof p.text === "string");
-      if (!textParts.length) continue;
-      raw = textParts.map((p) => p.text).join(" ");
-    } else {
-      continue;
-    }
-    raw = raw.trim();
-    if (!raw) continue;
-    const ts = typeof rec.timestamp === "string" ? rec.timestamp : null;
-    out.push({ turn_index: i, ts, excerpt: raw.slice(0, 300) });
-  }
-  return out;
-}
-function ownerTurnExcerptOfLine(line, i) {
-  line = line.trim();
-  if (!line || line.indexOf('"user"') === -1) return null;
-  return extractOwnerTurnExcerpts(line).map((r) => ({ ...r, turn_index: i }))[0] || null;
-}
-async function ownerTurnExcerptsFromStream(byteStream) {
-  const out = [];
-  const reader = byteStream.pipeThrough(new TextDecoderStream()).getReader();
-  let carry = "", dropping = false, i = 0;
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    const parts = value.split("\n");
-    for (let k = 0; k < parts.length; k++) {
-      if (!dropping) { carry += parts[k]; if (carry.length > TRANSCRIPT_LINE_MAX_CHARS) { carry = ""; dropping = true; } }
-      if (k < parts.length - 1) {
-        if (!dropping) { const r = ownerTurnExcerptOfLine(carry, i); if (r) out.push(r); }
-        i++; carry = ""; dropping = false;
-      }
-    }
-  }
-  if (!dropping) { const last = ownerTurnExcerptOfLine(carry, i); if (last) out.push(last); }
-  return out;
-}
 // Re-index one stored transcript: delete its rows, insert the fresh set (an upload is the whole transcript,
 // never a delta, so this can never duplicate). Reads the stored object, so a streamed upload is indexed too.
 // FAIL OPEN: the upload has already been stored when this runs; an indexing error never fails it.
@@ -1259,13 +1462,8 @@ async function indexStoredTranscript(env, key, domain) {
       if (typeof DecompressionStream === "undefined") return 0;
       src = src.pipeThrough(new DecompressionStream("gzip"));
     }
-    const rows = await ownerTurnExcerptsFromStream(src);
     await ensureWorkerSchema(env.DB);
-    const sid = transcriptSessionId(key);
-    await env.DB.prepare("DELETE FROM transcript_excerpts WHERE session_id = ?").bind(sid).run();
-    const ins = (r) => env.DB.prepare("INSERT INTO transcript_excerpts (session_id, turn_index, ts, domain, excerpt) VALUES (?, ?, ?, ?, ?)").bind(sid, r.turn_index, r.ts, domain || "", r.excerpt);
-    for (let k = 0; k < rows.length; k += 50) await env.DB.batch(rows.slice(k, k + 50).map(ins));
-    return rows.length;
+    return await indexExcerptsFromStream(env.DB, transcriptSessionId(key), domain || "", src);
   } catch (_) {
     return 0;
   }
@@ -1514,96 +1712,24 @@ const lessonRow = ({ id, type, title, body, rank, lscore }) =>
 // 2026-09-16 and widened to decision/pattern bodies 2026-09-25, is gone: the
 // ruling supersedes both. A load is this project and GLOBAL.
 
-async function relevantMemory(db, domain, topic, excludeIds) {
-  const { all, score, pat } = relevanceScore(topic);
-  if (!all.length) return [];
-  // Row 2206 residue: exclusion used to happen HERE, in JS, after the SQL
-  // had already applied LIMIT 24 - see memory-gateway/src/index.js for the
-  // full note. Excluding in SQL means LIMIT 24 always yields 24 CANDIDATE
-  // rows that are not already visible elsewhere in the load.
-  const ids = Array.from(new Set((excludeIds || []).filter((n) => Number.isInteger(n))));
-  const excludeClause = ids.length ? " AND id NOT IN (" + ids.map(() => "?").join(",") + ")" : "";
-  const sql =
-    // SCOPED TO ONE PROJECT, deliberately (2026-09-22). This search was
-    // briefly widened to reach mistake/pattern rows in every project and the
-    // owner rejected it the same evening: "Chats are not supposed to read each
-    // others chats! It creates context issues". Cross-project reach in the
-    // load is his call, not a retrieval optimisation to make on inference. He
-    // later ruled out every cross-project path in the load (2938, 2026-09-29),
-    // so this is not a slot that was left open for another query to fill.
-    "SELECT id, domain, type, title, substr(body, 1, 400) AS body, (" + score + ") AS score " +
-    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND " + NOT_SUPERSEDED + excludeClause +
-    " AND (" + score + ") > 0 " +
-    "ORDER BY score DESC, " + AUTHORITY + ", id DESC LIMIT 24";
-  const binds = [];
-  for (const a of all) binds.push(pat(a), pat(a));
-  binds.push(domain);
-  for (const id of ids) binds.push(id);
-  for (const a of all) binds.push(pat(a), pat(a));
-  let rows;
-  try {
-    rows = await db.prepare(sql).bind(...binds).all();
-  } catch (e) {
-    // A search that fails must never take the load down with it.
-    return [];
-  }
-  return (rows.results || []).slice(0, 8);
-}
+// relevantMemory is in core/search.js, the same function the owner gateway runs (step 5b).
 
-// GET /search?domain=<PROJECT>&q=<words> - the record for one message, from THIS customer's own
-// database only (BOUIOS decision 173; owner rulings 2969: memory is found at the moment it is needed,
-// and 3132: a customer's data never leaves their own account). The shape and ranking are the owner
-// gateway's /search exactly: up to 6 memory rows (the best 3 with their body, up to 1500 characters),
-// up to 5 log lines scored by the same terms, and the same two keys the hook reads, `transcripts` and
-// `elsewhere`. `elsewhere` is always empty (ruling 2938: no other project's rows ride on a lookup).
-// `transcripts` comes from the past-chat excerpt index (indexStoredTranscript), within the plan's history
-// window. Read-only: it writes nothing, so a lookup can never arm the load guard or add a log row.
-async function searchRoute(url, env, request) {
-  const domain = normaliseProject(url.searchParams.get("domain"));
-  const q = String(url.searchParams.get("q") || "").slice(0, 500);
-  if (!domain || !relevanceTerms(q).length) return json({ error: "domain and a query with at least one content word are required" }, 400);
-  try {
-    await ensureWorkerSchema(env.DB);
-    const mem = (await relevantMemory(env.DB, domain, q, [])).slice(0, 6)
-      .map((r) => ({ id: r.id, type: r.type, title: r.title, excerpt: String(r.excerpt || r.body || "").slice(0, 240) }));
-    const top = mem.slice(0, 3).map((r) => r.id);
-    if (top.length) {
-      const full = await env.DB.prepare("SELECT id, substr(body, 1, 1500) AS body FROM memory WHERE id IN (" + top.map(() => "?").join(",") + ")").bind(...top).all();
-      const byId = new Map((full.results || []).map((x) => [x.id, x.body]));
-      for (const r of mem) if (byId.has(r.id)) r.body = byId.get(r.id);
-    }
-    const terms = relevanceTerms(q);
-    const score = terms.map(() => "(CASE WHEN lower(summary) LIKE ? THEN 1 ELSE 0 END)").join(" + ");
-    const binds = [];
-    for (const t of terms) binds.push("%" + t + "%");
-    binds.push(domain);
-    for (const t of terms) binds.push("%" + t + "%");
-    const logRows = await env.DB.prepare(
-      "SELECT id, ts, substr(summary, 1, 300) AS summary, (" + score + ") AS score FROM log " +
-      "WHERE domain = ? AND summary NOT LIKE 'Session loaded%' AND summary NOT LIKE 'transcript PUT%' " +
-      "AND summary NOT LIKE 'AUTO-CHECKPOINT%' AND summary NOT LIKE 'REFUSED %' AND summary NOT GLOB 'FETCH *' AND summary NOT GLOB 'LOOKUP *' AND (" + score + ") > 0 " +
-      "ORDER BY score DESC, id DESC LIMIT 5"
-    ).bind(...binds).all();
-    const log = (logRows.results || []).map((r) => ({ id: r.id, ts: r.ts, summary: r.summary }));
-    // Past chats: the log's term scoring against the excerpt index, within the plan's history window (an unknown
-    // window is open, the worker's fail-open rule for the customer's own data); this project's chats or untagged.
-    const days = await historyWindowDaysCached(request, url, env);
-    const since = days === null || days === undefined ? null : new Date(Date.now() - days * 86400000).toISOString();
-    const tscore = terms.map(() => "(CASE WHEN lower(excerpt) LIKE ? THEN 1 ELSE 0 END)").join(" + ");
-    const tbinds = [];
-    for (const t of terms) tbinds.push("%" + t + "%");
-    tbinds.push(domain);
-    if (since) tbinds.push(since);
-    for (const t of terms) tbinds.push("%" + t + "%");
-    const tx = await env.DB.prepare(
-      "SELECT session_id, turn_index, ts, excerpt, (" + tscore + ") AS score FROM transcript_excerpts " +
-      "WHERE (domain = ? OR domain = '')" + (since ? " AND ts >= ?" : "") + " AND (" + tscore + ") > 0 ORDER BY score DESC, id DESC LIMIT 5"
-    ).bind(...tbinds).all();
-    const transcripts = (tx.results || []).map((r) => ({ session_id: r.session_id, turn: r.turn_index, ts: r.ts, excerpt: r.excerpt }));
-    return json({ domain, q, memory: mem, elsewhere: [], log, transcripts });
-  } catch (e) {
-    return json({ error: "search failed", detail: String(e) }, 500);
-  }
+// GET /search?domain=<PROJECT>&q=<words> - the record for one message, from THIS customer's own database only
+// (BOUIOS decision 173; owner rulings 2969 and 3132). The handler is searchRoute in core/search.js, the owner
+// gateway's own, so the shape and ranking cannot drift. This shell passes what is the customer's: the lazy
+// schema call, the plan's history window for past chats (an unknown window is open, the worker's fail-open
+// rule for the customer's own data) and that chats saved with no project are found for every project.
+// Read-only: it writes nothing, so a lookup can never arm the load guard or add a log row.
+async function searchEndpoint(url, env, request) {
+  const r = await searchRoute(env.DB, { domain: normaliseProject(url.searchParams.get("domain")), q: url.searchParams.get("q") }, {
+    prepare: () => ensureWorkerSchema(env.DB),
+    since: async () => {
+      const days = await historyWindowDaysCached(request, url, env);
+      return days === null || days === undefined ? null : new Date(Date.now() - days * 86400000).toISOString();
+    },
+    untaggedChats: true,
+  });
+  return json(r.body, r.status);
 }
 
 async function sessionLoad(domain, surface, env, token) {
@@ -3601,7 +3727,7 @@ export default {
     // GET /search: the per-message record lookup the Claude Code prompt hook makes (BOUIOS decision
     // 173, owner 2026-10-25: a customer's lookup runs against THEIR OWN server). Same bearer as every
     // route below, same answer shape and ranking as the owner gateway's /search.
-    if (path === "/search" && request.method === "GET") return searchRoute(url, env, request);
+    if (path === "/search" && request.method === "GET") return searchEndpoint(url, env, request);
     if (path === "/transcript" || path.startsWith("/transcript/")) return transcriptRoute(request, env, url, path, ctx);
     if (path === "/chat" || path.startsWith("/chat/")) return chatRoute(request, env, url, path);
     return json({ error: "not found", routes: ["GET /health", "GET /search?domain=&q=", "POST /mcp/{token}", "POST /mcp (after sign-in)", "PUT /transcript/{id}", "GET /transcript", "GET /transcript/{id}", "GET /chat", "GET /chat/{session}/{part}.jsonl"] }, 404);
