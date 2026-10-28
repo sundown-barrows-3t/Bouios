@@ -192,7 +192,7 @@ const OPEN_NEGATED = /\b(no|none|nothing|not)\b[^.]{0,40}\b(outstanding|open|unv
 
 // OPEN ITEMS ARE COUNTED FROM WHAT THE RECORD ACTUALLY SAYS (2026-09-10).
 //
-// countOpenTasks below matches bullets under a literal "## STILL OPEN" heading.
+// The old countOpenTasks matched bullets under a literal "## STILL OPEN" heading.
 // Measured against the live store: no hot state has used that heading in
 // months, so it returned 0 on every load - while the store held ONE pending row
 // and the current hot named seven unfinished items in prose. Every session on
@@ -211,11 +211,25 @@ const OPEN_NEGATED = /\b(no|none|nothing|not)\b[^.]{0,40}\b(outstanding|open|unv
 const OPEN_MARKER = /\b(not yet (?:verified|confirmed|checked|done)|still (?:open|unverified|outstanding|not)|unverified|remains? open|outstanding|to do|todo)\b/i;
 
 function openItems(hotState, pendingRows) {
+  return collectOpen(hotState, pendingRows, 12);
+}
+
+// THE OPEN COUNT IS REAL (2026-10-28, row 4289 part 7). open_tasks came from the old
+// countOpenTasks (a heading nobody writes, so 0) and the confirmation used
+// openItems().length, which stops at 12 (a load said 12 with 17 pending). openCount is the
+// same collection as openItems with no cap: every pending row handed in plus the hot open
+// items, not counted twice. The caller passes ALL the project's pending rows, live and
+// suspect alike: a row nobody has checked for 21 days is still an open task.
+function openCount(hotState, pendingRows) {
+  return collectOpen(hotState, pendingRows, Infinity).length;
+}
+
+function collectOpen(hotState, pendingRows, cap) {
   const out = [];
   const push = (s) => {
     const t = String(s || "").replace(/\s+/g, " ").trim();
     if (t.length < 8) return;
-    if (out.length >= 12) return;
+    if (out.length >= cap) return;
     if (out.some((o) => o.slice(0, 60) === t.slice(0, 60))) return;
     out.push(t.slice(0, 160));
   };
@@ -246,16 +260,6 @@ function openItems(hotState, pendingRows) {
     }
   }
   return out;
-}
-
-function countOpenTasks(hotState) {
-  if (!hotState) return 0;
-  const idx = hotState.search(/##\s*STILL OPEN/i);
-  if (idx === -1) return 0;
-  const after = hotState.slice(idx);
-  const next = after.slice(3).search(/\n##\s/);
-  const block = next === -1 ? after : after.slice(0, next + 3);
-  return block.split("\n").filter((l) => /^\s*-\s+/.test(l)).length;
 }
 
 // MEMORY USE IS MEASURED (rebuild A3, 2026-10-06, rulings 2969/2974). Row 2191
@@ -1806,7 +1810,7 @@ async function sessionLoad(domain, surface, env, token) {
     db, domain, loadTopic || String(hotState || "").slice(0, 600),
     [...(recent.results || []).map((r) => r.id), ...(lessons.results || []).map((r) => r.id)]
   );
-  const openN = countOpenTasks(hotState);
+  const openN = openCount(hotState, (pending.results || []));
   const openItemList = openItems(hotState, (pending.results || []));
   await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, "Session loaded, surface=" + (surface || "mcp")).run();
   // THE OWNER'S LATEST INSTRUCTION LEADS THE LOAD (2026-10-06, step 3-4 item 2;
@@ -1821,7 +1825,7 @@ async function sessionLoad(domain, surface, env, token) {
   const out = {
     // Parity with the gateway: the number in the line a customer reads is the
     // real count of what the record says is unfinished, not a heading match.
-    confirmation: confirmationText(domain, rules.length, hotDate, openItemList.length, false),
+    confirmation: confirmationText(domain, rules.length, hotDate, openN, false),
     // Immediately after confirmation and never clamped (clampMcpLoadSize's
     // protected set): the task in hand is read before anything else.
     ...(currentTask ? {
