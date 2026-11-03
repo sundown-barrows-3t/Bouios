@@ -1444,21 +1444,92 @@ async function transcriptTool(env, domain, args, policy) {
   }
   if (!env.TRANSCRIPTS) return { ok: false, error: policy.noStorageError };
   const inWindow = (o) => sinceMs === null || (o.uploaded && new Date(o.uploaded).getTime() >= sinceMs);
-  if (action === "list") {
+  // The listing both list and scan work from: every object that passes the key, window, project and size filters.
+  // R2 returns at most 1000 keys a page, so this follows the cursor (row 4700: 1582 transcripts, 3 pages).
+  const gather = async () => {
     const objects = [];
     let cursor;
+    const minSize = Math.max(0, Math.floor(Number(args.min_size)) || 0);
+    const maxSize = Math.max(0, Math.floor(Number(args.max_size)) || 0);
     do {
       const page = await env.TRANSCRIPTS.list({ cursor, limit: 1000, include: ["customMetadata"], ...(policy.listPrefix ? { prefix: policy.listPrefix } : {}) });
       for (const o of page.objects || []) {
         if (!policy.keepKey(o.key) || !inWindow(o)) continue;
         const project = (o.customMetadata && o.customMetadata.project) || null;
         if (project && project !== domain) continue;
-        objects.push({ session_id: transcriptSessionId(o.key), size: o.size, uploaded: o.uploaded, project });
+        if (minSize && o.size < minSize) continue;
+        if (maxSize && o.size > maxSize) continue;
+        objects.push({ session_id: transcriptSessionId(o.key), key: o.key, size: o.size, uploaded: o.uploaded, project });
       }
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
-    objects.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded));
-    return { ok: true, project: domain, history_days: days, transcripts: objects.slice(0, clampN(args.limit, 5, 20)) };
+    return objects;
+  };
+  const offsetN = Math.max(0, Math.floor(Number(args.offset)) || 0);
+  if (action === "list") {
+    // Row 4700: a total and a next_offset so the index can be compared with the bucket and paged, min_size and
+    // max_size to pick out the large objects, sort "largest" to see them first. A row still carries no key.
+    const objects = await gather();
+    if (args.sort === "largest") objects.sort((a, b) => b.size - a.size || (a.session_id < b.session_id ? -1 : 1));
+    else objects.sort((a, b) => new Date(b.uploaded) - new Date(a.uploaded) || (a.session_id < b.session_id ? -1 : 1));
+    const lim = clampN(args.limit, 5, 100);
+    const rows = objects.slice(offsetN, offsetN + lim).map(({ key, ...row }) => row);
+    return { ok: true, project: domain, history_days: days, total: objects.length, total_bytes: objects.reduce((n, o) => n + (o.size || 0), 0), offset: offsetN, next_offset: offsetN + lim < objects.length ? offsetN + lim : null, transcripts: rows };
+  }
+  if (action === "scan") {
+    // Row 4700: read stored transcripts INSIDE the store and return only counts, so a whole bucket (and the objects
+    // too large to push through a tool result, gzip included) is covered page by page with nothing but numbers
+    // coming back. Oldest first so the order is stable while new uploads arrive at the end. At most 10 objects a
+    // call and a wall-clock budget, because each object is streamed line by line; next_offset says where to go on.
+    const q = String(args.q || "").slice(0, 500);
+    const terms = relevanceTerms(q);
+    if (!terms.length) return { ok: false, error: "q needs at least one content word" };
+    const objects = await gather();
+    objects.sort((a, b) => new Date(a.uploaded) - new Date(b.uploaded) || (a.session_id < b.session_id ? -1 : 1));
+    const lim = clampN(args.limit, 3, 10);
+    const slice = objects.slice(offsetN, offsetN + lim);
+    const deadline = Date.now() + (policy.scanBudgetMs || 20000);
+    const scanned = [];
+    let done = 0;
+    for (const o of slice) {
+      if (done && Date.now() > deadline) break;
+      done++;
+      const row = { session_id: o.session_id, size: o.size, uploaded: o.uploaded };
+      try {
+        const obj = await env.TRANSCRIPTS.get(o.key);
+        if (!obj || !obj.body) { scanned.push({ ...row, error: "object not readable" }); continue; }
+        let src = obj.body;
+        if (/\.gz$/.test(o.key)) {
+          if (typeof DecompressionStream === "undefined") { scanned.push({ ...row, error: "gzip not supported here" }); continue; }
+          src = src.pipeThrough(new DecompressionStream("gzip"));
+        }
+        let lines = 0, matches = 0, sample = "", carry = "", dropping = false;
+        const check = (line) => {
+          if (!line) return;
+          lines++;
+          const low = line.toLowerCase();
+          if (!terms.some((t) => low.includes(t))) return;
+          matches++;
+          if (!sample) sample = line.length > 160 ? line.slice(0, 160) + "..." : line;
+        };
+        const reader = src.pipeThrough(new TextDecoderStream()).getReader();
+        for (;;) {
+          const { value, done: fin } = await reader.read();
+          if (fin) break;
+          const parts = value.split("\n");
+          for (let k = 0; k < parts.length; k++) {
+            if (!dropping) { carry += parts[k]; if (carry.length > TRANSCRIPT_LINE_MAX_CHARS) { carry = ""; dropping = true; } }
+            if (k < parts.length - 1) { if (!dropping) check(carry); carry = ""; dropping = false; }
+          }
+        }
+        if (!dropping) check(carry);
+        scanned.push({ ...row, lines_scanned: lines, match_count: matches, ...(sample ? { sample } : {}) });
+      } catch (e) {
+        scanned.push({ ...row, error: "read failed: " + String(e && e.message || e).slice(0, 80) });
+      }
+    }
+    const next = offsetN + done;
+    return { ok: true, project: domain, q, total: objects.length, offset: offsetN, scanned, next_offset: next < objects.length ? next : null, note: "counts only; an object's lines are never returned beyond one short sample" };
   }
   if (action === "read") {
     const sid = transcriptSessionId(String(args.session_id || ""));
