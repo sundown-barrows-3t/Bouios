@@ -961,9 +961,13 @@ async function searchFullText(db, domain, q, mem) {
   return [];
 }
 
-async function relevantMemory(db, domain, topic, excludeIds) {
+async function relevantMemory(db, domain, topic, excludeIds, onlyType) {
   const { all, score, pat } = relevanceScore(topic);
   if (!all.length) return [];
+  // onlyType: "decision" keeps the 24-row candidate window to decisions, so a caller that wants decisions (the
+  // decision-save check, relatedDecisionCheck below) is not left with the few that happened to rank among mixed
+  // types. Any other value is ignored; every existing caller passes nothing and gets the search unchanged.
+  const typeClause = onlyType === "decision" ? " AND type = 'decision'" : "";
   // Scoring is relevanceScore() below exactTerms(): identifiers weigh 20/15,
   // plain words 3/1 (title/body). Superseded rows are excluded and equal
   // scores order by AUTHORITY before id (2026-10-06).
@@ -988,7 +992,7 @@ async function relevantMemory(db, domain, topic, excludeIds) {
     // later ruled out every cross-project path in the load (2938, 2026-09-29),
     // so this is not a slot that was left open for another query to fill.
     "SELECT id, domain, type, title, substr(body, 1, 400) AS body, (" + score + ") AS score " +
-    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND " + NOT_SUPERSEDED + excludeClause +
+    "FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND " + NOT_SUPERSEDED + excludeClause + typeClause +
     " AND (" + score + ") > 0 " +
     "ORDER BY score DESC, " + AUTHORITY + ", id DESC LIMIT 24";
   const binds = [];
@@ -1005,6 +1009,75 @@ async function relevantMemory(db, domain, topic, excludeIds) {
     return [];
   }
   return (rows.results || []).slice(0, 8);
+}
+
+// A DECISION SAVE IS CHECKED AGAINST EARLIER DECISIONS (row 4159, owner 2026-10-27: "This is more than a mistake
+// it is huge and proves bohios isn't working at all"). On 2026-10-27 a planner's decision was saved without anyone
+// searching the earlier decisions that answered it (rows 514, 780, 3180). Now every type=decision row in a save is
+// searched against the project's earlier decisions with relevantMemory, restricted to decisions. Owner rulings are
+// decisions (the load's owner_rulings is type=decision AND title OWNER-RULING% / STANDING% OR body PROVENANCE:
+// OWNER-SAID%), so one decision-only search covers both; isOwnerRuling below is that same definition, used to mark them.
+// The five best come back with every such save (id, title, score). The row is REFUSED, that row only, when the best
+// one scores at or above DECISION_RELATED_T and the body cites none of the best three: by naming the id (which
+// "SUPERSEDES <id>" and "NOT-RELATED <id>: <reason>" both do). A failed search never blocks a save.
+//
+// THE QUERY. The store reads the first six distinct content words of a topic (relevanceTerms), so the topic is the
+// title, with its status tag, date and sha taken off (they are the same on every BUILT- row and would fill the six),
+// then the body. A title is the subject of the decision; the body only fills what the title leaves.
+//
+// T = DECISION_RELATED_T = 16. MEASURED 2026-11-05, read-only, over the last 60 decision rows of project AI (ids 4265
+// to 4866). Each was scored against the decisions with a LOWER id (what exists at save time) with this file's own
+// scoring on the six plain words decisionTopic returns (title word 3, body word 1; the six rows whose title has fewer
+// than six words took the rest from the first 600 characters of the body). Best earlier-decision score per row,
+// sorted: 6 x3, 7, 8 x12, 9 x10, 10 x7, 11 x5, 12 x6, 13 x8, 14 x2, 15, 16 x2, 17, 20, 24. Median 10, maximum 24.
+// Rows at or above: 12 -> 22 of 60 (37%), 14 -> 8 (13%), 15 -> 6, 16 -> 5 (8%), 17 -> 3 (5%), 20 -> 2. Reading the
+// pairs: the highest score on a pair that is NOT about the same thing is 14 (4690, the pending list from chat, against
+// 4391, the job-closed line); every pair at 16 or more is the same subject (4719 BUILT against its DEFECT 4716 at 20;
+// 4643 and 4642, the owner's same sentence twice, at 24 and 17; 4713 against 4711 and 4352 against 4139, both at 16).
+// So 16 sits two points over that unrelated ceiling and refuses only rows that restate or extend an earlier one, five
+// of the 60 (a row that names what it restates, as most BUILT rows do, passes). Below 14 the refusal would fire on a
+// third of ordinary decisions, the over-firing the owner has rejected twice; above 17 it would stop catching the
+// restatements. Only a few pairs were read by title, so the ceiling is the highest unrelated pair found, not proved.
+// A TUNED CONSTANT: change it only with a new measurement of the same kind. decision-related.test.mjs pins the value.
+const DECISION_RELATED_T = 16;
+function decisionTopic(title, body) {
+  const clean = (x) => String(x || "")
+    .replace(/\s*\[[^\]]*\]\s*/g, " ")
+    .replace(/\b\d{4}-\d{2}-\d{2}\b/g, " ")
+    .replace(/\b[0-9a-f]{7,40}\b/gi, " ")
+    .replace(/\b\d+\b/g, " ");
+  const t = clean(title).replace(/^\s*(BUILT|FIXED|SHIPPED|DONE|RESOLVED|DECIDED|FIX|BUILD|DEFECT|FINDING|HANDOVER|OWNER-SAID|OWNER-RULING|OWNER-YES|OWNER-ASKED|STANDING)\b[-_ ]*/i, " ");
+  // PLAIN WORDS ONLY, and the topic IS the six words. relevanceScore() also reads routes, snake_case names and
+  // 100-599 numbers out of a topic and weighs them 20 (title) and 15 (body), so a body that cites "514" or names
+  // /search would turn row ids and test counts into the strongest terms and pull in every row that mentions them. The
+  // limit T was measured on plain words, so only plain words are searched. Digits are dropped from the body too.
+  return relevanceTerms(t + " " + clean(String(body || "").slice(0, 600))).join(" ");
+}
+// Same definition as the load's owner_rulings query (memory-gateway sessionStart): type=decision and the title opens
+// OWNER-RULING or STANDING, or the body opens PROVENANCE: OWNER-SAID. (SQL LIKE is case-blind for ASCII; so is this.)
+function isOwnerRuling(r) {
+  return !!r && r.type === "decision" && (/^(OWNER-RULING|STANDING)/i.test(String(r.title || "")) || /^PROVENANCE: OWNER-SAID/i.test(String(r.body || "")));
+}
+// A body cites a row by naming its id as a whole number: "514", "row 514", "SUPERSEDES 514",
+// "NOT-RELATED 514: reason". A longer number, a word or a sha that merely contains the digits does not count.
+function bodyCitesId(body, id) {
+  return new RegExp("(?<![0-9A-Za-z])" + Number(id) + "(?![0-9A-Za-z])").test(String(body || ""));
+}
+// -> { related: [{id, title, score, owner_ruling}] (best five), refusal: string | null }, or null when there is
+// nothing to search on. db, domain as relevantMemory; m = { title, body }.
+async function relatedDecisionCheck(db, domain, m, threshold = DECISION_RELATED_T) {
+  const topic = decisionTopic(m.title, m.body);
+  if (!relevanceTerms(topic).length) return null;
+  const rows = (await relevantMemory(db, domain, topic, [], "decision")).filter((r) => r && r.type === "decision");
+  const related = rows.slice(0, 5).map((r) => ({ id: r.id, title: String(r.title || "").slice(0, 160), score: Number(r.score || 0), owner_ruling: isOwnerRuling(r) }));
+  const top3 = related.slice(0, 3);
+  let refusal = null;
+  if (top3.length && top3[0].score >= threshold && !top3.some((r) => bodyCitesId(m.body, r.id))) {
+    refusal = "decision refused: it closely matches earlier decisions (best score " + top3[0].score + ", limit " + threshold + ") and the body cites none of them - " +
+      top3.map((r) => r.id + (r.owner_ruling ? " [owner ruling]" : "") + " " + r.title.slice(0, 90) + " (score " + r.score + ")").join("; ") +
+      ". Read them with bouios_get, then put in the body the id of each that bears on it, \"SUPERSEDES <id>\" if this replaces one, or \"NOT-RELATED <id>: <reason>\" if it does not apply, and save again.";
+  }
+  return { related, refusal };
 }
 
 // GET /search?domain=<PROJECT>&q=<words> - the record for one message, from the caller's own database only
