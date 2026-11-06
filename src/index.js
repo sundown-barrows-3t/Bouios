@@ -709,19 +709,50 @@ const RELEVANCE_STOPWORDS = new Set([
   "bouios", "memory", "session", "sessions", "claude", "owner", "project",
 ]);
 
+// HOW MANY TOPIC WORDS ARE SEARCHED (5.1). Every distinct content word counts, up to what one query can bind.
+// Cloudflare D1 allows 100 bound parameters per query and a LIKE pattern of at most 50 bytes
+// (developers.cloudflare.com/d1/platform/limits/, read 6 Nov 2026). relevanceTerms keeps up to 24 words
+// (99 binds / 4 per word, the most one query can take with nothing else bound). relevantMemory, the widest
+// user, binds 4 values per plain word (title and body, and the score appears twice), 4 per exact identifier,
+// the project, and every excluded id, so it takes fewer: see termBudget. The cap was 6 from the first version
+// (cb3c070) with no recorded reason. A word past the budget is reported by topicTermsDropped, never dropped
+// silently. A term is cut to 48 characters so "%" + term + "%" stays within the 50-byte LIKE limit.
+// The function is kept self-contained (no module-level names) because context-window.test.mjs and
+// handoff-full.test.mjs lift its source text. Its second argument is optional: an array that receives the
+// words past the 24.
+const D1_MAX_BOUND = 100;
 function relevanceTerms(topic) {
   if (!topic || typeof topic !== "string") return [];
+  const dropped = arguments[1];
+  const RELEVANCE_TERMS_MAX = 24;
   const seen = new Set();
   const out = [];
-  for (const raw of topic.toLowerCase().split(/[^a-z0-9]+/)) {
-    if (raw.length < 4) continue;
-    if (RELEVANCE_STOPWORDS.has(raw)) continue;
+  for (const raw0 of topic.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw0.length < 4) continue;
+    if (RELEVANCE_STOPWORDS.has(raw0)) continue;
+    const raw = raw0.slice(0, 48);
     if (seen.has(raw)) continue;
     seen.add(raw);
+    if (out.length >= RELEVANCE_TERMS_MAX) { if (Array.isArray(dropped)) { dropped.push(raw); continue; } break; }
     out.push(raw);
-    if (out.length >= 6) break;
   }
   return out;
+}
+
+// How many plain words relevantMemory can bind: 4 per word, 4 per exact identifier (up to 4), 1 for the project and
+// 1 per excluded id. At least one word is always searched.
+function termBudget(topic, nExcluded) {
+  const room = Math.floor((D1_MAX_BOUND - 1 - (nExcluded | 0)) / 4) - exactTerms(topic).length;
+  return Math.max(1, room);
+}
+
+// The words of a topic that were not searched (past the 24, or past termBudget), in topic order. Empty for an
+// ordinary topic. `excluded` is the ids the search leaves out, or how many (the load passes its recent and lesson rows).
+function topicTermsDropped(topic, excluded) {
+  const n = Array.isArray(excluded) ? new Set(excluded.filter((x) => Number.isInteger(x))).size : excluded | 0;
+  const over = [];
+  const kept = relevanceTerms(topic, over);
+  return kept.slice(termBudget(topic, n)).concat(over);
 }
 
 // Identifiers kept whole for the memory searches (relevantMemory,
@@ -764,8 +795,8 @@ function exactTerms(topic) {
 // relevance-idf.test.mjs R-ID1..R-ID3.
 // Identifiers match by instr(), not LIKE: LIKE reads "_" as any character, so
 // "complete_authentication" would also match "complete-authentication".
-function relevanceScore(topic) {
-  const terms = relevanceTerms(topic);
+function relevanceScore(topic, maxTerms) {
+  const terms = maxTerms > 0 ? relevanceTerms(topic).slice(0, maxTerms) : relevanceTerms(topic);
   const exact = exactTerms(topic);
   const all = exact.map((t) => [t, 20, 15, true]).concat(terms.map((t) => [t, 3, 1, false]));
   const score = all
@@ -775,6 +806,40 @@ function relevanceScore(topic) {
     .join(" + ");
   const pat = ([t, , , ex]) => (ex ? t : "%" + t + "%");
   return { all, score, pat };
+}
+
+// WHICH PROJECT IS THIS CHAT FOR (5.2, F07). The only "ask which project" was prose. With a topic, score it against
+// every project's rows with the same words relevanceScore reads (one grouped query, 10 words at most so the score
+// binds stay small) and, when another project fits clearly better than the loaded one, return a structured ask:
+//   { loaded, better_fit: [{ project, score, top_title }], ask }
+// "Clearly better" is PROJECT_CHECK_MARGIN times the loaded project's best score AND at least PROJECT_CHECK_MIN
+// (a single weak word in another project is not a reason to ask). No topic, no check: a hot-state-derived search
+// is not what the owner typed. GLOBAL belongs to every project and is never a candidate. The caller decides who may
+// see it: the owner gateway only for the owner, the customer worker over its own database.
+const PROJECT_CHECK_MARGIN = 2;
+const PROJECT_CHECK_MIN = 6;
+async function projectCheck(db, loaded, topic) {
+  if (!loaded || !topic || typeof topic !== "string") return null;
+  const { all, score, pat } = relevanceScore(topic, 10);
+  if (!all.length) return null;
+  const binds = [];
+  for (const a of all) binds.push(pat(a), pat(a));
+  const per = await db.prepare(
+    "SELECT domain, MAX(s) AS best FROM (SELECT domain, (" + score + ") AS s FROM memory WHERE domain != 'GLOBAL' AND " + NOT_SUPERSEDED + ") GROUP BY domain ORDER BY best DESC LIMIT 20"
+  ).bind(...binds).all();
+  const rows = per.results || [];
+  const mine = (rows.find((r) => r.domain === loaded) || {}).best || 0;
+  const better = rows.filter((r) => r.domain !== loaded && r.best >= PROJECT_CHECK_MIN && r.best > PROJECT_CHECK_MARGIN * mine).slice(0, 3);
+  if (!better.length) return null;
+  const fits = [];
+  for (const r of better) {
+    const top = await db.prepare(
+      "SELECT title FROM memory WHERE domain = ? AND " + NOT_SUPERSEDED + " ORDER BY (" + score + ") DESC, id DESC LIMIT 1"
+    ).bind(r.domain, ...binds).first();
+    fits.push({ project: r.domain, score: r.best, top_title: String((top && top.title) || "").slice(0, 160) });
+  }
+  const names = [loaded, ...fits.map((f) => f.project)];
+  return { loaded, better_fit: fits, ask: "Which project is this chat for: " + names.join(" or ") + "?" };
 }
 
 // SUPERSEDED ROWS ARE NEVER SERVED AS CURRENT (2026-10-06, rebuild A7).
@@ -962,7 +1027,8 @@ async function searchFullText(db, domain, q, mem) {
 }
 
 async function relevantMemory(db, domain, topic, excludeIds, onlyType) {
-  const { all, score, pat } = relevanceScore(topic);
+  const nExcluded = Array.from(new Set((excludeIds || []).filter((n) => Number.isInteger(n)))).length;
+  const { all, score, pat } = relevanceScore(topic, termBudget(topic, nExcluded));
   if (!all.length) return [];
   // onlyType: "decision" keeps the 24-row candidate window to decisions, so a caller that wants decisions (the
   // decision-save check, relatedDecisionCheck below) is not left with the few that happened to rank among mixed
@@ -1021,7 +1087,8 @@ async function relevantMemory(db, domain, topic, excludeIds, onlyType) {
 // one scores at or above DECISION_RELATED_T and the body cites none of the best three: by naming the id (which
 // "SUPERSEDES <id>" and "NOT-RELATED <id>: <reason>" both do). A failed search never blocks a save.
 //
-// THE QUERY. The store reads the first six distinct content words of a topic (relevanceTerms), so the topic is the
+// THE QUERY. decisionTopic keeps the first six distinct content words (T below was measured on six; the general topic
+// search reads up to RELEVANCE_TERMS_MAX since 5.1), so the topic is the
 // title, with its status tag, date and sha taken off (they are the same on every BUILT- row and would fill the six),
 // then the body. A title is the subject of the decision; the body only fills what the title leaves.
 //
@@ -1040,6 +1107,7 @@ async function relevantMemory(db, domain, topic, excludeIds, onlyType) {
 // restatements. Only a few pairs were read by title, so the ceiling is the highest unrelated pair found, not proved.
 // A TUNED CONSTANT: change it only with a new measurement of the same kind. decision-related.test.mjs pins the value.
 const DECISION_RELATED_T = 16;
+const DECISION_TOPIC_WORDS = 6; // part of what T was measured on: do not change without a new measurement
 function decisionTopic(title, body) {
   const clean = (x) => String(x || "")
     .replace(/\s*\[[^\]]*\]\s*/g, " ")
@@ -1051,7 +1119,7 @@ function decisionTopic(title, body) {
   // 100-599 numbers out of a topic and weighs them 20 (title) and 15 (body), so a body that cites "514" or names
   // /search would turn row ids and test counts into the strongest terms and pull in every row that mentions them. The
   // limit T was measured on plain words, so only plain words are searched. Digits are dropped from the body too.
-  return relevanceTerms(t + " " + clean(String(body || "").slice(0, 600))).join(" ");
+  return relevanceTerms(t + " " + clean(String(body || "").slice(0, 600))).slice(0, DECISION_TOPIC_WORDS).join(" ");
 }
 // Same definition as the load's owner_rulings query (memory-gateway sessionStart): type=decision and the title opens
 // OWNER-RULING or STANDING, or the body opens PROVENANCE: OWNER-SAID. (SQL LIKE is case-blind for ASCII; so is this.)
@@ -1128,7 +1196,8 @@ async function searchRoute(db, input, hooks = {}) {
     for (const t of terms) tbinds.push("%" + t + "%");
     const tx = await db.prepare(
       "SELECT session_id, turn_index, ts, excerpt, (" + tscore + ") AS score FROM transcript_excerpts " +
-      "WHERE " + (hooks.untaggedChats ? "(domain = ? OR domain = '')" : "domain = ?") + (since ? " AND ts >= ?" : "") + " AND (" + tscore + ") > 0 ORDER BY score DESC, id DESC LIMIT 5"
+      "WHERE " + (hooks.untaggedChats ? "(domain = ? OR domain = '')" : "domain = ?") + (since ? " AND ts >= ?" : "") +
+      NOT_OWNER_TURN_STARTS.map((p) => " AND excerpt NOT LIKE '" + p + "%'").join("") + " AND (" + tscore + ") > 0 ORDER BY score DESC, id DESC LIMIT 5"
     ).bind(...tbinds).all();
     const transcripts = (tx.results || []).map((r) => ({ session_id: r.session_id, turn: r.turn_index, ts: r.ts, excerpt: r.excerpt }));
     if (hooks.afterLookup) await hooks.afterLookup({ mem, log, transcripts, elsewhere });
@@ -1177,10 +1246,32 @@ function extractOwnerTurnExcerpts(text) {
     }
     raw = raw.trim();
     if (!raw) continue;
+    if (!isOwnerTurn(rec, raw)) continue; // hook feedback, task notices, sub-agent hand-backs are not the owner
     const ts = typeof rec.timestamp === "string" ? rec.timestamp : null;
     out.push({ turn_index: i, ts, excerpt: raw.slice(0, 300) });
   }
   return out;
+}
+
+// WHAT IS NOT THE OWNER TYPING (0b.2b). A transcript line with type "user" also carries Stop-hook feedback,
+// task notices and sub-agent hand-backs; the harness marks most of them (isMeta, an origin that is not
+// human) and an older transcript marks none, so the start of the text is the third test. One list of
+// starts: the index time check below and both search-time SELECTs (core/store.js, searchRoute) read it, so
+// they cannot drift. The hook side keeps the same rule in owner_last_message (pre-tool-enforcement.sh);
+// test-subagent-exemption.sh OM7 feeds both the same lines.
+const NOT_OWNER_TURN_STARTS = [
+  "Stop hook feedback:",
+  "<task-notification>",
+  "Another Claude session sent a message:",
+  "[Subagent hand-back]",
+  "<agent-message",
+];
+function isOwnerTurn(rec, text) {
+  if (!rec || rec.type !== "user") return false;
+  if (rec.isMeta === true) return false;
+  if (((rec.origin && rec.origin.kind) || "human") !== "human") return false;
+  const t = String(text == null ? "" : text).trimStart();
+  return !NOT_OWNER_TURN_STARTS.some((p) => t.startsWith(p));
 }
 
 // One line of a stream, numbered by its position in the file exactly as extractOwnerTurnExcerpts numbers
@@ -1511,7 +1602,7 @@ async function transcriptTool(env, domain, args, policy) {
     const since = sinceMs === null ? null : new Date(sinceMs).toISOString();
     const rows = await env.DB.prepare(
       "SELECT session_id, turn_index, ts, excerpt, (" + score + ") AS score FROM transcript_excerpts WHERE (domain = ? OR domain = '')" +
-      (since ? " AND ts >= ?" : "") + " AND (" + score + ") > 0 ORDER BY score DESC, id DESC LIMIT ?"
+      (since ? " AND ts >= ?" : "") + NOT_OWNER_TURN_STARTS.map((p) => " AND excerpt NOT LIKE '" + p + "%'").join("") + " AND (" + score + ") > 0 ORDER BY score DESC, id DESC LIMIT ?"
     ).bind(...like, domain, ...(since ? [since] : []), ...like, clampN(args.limit, 5, 20)).all();
     return { ok: true, project: domain, q, history_days: days, matches: (rows.results || []).map((r) => ({ session_id: r.session_id, line: r.turn_index, ts: r.ts, excerpt: r.excerpt })), note: policy.searchNote };
   }
@@ -1607,8 +1698,12 @@ async function transcriptTool(env, domain, args, policy) {
   if (action === "read") {
     const sid = transcriptSessionId(String(args.session_id || ""));
     if (!policy.idPattern.test(sid)) return { ok: false, error: policy.idError };
-    const terms = relevanceTerms(String(args.q || "").slice(0, 500));
-    if (!terms.length) return { ok: false, error: "q needs at least one content word" };
+    // Line-range read (0b.2, owner side only): from_line and to_line replace the word search, so q is
+    // optional. Enabled only by the policy flag, so the customer worker keeps its word-search-only read.
+    const isLineNo = (v) => v !== undefined && v !== null && v !== "" && Number.isInteger(Number(v)) && Number(v) >= 0;
+    const rangeMode = policy.lineRange === true && isLineNo(args.from_line) && isLineNo(args.to_line) && Number(args.to_line) >= Number(args.from_line);
+    const terms = rangeMode ? [] : relevanceTerms(String(args.q || "").slice(0, 500));
+    if (!rangeMode && !terms.length) return { ok: false, error: "q needs at least one content word" };
     let obj = null;
     for (const key of policy.objectKeys(sid)) {
       obj = await env.TRANSCRIPTS.get(key);
@@ -1622,6 +1717,37 @@ async function transcriptTool(env, domain, args, policy) {
     if (/\.gz$/.test(obj.__key)) {
       if (typeof DecompressionStream === "undefined") return { ok: false, error: "gzip not supported here" };
       src = src.pipeThrough(new DecompressionStream("gzip"));
+    }
+    if (rangeMode) {
+      const fromN = Number(args.from_line), toN = Number(args.to_line);
+      // 60000 matches the load ceiling the gateway already uses; one page never exceeds it.
+      const rBudget = clampN(args.max_chars, 20000, 60000);
+      const out = [];
+      let rUsed = 0, rLine = 0, rNext = null, rStop = false, rCarry = "", rDrop = false;
+      const take = (text, dropped) => {
+        const idx = rLine++;
+        if (idx < fromN) return;
+        if (idx > toN) { rNext = idx; rStop = true; return; }
+        if (out.length && (rUsed + text.length > rBudget || rUsed >= rBudget)) { rNext = idx; rStop = true; return; }
+        if (dropped) { out.push({ line: idx, text: "", cut: true }); return; }
+        if (text.length > rBudget) { out.push({ line: idx, text: text.slice(0, rBudget), cut: true }); rUsed += rBudget; return; }
+        out.push({ line: idx, text });
+        rUsed += text.length;
+      };
+      const rReader = src.pipeThrough(new TextDecoderStream()).getReader();
+      for (;;) {
+        const { value, done } = await rReader.read();
+        if (done) break;
+        const parts = value.split("\n");
+        for (let k = 0; k < parts.length && !rStop; k++) {
+          if (!rDrop) { rCarry += parts[k]; if (rCarry.length > TRANSCRIPT_LINE_MAX_CHARS) { rCarry = ""; rDrop = true; } }
+          if (k < parts.length - 1) { take(rCarry, rDrop); rCarry = ""; rDrop = false; }
+        }
+        if (rStop) { try { await rReader.cancel(); } catch (_) {} break; }
+      }
+      // The text after the last newline is a line only when it is not empty.
+      if (!rStop && (rDrop || rCarry !== "")) take(rCarry, rDrop);
+      return { ok: true, project: domain, session_id: sid, from_line: fromN, to_line: toN, lines: out, next_line: rNext, ...(tag ? {} : { untagged: true }) };
     }
     const budget = clampN(args.max_chars, 6000, 20000);
     const hits = [];
@@ -2296,10 +2422,14 @@ async function sessionLoad(domain, surface, env, token) {
   const hotRow = (hot.results && hot.results[0]) || null;
   const hotState = hotRow ? hotRow.state : null;
   const hotDate = hotRow ? hotRow.updated_at : "none";
-  const relevantRows = await relevantMemory(
-    db, domain, loadTopic || String(hotState || "").slice(0, 600),
-    [...(recent.results || []).map((r) => r.id), ...(lessons.results || []).map((r) => r.id)]
-  );
+  const relevantExclude = [...(recent.results || []).map((r) => r.id), ...(lessons.results || []).map((r) => r.id)];
+  const relevantTopic = loadTopic || String(hotState || "").slice(0, 600);
+  const relevantRows = await relevantMemory(db, domain, relevantTopic, relevantExclude);
+  // Topic words that did not fit the query's bind budget are named, never dropped silently (5.1).
+  const topicDropped = topicTermsDropped(relevantTopic, relevantExclude);
+  // A topic that fits another of this store's projects clearly better says so, as a structured ask (5.2).
+  let projectCheckOut = null;
+  try { projectCheckOut = await projectCheck(db, domain, loadTopic); } catch (_) { /* the load stands without it */ }
   const openN = openCount(hotState, (pending.results || []));
   const openItemList = openItems(hotState, (pending.results || []));
   await db.prepare("INSERT INTO log (ts, domain, summary) VALUES (datetime('now'), ?, ?)").bind(domain, "Session loaded, surface=" + (surface || "mcp")).run();
@@ -2349,6 +2479,8 @@ async function sessionLoad(domain, surface, env, token) {
     ...(relevantRows.length ? {
       relevant: relevantRows,
     } : {}),
+    ...(topicDropped.length ? { topic_terms_dropped: topicDropped } : {}),
+    ...(projectCheckOut ? { project_check: projectCheckOut } : {}),
     // The only rows here that arrive WITH a body - parity with the gateway.
     lessons: (lessons.results || []).map(lessonRow),
     // Where the project's past chats are (bb11701 on the owner gateway): one entry per "transcript PUT" row.
