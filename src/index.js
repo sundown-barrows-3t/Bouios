@@ -1453,6 +1453,15 @@ async function indexTranscriptExcerpts(db, sessionId, domain, text) {
 
 const MEMORY_TYPES = ["pattern", "mistake", "decision", "pending"];
 
+// Projects are dynamic: created on first write, listed live from the store. Valid name: starts with a
+// letter, 2-20 chars, A-Z 0-9 _ - (stored uppercase). ONE definition for the owner gateway and the
+// customer worker (5.7, F74): both used to carry a copy. normalise-domains.test.mjs.
+const PROJECT_RE = /^[A-Z][A-Z0-9_-]{1,19}$/;
+function normaliseProject(raw) {
+  const p = String(raw || "").toUpperCase();
+  return PROJECT_RE.test(p) ? p : null;
+}
+
 // CONSTRAINT-ROW write gate (owner directive, incident 2026-08-04). A memory row
 // that ASSERTS a ban/prohibition ("ban", "never use", "do not use", "must not
 // use", "prohibit", "blacklist", "forbidden") is a CONSTRAINT ROW: acted on by
@@ -2024,11 +2033,7 @@ const WORKER_SCHEMA = [
 ];
 const ensureWorkerSchema = (db) => ensureSchema(db, WORKER_SCHEMA);
 
-const PROJECT_RE = /^[A-Z][A-Z0-9_-]{1,19}$/;
-function normaliseProject(raw) {
-  const p = String(raw || "").toUpperCase();
-  return PROJECT_RE.test(p) ? p : null;
-}
+// PROJECT_RE and normaliseProject are in core/store.js (5.7), joined in by worker/build.mjs.
 
 function timingSafeEqual(a, b) {
   const enc = new TextEncoder();
@@ -2135,24 +2140,31 @@ async function fetchRules(env, token) {
 // gateway and obeys a plain yes/no. All of that logic lives at
 // memory-gateway/src/index.js's GET /licence/verify?existing=&total=.
 //
-// INERT BY DEFAULT: no existing free/alpha deployment has ever had a token
-// configured, so this never runs for them - no separate on/off flag needed,
-// presence of a token IS the switch.
+// 7.1 (owner 4817, "installs with no licence ... It's not new free limits"): a token is no longer
+// the switch. An install with GATEWAY_URL set but NO licence asks the gateway with an empty licence and
+// gets the no-licence level (1 project, 1 day of history, no skills). An install with no GATEWAY_URL
+// never asks: that is the inert case, and every network failure still fails open.
 const NO_ACCESS_CHECK = { ok: true, note: null };
 
 // TRANSCRIPTS IN YOUR OWN STORAGE. Session transcripts are kept in a bucket in
 // this account (binding TRANSCRIPTS) and nowhere else: nothing here sends one
 // to any other service. Nothing is ever deleted. How far back they are listed
 // and read is a number of days the gateway returns with the licence check; this
-// file holds no plan logic, only obeys the number. With no licence set, or if
-// the gateway cannot be reached, the window is open - the same fail-open rule
-// as checkAccess above, so a network problem never hides a customer's own data.
+// file holds no plan logic, only obeys the number. With no licence set the gateway
+// is asked with an empty one and answers the no-licence window (1 day, 7.1). If the
+// gateway cannot be reached, or this install has no GATEWAY_URL, the window is open -
+// the same fail-open rule as checkAccess above, so a network problem never hides a
+// customer's own data.
 const TRANSCRIPT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 async function historyWindowDays(request, url, env) {
   const token = accessTokenFromRequest(request, url, env);
-  if (!token || !env.GATEWAY_URL) return null;
+  if (!env.GATEWAY_URL) return null;
+  // 7.1: with no licence the gateway is asked with an empty one and answers the no-licence window (1 day).
+  let silent = !token; // the rule before 7.1: no licence, no question, window open
+  silent = false; // m:nolic-history
+  if (silent) return null;
   try {
-    const r = await fetch(env.GATEWAY_URL + "/licence/verify?licence=" + encodeURIComponent(token), { headers: { "x-licence": token } });
+    const r = await fetch(env.GATEWAY_URL + "/licence/verify?licence=" + encodeURIComponent(token || ""), { headers: token ? { "x-licence": token } : {} });
     if (!r.ok) return null;
     const v = await r.json();
     return v && Number.isFinite(v.history_days) && v.history_days >= 0 ? v.history_days : null;
@@ -2390,7 +2402,13 @@ function accessTokenFromRequest(request, url, env) {
 // inspection, before this was routed through the gateway at all.
 async function checkAccess(db, domain, request, url, env) {
   const token = accessTokenFromRequest(request, url, env);
-  if (!token || !env.GATEWAY_URL) return NO_ACCESS_CHECK;
+  if (!env.GATEWAY_URL) return NO_ACCESS_CHECK;
+  // 7.1 (owner 4817): an install with NO licence asks the gateway too, with an empty licence, and is held to
+  // the no-licence level the gateway answers (1 project). Before this, no token meant no question and
+  // unlimited projects. An install with no GATEWAY_URL still never asks; every failure below still fails open.
+  let silent = !token; // the rule before 7.1: no licence, no question
+  silent = false; // m:nolic-access
+  if (silent) return NO_ACCESS_CHECK;
   const row = await db
     .prepare("SELECT (SELECT COUNT(*) FROM hot WHERE domain = ?1) AS already, (SELECT COUNT(DISTINCT domain) FROM hot) AS total")
     .bind(domain)
@@ -2399,8 +2417,8 @@ async function checkAccess(db, domain, request, url, env) {
   const total = (row && row.total) || 0;
   try {
     const r = await fetch(
-      env.GATEWAY_URL + "/licence/verify?licence=" + encodeURIComponent(token) + "&existing=" + existing + "&total=" + total,
-      { headers: { "x-licence": token } }
+      env.GATEWAY_URL + "/licence/verify?licence=" + encodeURIComponent(token || "") + "&existing=" + existing + "&total=" + total,
+      { headers: token ? { "x-licence": token } : {} }
     );
     if (!r.ok) return NO_ACCESS_CHECK;
     const v = await r.json();
