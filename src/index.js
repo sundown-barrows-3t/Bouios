@@ -364,6 +364,55 @@ function toolText(id, text, isError) {
   return rpcResult(id, result);
 }
 
+// CORS FOR /mcp (5.11, S12). OPTIONS on /mcp answered a bare 204 with no Access-Control-* header, so a browser
+// client's preflight failed. The helper below is the one copy, used by the owner gateway and the customer worker.
+// AN ALLOWLIST ONLY, NEVER "*": the requesting Origin is echoed when it is https on claude.ai or a subdomain of
+// it, or is listed exactly in env.CORS_ORIGINS (comma separated); otherwise no Allow-Origin header is sent.
+// Source: the MCP specification 2025-03-26, Transports, "Streamable HTTP" (opened 2026-11-07): its Security
+// Warning says servers MUST validate the Origin header on incoming connections; Session Management names the
+// Mcp-Session-Id request header. That the headers below are what a browser MCP client needs is a HYPOTHESIS:
+// the spec page names no Access-Control header list, and no browser client was driven against this. A request
+// with no Origin header (every non-browser client) gets nothing added.
+const CORS_ALLOW_METHODS = "POST, GET, DELETE, OPTIONS";
+const CORS_ALLOW_HEADERS = "authorization, content-type, mcp-session-id, mcp-protocol-version, x-licence";
+const CORS_MAX_AGE = "600";
+
+function corsAllowedOrigin(origin, env) {
+  if (typeof origin !== "string" || !origin) return null;
+  let u;
+  try { u = new URL(origin); } catch { return null; }
+  if (u.origin !== origin) return null; // a path, query, userinfo or a trailing slash is not an Origin
+  if (u.protocol === "https:" && !u.port && (u.hostname === "claude.ai" || u.hostname.endsWith(".claude.ai"))) return origin;
+  const extra = String((env && env.CORS_ORIGINS) || "").split(",").map((s) => s.trim()).filter((s) => s && s !== "*");
+  return extra.includes(origin) ? origin : null;
+}
+
+// The preflight answer. 204 always; the Allow-* headers only for an allowed Origin.
+function corsPreflight(request, env) {
+  const headers = { vary: "Origin" };
+  const allowed = corsAllowedOrigin(request.headers.get("origin"), env);
+  if (allowed) {
+    headers["access-control-allow-origin"] = allowed;
+    headers["access-control-allow-methods"] = CORS_ALLOW_METHODS;
+    headers["access-control-allow-headers"] = CORS_ALLOW_HEADERS;
+    headers["access-control-max-age"] = CORS_MAX_AGE;
+  }
+  return new Response(null, { status: 204, headers });
+}
+
+// The matching POST/GET answer: the same Allow-Origin (and Vary), plus Expose-Headers so a browser can read the
+// Mcp-Session-Id it must send back. A request without an Origin header, or from an origin that is not allowed,
+// gets the response unchanged.
+function withCors(request, env, response) {
+  const allowed = corsAllowedOrigin(request.headers.get("origin"), env);
+  if (!allowed || !response) return response;
+  const h = new Headers(response.headers);
+  h.set("access-control-allow-origin", allowed);
+  h.set("access-control-expose-headers", "Mcp-Session-Id");
+  h.append("vary", "Origin");
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers: h });
+}
+
 // MCP TRANSPORT SIZE GUARD, one function for the owner gateway and the customer worker.
 // Merged from the two copies in step 5a (the worker's had drifted: it cut every context
 // row over 300 characters, protected no owner words, and lacked the pointer and field steps).
@@ -639,7 +688,55 @@ async function logFetch(db, domain, sessionId, args, ids, keyCount, found) {
   } catch (_) { /* a lost measurement must never cost the caller the rows */ }
 }
 
-const AUTO_LOAD_PREFACE = "Memory was not loaded in this chat; loaded it now.";
+// PAGING THE LOAD'S RECENT-MEMORY LIST (5.10, S10). The list is the 15 newest non-pending titles; there was no
+// way to reach the 16th newest except by topic. bouios_load now takes memory_before_id: the query adds
+// "AND id < ?" and the load returns memory_next_before_id (the smallest id shown) whenever a full page of 15
+// came back. The page size stays 15 (LIMIT 15 is in each caller's query text, pinned by invariants a1 and the
+// worker parity test T6b), so a load without memory_before_id is byte-identical to before. Shared by the owner
+// gateway and the customer worker: one copy.
+const RECENT_MEMORY_LIMIT = 15;
+
+// A cursor is a positive whole number. Anything else (absent, 0, negative, text, a fraction) means page 1.
+function parseMemoryBeforeId(v) {
+  const n = typeof v === "number" ? v : (typeof v === "string" && /^\d{1,15}$/.test(v.trim()) ? Number(v) : NaN);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+// The SQL clause and its binds for one page. Page 1 gets no clause and no bind.
+function memoryPage(beforeId) {
+  const n = parseMemoryBeforeId(beforeId);
+  return n === null ? { clause: "", binds: [] } : { clause: "AND id < ? ", binds: [n] };
+}
+
+// The cursor for the next page: the smallest id shown, only when a full page came back.
+function memoryNextBeforeId(rows) {
+  const ids = (rows || []).map((r) => Number(r && r.id)).filter((x) => Number.isInteger(x) && x > 0);
+  return ids.length >= RECENT_MEMORY_LIMIT ? Math.min(...ids) : null;
+}
+
+// bouios_get READS MANY IDS (5.10, P14). D1 allows 100 bound parameters per query (core/search.js:47; the D1
+// limits page, read 2026-11-07: "Maximum bound parameters per query: 100"). The ids plus the domain bind must
+// fit, so a call with more than about 98 ids failed. The ids are split into chunks of BOUIOS_GET_CHUNK (the cap
+// minus 2) and run as one db.batch(), which counts as a single query against the per-invocation limit (same
+// page). One call takes at most BOUIOS_GET_MAX_IDS ids; the rest are named in ids_over_cap, never dropped silently.
+const BOUIOS_GET_CHUNK = 98;
+const BOUIOS_GET_MAX_IDS = 500;
+
+async function getMemoryRows(db, domain, ids) {
+  const take = ids.slice(0, BOUIOS_GET_MAX_IDS);
+  const over = ids.slice(BOUIOS_GET_MAX_IDS);
+  const stmts = [];
+  for (let i = 0; i < take.length; i += BOUIOS_GET_CHUNK) {
+    const part = take.slice(i, i + BOUIOS_GET_CHUNK);
+    stmts.push(db.prepare("SELECT id, type, title, body FROM memory WHERE id IN (" + part.map(() => "?").join(",") + ") AND (domain = ? OR domain = 'GLOBAL')").bind(...part, domain));
+  }
+  const res = stmts.length ? await db.batch(stmts) : [];
+  const rows = [];
+  for (const r of res) rows.push(...((r && r.results) || []));
+  return { rows, ids_over_cap: over };
+}
+
+const AUTO_LOAD_PREFACE ="Memory was not loaded in this chat; loaded it now.";
 
 // Puts the preface, the load's confirmation line and its payload ahead of the
 // tool's own result, in the same text block the model reads.
@@ -2361,6 +2458,8 @@ async function sessionLoad(domain, surface, env, token) {
     if (tm) { try { loadTopic = decodeURIComponent(tm[1]); } catch (e) { loadTopic = tm[1]; } }
   }
   const lq = lessonsQuery(loadTopic);
+  const beforeM = / before=(\d+)(?=\s|$)/.exec(String(surface || ""));
+  const memPage = memoryPage(beforeM ? beforeM[1] : null);
   const [rules, hot, context, pending, recent, lessons, memTotal, tputs] = await Promise.all([
     fetchRules(env, token),
     db.prepare("SELECT state, updated_at FROM hot WHERE domain = ?").bind(domain).all(),
@@ -2372,7 +2471,8 @@ async function sessionLoad(domain, surface, env, token) {
     db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type = 'pending' AND " + NOT_SUPERSEDED + " ORDER BY id").bind(domain).all(),
     // 15 newest non-pending titles, was 40 (2026-10-20, owner 3498/3512: titles first,
     // expand on demand). Same cut as the gateway; worker-gateway-parity pins both.
-    db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') AND type != 'pending' AND " + NOT_SUPERSEDED + " ORDER BY id DESC LIMIT 15").bind(domain).all(),
+    // Paged like the gateway (5.10): memory_before_id adds "AND id < ?" via the shared memoryPage in core/records.js.
+    db.prepare("SELECT id, type, title FROM memory WHERE (domain = ? OR domain = 'GLOBAL') " + memPage.clause + "AND type != 'pending' AND " + NOT_SUPERSEDED + " ORDER BY id DESC LIMIT 15").bind(domain, ...memPage.binds).all(),
     // LESSONS - parity with the gateway (2026-09-05). 12 mistake and pattern
     // rows (the ones matching the topic first, then the newest) arrive WITH
     // their bodies, because those rows exist for one
@@ -2467,6 +2567,7 @@ async function sessionLoad(domain, surface, env, token) {
     context_note: "context carries the reference material for this project. Rows that bind behaviour (preferences, instructions), rows under 1200 characters, and rows matching the topic you named come back IN FULL. The rest are an excerpt plus their real length, marked excerpt_only - because after the log was capped, context became the largest block in the payload and the size guard's last resort would otherwise have started cutting it. Nothing is hidden: every key is listed with its date, and the full content is one bouios_get({project, keys:[...]}) call away. Fetch the ones your task actually needs, never all of them.",
     // HANDOVER rows first (row 4289 part 9, row 4341); the other open rows keep their id order.
     memory: [...handoversFirst(pending.results || []), ...(recent.results || [])],
+    ...(memoryNextBeforeId(recent.results || []) ? { memory_next_before_id: memoryNextBeforeId(recent.results || []) } : {}),
     memory_note: MEMORY_NOTE,
     memory_total: memTotal ? memTotal.n : 0,
     // Say out loud how little of the store this is - parity with the gateway.
@@ -2783,7 +2884,7 @@ async function mcpLoad(domain, args, sessionId, env, request, url) {
   // The topic rides on `surface` URI-encoded, as on the gateway. Until
   // 2026-10-06 the worker never read args.topic and its schema had no
   // topic, so a customer load could not search by one at all.
-  const surface = (args.surface || "mcp") + " session=" + (sessionId || "none") + (typeof args.topic === "string" && args.topic.trim() ? " topic=" + encodeURIComponent(args.topic.trim().slice(0, 160)) : "");
+  const surface = (args.surface || "mcp") + " session=" + (sessionId || "none") + (memoryPage(args.memory_before_id).binds.length ? " before=" + memoryPage(args.memory_before_id).binds[0] : "") + (typeof args.topic === "string" && args.topic.trim() ? " topic=" + encodeURIComponent(args.topic.trim().slice(0, 160)) : "");
   const loaded = await sessionLoad(domain, surface, env, accessTokenFromRequest(request, url, env));
   // A skill that cannot be read never takes the load down with it.
   try {
@@ -2863,6 +2964,7 @@ const MCP_TOOLS = [
       properties: {
         project: { type: "string", description: "Project name (uppercase, 2-20 chars)." },
         surface: { type: "string", description: "Where this session runs: chat, cowork, code, dispatch, chatgpt (ChatGPT, any surface), codex (OpenAI Codex)." },
+        memory_before_id: { type: "integer", description: "Optional. Pages the `memory` list: pass the memory_next_before_id of the previous load to get the 15 next older titles. Omit for the newest 15." },
         topic: { type: "string", description: "Optional but strongly recommended: what this conversation is about, in a few words. With it, ALL rows are searched by relevance and the matches come back with a body excerpt in `relevant`, and lessons are chosen by it." },
       },
       required: ["project"],
@@ -4281,12 +4383,10 @@ async function handleMsg(msg, sessionId, env, request, url) {
         const rawIds = Array.isArray(args.ids) ? args.ids : [];
         const ids = rawIds.map((x) => parseInt(x, 10)).filter((x) => Number.isInteger(x) && x > 0);
         if (!ids.length) return toolText(id, "Provide at least one valid memory row id in ids.", true);
-        const placeholders = ids.map(() => "?").join(",");
-        const rows = await env.DB.prepare(
-          `SELECT id, type, title, body FROM memory WHERE id IN (${placeholders}) AND (domain = ? OR domain = 'GLOBAL')`
-        ).bind(...ids, domain).all();
-        await logFetch(env.DB, domain, sessionId, args, ids, 0, (rows.results || []).length);
-        return toolText(id, JSON.stringify({ rows: rows.results || [] }));
+        // Same shared reader as the gateway (core/records.js getMemoryRows): chunked under D1's 100-parameter cap (5.10, P14).
+        const got = await getMemoryRows(env.DB, domain, ids);
+        await logFetch(env.DB, domain, sessionId, args, ids, 0, got.rows.length);
+        return toolText(id, JSON.stringify(got.ids_over_cap.length ? { rows: got.rows, ids_over_cap: got.ids_over_cap } : { rows: got.rows }));
       }
     } catch (e) {
       return toolText(id, "tool failed: " + String(e), true);
@@ -4345,9 +4445,11 @@ export default {
     if (path === "/health") return json({ ok: true, service: "memory-vault", version: env.BUILD_SHA || null });
 
     if (path.startsWith("/mcp/")) {
+      // CORS preflight (5.11): the shared helper in core/mcp.js, same as the gateway. It carries no data and needs no token.
+      if (request.method === "OPTIONS") return corsPreflight(request, env);
       const token = path.slice(5);
       if (!env.BEARER_TOKEN || !token || !timingSafeEqual(token, env.BEARER_TOKEN)) return json({ error: "unauthorised" }, 401);
-      return handleMcp(request, env, ctx);
+      return withCors(request, env, await handleMcp(request, env, ctx));
     }
     // NO OAUTH - answer the discovery probes truthfully, same fix as the
     // gateway (b5c76ac). These paths fell through to the bearer check below
