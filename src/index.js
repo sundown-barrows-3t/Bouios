@@ -2551,6 +2551,8 @@ async function sessionWrite(domain, body, db, tz) {
   // item 7): they used to be a silent `continue`. Reason strings are the
   // gateway's, verbatim, so parity tests can compare them.
   const rejected = [];
+  // The five best earlier decisions for each decision row in this save (4938(b), parity with the owner gateway).
+  const relatedDecisions = [];
   // Rows saved but flagged (chat/cowork claims, step 3-4 item 13).
   const marked = [];
   const wasteMissing = [];
@@ -2626,6 +2628,19 @@ async function sessionWrite(domain, body, db, tz) {
       const pendingCheck = pendingRowCheck(m, m.title);
       if (pendingCheck.refused) { rejected.push({ title: m.title, reason: pendingCheck.refused }); continue; }
       let openTitle = pendingCheck.title;
+      // A DECISION IS CHECKED AGAINST EARLIER DECISIONS (row 4159, 4938(b); parity with the owner gateway, whose
+      // comment carries the reasoning). core/search.js relatedDecisionCheck is the one copy: the row is refused,
+      // that row only, when the best earlier decision scores at or above DECISION_RELATED_T and the body cites
+      // none of the best three. A failed search never blocks a save.
+      if (m.type === "decision") {
+        try {
+          const rel = await relatedDecisionCheck(db, domain, m); // m:worker-decision-related
+          if (rel) {
+            for (const r of rel.related) relatedDecisions.push({ ...r, for: String(m.title).slice(0, 80) });
+            if (rel.refusal) { rejected.push({ title: m.title, reason: rel.refusal }); continue; }
+          }
+        } catch (_) { /* a failed check never blocks a save */ }
+      }
       // CHAT/COWORK CLAIMS ARE MARKED, NEVER REFUSED (2026-10-06, step 3-4 item
       // 13; mirrors the gateway, whose comment carries the measurements). A
       // refused save is the worst failure on record, so the title carries the
@@ -2703,7 +2718,7 @@ async function sessionWrite(domain, body, db, tz) {
   const siblingCandidates = await siblingCandidatesFor(db, domain, applied);
   const close = await closeCandidatesFor(db, domain, body, applied, insertedTitles, hasShaToken);
   const savedAt = new Date();
-  return { ok: true, domain, applied, ...closureReplyFields(close, siblingCandidates), ...(rejected.length ? { rejected } : {}), ...(marked.length ? { marked } : {}), ...(wasteMissing.length ? { waste_missing: wasteMissing, waste_note: "Each mistake row needs a WASTE line: time, tokens or cost, cycles repeated and owner turns lost, each with its source (owner ruling 2026-10-07). Add it with bouios_edit." } : {}), saved_at: savedAt.toISOString(), confirmation: saveConfirmation(applied, savedAt, tz, rejected.length) };
+  return { ok: true, domain, applied, ...closureReplyFields(close, siblingCandidates), ...(rejected.length ? { rejected } : {}), ...(relatedDecisions.length ? { related_decisions: relatedDecisions, related_note: "The earlier decisions (and owner rulings) that score highest against each decision row in this save; read them with bouios_get before relying on the new row. A row that scores high against one of them and cites none of the best three is refused: name the id, SUPERSEDES <id>, or NOT-RELATED <id>: <reason>." } : {}), ...(marked.length ? { marked } : {}), ...(wasteMissing.length ? { waste_missing: wasteMissing, waste_note: "Each mistake row needs a WASTE line: time, tokens or cost, cycles repeated and owner turns lost, each with its source (owner ruling 2026-10-07). Add it with bouios_edit." } : {}), saved_at: savedAt.toISOString(), confirmation: saveConfirmation(applied, savedAt, tz, rejected.length) };
 }
 
 // SAVE TIME (2026-09-24). A save hands back the moment it was written and a
@@ -4357,6 +4372,6 @@ export default {
     if (path === "/search" && request.method === "GET") return searchEndpoint(url, env, request);
     if (path === "/transcript" || path.startsWith("/transcript/")) return transcriptRoute(request, env, url, path, ctx);
     if (path === "/chat" || path.startsWith("/chat/")) return chatRoute(request, env, url, path);
-    return json({ error: "not found", routes: ["GET /health", "GET /search?domain=&q=", "POST /mcp/{token}", "POST /mcp (after sign-in)", "PUT /transcript/{id}", "GET /transcript", "GET /transcript/{id}", "GET /chat", "GET /chat/{session}/{part}.jsonl"] }, 404);
+    return json({ error: "not found", routes: ["GET /health", "GET /search?domain=&q=", "POST /mcp/{token}", /* m:routes-true */ "PUT /transcript/{id}", "GET /transcript", "GET /transcript/{id}", "GET /chat", "GET /chat/{session}/{part}.jsonl"] }, 404);
   },
 };
