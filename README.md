@@ -123,6 +123,13 @@ Each Claude Code chat is then saved to your own storage when it ends or compacts
 - **One password** — the `BEARER_TOKEN` is the only key. Rotate it any time in
   the Cloudflare dashboard.
 
+## Planned (not built yet)
+
+- **Prompt caching** in the console add-on, so repeated context costs less.
+- **Batch mode** in the console add-on for bulk jobs at the batch discount, on your own key.
+- **Usage notes** that show your plan's usage limits rather than dollar costs on Pro and Max.
+- **A new chat at the hand-off point**, opened for you with your saved state.
+
 ## Questions
 
 - **Is it really free?** Cloudflare's free tier covers normal personal use.
