@@ -1,10 +1,9 @@
 {
-  // Customer template for the Deploy to Cloudflare button.
-  // The button clones this to the customer's own GitHub, provisions the D1
-  // database and the R2 transcript bucket below on THEIR account and binds
-  // them, prompts for the BEARER_TOKEN secret, then deploys. Chat transcripts
-  // go only to this bucket (PUT/GET /transcript, bearer-gated).
-  // Deploy trigger: keep Cloudflare native Git deployment on main authoritative.
+  // Customer template. The Deploy to Cloudflare button provisions the D1
+  // database on the customer's account, fills in database_id, prompts for
+  // the BEARER_TOKEN secret (declared under "secrets" below, so the deploy
+  // asks for it), then deploys. No storage bucket is declared here:
+  // transcript storage is a second step (worker/hooks/add-transcript-storage.sh).
   "name": "memory-vault",
   "main": "src/index.js",
   "compatibility_date": "2026-06-01",
@@ -15,14 +14,8 @@
       "database_id": "PLACEHOLDER_PROVISIONED_ON_DEPLOY"
     }
   ],
-  "r2_buckets": [
-    {
-      "binding": "TRANSCRIPTS",
-      "bucket_name": "memory-vault-transcripts"
-    }
-  ],
   "vars": {
-    "GATEWAY_URL": "https://memory-gateway.syndakat.com"
+    "GATEWAY_URL": "https://memory-gateway.bouios.com"
   },
   "secrets": {
     "required": ["BEARER_TOKEN"]

@@ -1,10 +1,14 @@
 #!/bin/bash
-# transcript-upload.sh - keep this session's transcript in YOUR OWN Cloudflare
-# storage.
+# transcript-upload.sh - keep this session's transcript in YOUR OWN storage, on your own
+# account.
 #
-# It runs as a Claude Code Stop hook and a PreCompact hook. It reads the hook
-# input, finds the transcript file, and PUTs it to
-# $BOUIOS_URL/transcript/<session>.jsonl with your bearer token - your worker,
+# Your data is saved directly to your own account, never to ours. A Stop hook and a
+# pre-compact hook send the session transcript to your memory service (a bearer-gated
+# PUT/GET /transcript route); the setup installs this script and wires it as a Stop and
+# a PreCompact hook.
+#
+# What it does: reads the hook input, finds the transcript file, and PUTs it to
+# $BOUIOS_URL/transcript/<session>.jsonl with your bearer token - your memory service,
 # your bucket; nothing goes anywhere else. A re-upload replaces the stored copy
 # with the longer one. To avoid re-sending on every turn it uploads when the
 # file has grown by 200KB or 30 minutes have passed since the last upload, and
@@ -35,8 +39,8 @@ if [ "$event" != "PreCompact" ] && [ -f "$mark" ]; then
   [ $(( size - last )) -lt 204800 ] && [ "$age" -lt 1800 ] && exit 0
 fi
 
-# The project this session loaded from your memory, so a past chat is found for that project;
-# nothing when no project was loaded (the upload is then untagged).
+# The project this session loaded from your memory (written by the session checks when you load), so a
+# past chat is found for that project; nothing when no project was loaded (the upload is then untagged).
 proj=$(head -n 1 "$HOME/.claude/loaded-project" 2>/dev/null | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z0-9_-' | cut -c1-20)
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 -X PUT \
   -H "Authorization: Bearer $BOUIOS_TOKEN" -H "Content-Type: application/x-ndjson" ${proj:+-H "x-bouios-project: $proj"} \

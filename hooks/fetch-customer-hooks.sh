@@ -1,14 +1,14 @@
 #!/bin/bash
 # fetch-customer-hooks.sh - install the current session checks from Bouios into
-# ~/.claude (2026-10-25: the checks are Bouios's control plane,
-# served per session to a licensed customer and never committed to the customer's own
-# store; a lapsed licence leaves the customer on data-only).
+# ~/.claude (the checks are served per session to a licensed customer and never
+# committed to the customer's own store; a lapsed licence leaves the customer on
+# data-only).
 #
 # Run by SessionStart (the public Bouios repo's .claude/settings.json and the user-level
 # entry install-customer-hooks.sh adds). It carries no product logic: it asks the
 # gateway's licensed route for a list of files with a sha256 each, fetches only the ones
 # that changed, checks that each one parses, and installs them. What it does and does
-# not do, each locked by .session/test-customer-hooks-fetch.sh:
+# not do:
 #   - WITHOUT a valid licence it installs nothing. No licence at all, or a licence the
 #     gateway refuses, leaves ~/.claude as it was; the repo's own PreToolUse stub then
 #     refuses every edit because ~/.claude/pre-tool-enforcement.sh is absent.
@@ -51,7 +51,7 @@ if [ -f "$lock" ] && [ -f "$marker" ]; then
   [ "$age" -ge 0 ] && [ "$age" -lt 60 ] && exit 0
 fi
 
-base="${BOUIOS_HOOKS_URL:-https://memory-gateway.syndakat.com}"
+base="${BOUIOS_HOOKS_URL:-https://memory-gateway.bouios.com}" # where your worker fetches the shared session hooks from
 command -v curl >/dev/null 2>&1 || exit 0
 command -v python3 >/dev/null 2>&1 || { note "session checks not installed: python3 is needed."; exit 0; }
 tmp=$(mktemp -d 2>/dev/null) || exit 0

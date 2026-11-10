@@ -1,14 +1,12 @@
 #!/bin/bash
-# install-transcript-hook.sh <worker-address> <BEARER_TOKEN> - wire the
-# transcript backup into THIS machine's Claude Code.
+# install-transcript-hook.sh <service-url> <bearer-token> - wire the transcript
+# backup into THIS machine's Claude Code.
 #
-# Usage: bash hooks/install-transcript-hook.sh <worker-address> <BEARER_TOKEN>
-# Needs: jq, curl, python3.
-#
-# It puts transcript-upload.sh in ~/.claude, writes the worker address and
-# token to ~/.claude/bouios.env (readable by you only), and adds the script as
-# a Stop and a PreCompact hook in ~/.claude/settings.json - beside whatever is
-# there, never replacing it, and never twice.
+# Called by the setup once the memory service answers and has
+# transcript storage. It puts transcript-upload.sh in ~/.claude, writes the
+# service address and token to ~/.claude/bouios.env (readable by you only), and
+# adds the script as a Stop and a PreCompact hook in ~/.claude/settings.json -
+# beside whatever is there, never replacing it, and never twice.
 set -u
 url="${1:-}"; tok="${2:-}"
 if [ -z "$url" ] || [ -z "$tok" ]; then
@@ -23,7 +21,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dir="$HOME/.claude"
 mkdir -p "$dir"
 cp "$here/transcript-upload.sh" "$dir/bouios-transcript-upload.sh" && chmod +x "$dir/bouios-transcript-upload.sh"
-( umask 077; printf 'BOUIOS_URL=%q\nBOUIOS_TOKEN=%q\n' "$url" "$tok" > "$dir/bouios.env" )
+# The licence line install-customer-hooks.sh keeps in the same file survives a re-run.
+( umask 077; { [ -f "$dir/bouios.env" ] && grep '^BOUIOS_LICENCE=' "$dir/bouios.env"; printf 'BOUIOS_URL=%q\nBOUIOS_TOKEN=%q\n' "$url" "$tok"; } > "$dir/bouios.env.tmp"; mv "$dir/bouios.env.tmp" "$dir/bouios.env" )
 chmod 600 "$dir/bouios.env"
 python3 - "$dir/settings.json" <<'PY'
 import json, os, sys

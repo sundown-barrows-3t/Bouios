@@ -1,17 +1,16 @@
 #!/bin/bash
-# install-customer-hooks.sh <licence> [worker-url] [worker-key] - put the licence on THIS machine and wire the
-# session-checks fetch into Claude Code (2026-10-25).
+# install-customer-hooks.sh <licence> [service-url] [service-key] - put the licence on THIS machine and wire the
+# session-checks fetch into Claude Code.
 #
-# Called by install.sh and install-rest.sh when LICENCE is given. It stores the licence
+# Called by the setup when a licence is given. It stores the licence
 # as BOUIOS_LICENCE in ~/.claude/bouios.env (readable by you only, beside the lines the
-# transcript hook keeps there). With the worker address and key as well (the installers pass
+# transcript hook keeps there). With the memory service address and key as well (setup passes
 # them) it stores those as BOUIOS_URL and BOUIOS_TOKEN: the per-message record lookup in the
-# served hook asks YOUR worker with them, so it works whether or not transcript storage was
-# set up. They are never sent anywhere else, copies fetch-customer-hooks.sh to ~/.claude, adds it as a
+# served hook asks YOUR memory service with them, so it works whether or not transcript storage was
+# set up. They are never sent anywhere else. It copies fetch-customer-hooks.sh to ~/.claude, adds it as a
 # SessionStart hook in ~/.claude/settings.json beside whatever is there and never twice,
 # and runs it once. The checks themselves are not in this repo or on your disk until a
 # licensed fetch brings them; without a valid licence the fetch installs nothing.
-# Locked by .session/test-customer-hooks-fetch.sh.
 set -u
 lic="${1:-}"; wurl="${2:-}"; wkey="${3:-}"
 if [ -z "$lic" ]; then

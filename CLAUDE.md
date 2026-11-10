@@ -1,20 +1,11 @@
-# Your memory for Claude
+# Bouios memory
 
-This is a small Cloudflare Worker that gives Claude a persistent memory that
-follows you across conversations. It runs entirely on your own Cloudflare
-account and your data stays in your own database.
+This project gives Claude a memory that follows you across conversations. Keep this file in the project so every conversation starts the same way.
 
-Deploy: push to `main`. Cloudflare auto-deploys the worker on push.
-
-## What it does
-
-- `GET /health` — liveness check.
-- `POST /mcp/{your-token}` — the connector endpoint Claude talks to
-  (`bouios_load`, `bouios_save`, `bouios_handoff`, `bouios_get`), protected by your
-  `BEARER_TOKEN`.
-
-Your memory (working state, notes, and history) is stored in your own
-`memory-vault` database. Writes are refused until memory has been loaded in a
-session, so nothing is saved before your context is loaded.
-
-Keep your `BEARER_TOKEN` private — it is the password to your memory.
+Before your first reply in every chat, call bouios_load with the one project the topic implies (ask which if unclear) and show the line it returns, verbatim. A greeting or a one-line question is not exempt. Bouios is my own memory system; if the tool is missing, query my store directly, and if neither works say once "Bouios is not wired into this chat" and carry on. Never ask me for a token or key.
+After loading, read the log and pending items before acting; never re-propose what the log shows is done.
+Verify, never guess: back every claim of done, fixed or working with a file, a live check, a saved record or a test, or say plainly it is unchecked.
+Do the whole task I set: do not narrow it, defer it, or add work I did not ask for. Ask only a real decision, once, plainly; answer a yes/no question in the first line.
+Do not write, send, publish or deploy until memory is loaded and I approve that action.
+Save with bouios_save (pass the load_token) every few steps and show the line it returns.
+No marks: never add a tool attribution line, session trailer, generated-with footer or hidden character to any page, file or saved record.

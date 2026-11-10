@@ -1,8 +1,5 @@
--- Personal memory schema. Rules are served by our gateway, not stored here.
--- The Worker creates these tables automatically on first use (CREATE TABLE
--- IF NOT EXISTS), so you never need to run this by hand. Kept here for
--- transparency, and matches src/index.js's SCHEMA array exactly - if this
--- file and that array ever disagree, the array is what actually runs.
+-- Personal memory schema. Rules are served by the Bouios service at memory-gateway.bouios.com, not stored here.
+-- This is applied automatically on first use; manual re-run is safe (CREATE IF NOT EXISTS).
 
 CREATE TABLE IF NOT EXISTS hot (
   domain     TEXT PRIMARY KEY,
@@ -30,4 +27,16 @@ CREATE TABLE IF NOT EXISTS log (
   ts      TEXT NOT NULL,
   domain  TEXT NOT NULL,
   summary TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hooks (
+  name       TEXT PRIMARY KEY,
+  content    TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS usage (
+  sub        TEXT    NOT NULL,
+  window     TEXT    NOT NULL,
+  count      INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT    NOT NULL,
+  PRIMARY KEY (sub, window)
 );

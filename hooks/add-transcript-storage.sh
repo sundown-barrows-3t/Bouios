@@ -1,29 +1,31 @@
 #!/bin/bash
-# add-transcript-storage.sh - the SECOND STEP for a Deploy-button install: add transcript
-# storage after the button has deployed your memory worker. It checks first that storage is
-# available on your Cloudflare account and, if it is not, tells you how to add it.
+# add-transcript-storage.sh - the second step after a one-button install: add transcript
+# storage once your memory service is running.
 #
-# WHY A SECOND STEP. The button deploys the worker with the database only. Declaring a
-# storage bucket in the button's own config could make the whole deploy fail on an
-# account that has no R2, where today memory deploys without it. So the button stays
-# storage-free, and this step adds the bucket afterwards, only when the account has it.
+# WHY A SECOND STEP. The button sets up the memory service with its database only.
+# Asking for a storage bucket in the same step could make the whole setup fail on an
+# account that does not have object storage, whereas memory works fine without it. So the
+# button stays storage-free, and this step adds the bucket afterwards, only when the
+# account has it.
 #
 # WHAT IT DOES, in order, stopping at the first thing that cannot be done:
-#   1. Checks that R2 is available on the account. If it is not (Cloudflare answers
-#      error 10042, "not entitled"), it tells you how to enable it and stops with exit
-#      0: memory works without transcripts, nothing was changed.
-#   2. Creates the bucket <worker>-transcripts when it is not there yet.
-#   3. Adds the TRANSCRIPTS binding to your worker, keeping every binding and secret
-#      it already has (secrets are carried over with an `inherit` binding, so their
-#      values are never read or resent). Already bound: nothing is changed.
-#   4. Installs the transcript backup hook on this machine (install-transcript-hook.sh).
-#   5. Proves it: stores a tiny test file (always the same name) through your worker and reads it back.
-# Nothing is sent anywhere but your own Cloudflare account and your own worker.
+#   1. Checks that object storage is available on your account. If it is not, it tells
+#      you how to enable it and stops with exit 0: memory works without transcripts,
+#      nothing was changed.
+#   2. Creates the bucket <service>-transcripts when it is not there yet.
+#   3. Connects the bucket to your memory service, keeping every connection and secret
+#      it already has (secrets are carried over as they are, so their values are never
+#      read or resent). Already connected: nothing is changed.
+#   4. Installs the transcript backup hook on this machine.
+#   5. Proves it: stores a tiny test file (always the same name) through your memory
+#      service and reads it back.
+# Nothing is sent anywhere but your own account and your own memory service.
 #
-# Needs: CLOUDFLARE_API_TOKEN (Workers Scripts Edit + R2 Edit), WORKER_URL and
-# BEARER_TOKEN (the address and password from the button's setup). Optional:
-# CLOUDFLARE_ACCOUNT_ID (found by itself when the token sees one account),
-# WORKER_NAME (default memory-vault). CF_API_BASE exists for the test only.
+# Needs: an account API token allowed to edit scripts and storage, the memory service
+# address and the access password from the button's setup. Optional: the account id
+# (found by itself when the token sees one account) and the service name (default
+# memory-vault). The exact variable names are read near the top of this script. One
+# further variable only redirects the API address for the automated test.
 set -u
 API="${CF_API_BASE:-https://api.cloudflare.com/client/v4}"
 NAME="${WORKER_NAME:-memory-vault}"
@@ -46,7 +48,7 @@ if [ -z "$ACC" ]; then
   ACC=$(printf '%s' "$A" | jq -r '.result[0].id')
 fi
 
-# 1. Is R2 available on this account?
+# 1. Is object storage available on this account?
 L=$(cf "$API/accounts/$ACC/r2/buckets")
 if [ "$(printf '%s' "$L" | jq -r '.success // false')" != "true" ]; then
   code=$(printf '%s' "$L" | jq -r '.errors[0].code // 0')
@@ -73,7 +75,7 @@ else
   echo "  Bucket '$BUCKET' created."
 fi
 
-# 3. The binding, keeping everything the worker already has.
+# 3. The connection, keeping everything the memory service already has.
 S=$(cf "$API/accounts/$ACC/workers/scripts/$NAME/settings")
 if [ "$(printf '%s' "$S" | jq -r '.success // false')" != "true" ]; then
   echo "Transcript storage: your worker '$NAME' could not be read ($(printf '%s' "$S" | jq -r '.errors[0].message // "no answer"')). Check WORKER_NAME. Nothing else was changed."
@@ -96,7 +98,7 @@ fi
 # 4. The backup hook on this machine.
 bash "$here/install-transcript-hook.sh" "$WORKER_URL" "$BEARER_TOKEN"
 
-# 5. Proof: store a tiny test file through the worker and read it back. It always uses the
+# 5. Proof: store a tiny test file through the memory service and read it back. It always uses the
 # same name, so running this again replaces it instead of adding another.
 BODY='{"type":"user","message":"bouios storage check"}'
 PUT=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT "$WORKER_URL/transcript/bouios-storage-check" -H "Authorization: Bearer $BEARER_TOKEN" --data-binary "$BODY")
